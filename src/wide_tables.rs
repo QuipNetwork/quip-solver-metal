@@ -8,10 +8,14 @@
 //! an integer energy change or field against it, so the spins it produces do
 //! not depend on the GPU's floating-point unit. Rows come from f64 on the
 //! host, from the f32 schedule the kernels already receive.
+//! The model classifier caps each local field at `WIDE_MAX_FIELD_MILLI`, and
+//! an energy change is at most twice that. Both fit well inside `i32`, so
+//! saturated entries act as positive or negative infinity in kernel comparisons.
 
 /// Entries per rung. Must equal `WIDE_ROW` in `sa.metal` and `gibbs.metal`.
 pub(crate) const WIDE_ROW: usize = 2048;
 const _: () = assert!(WIDE_ROW.is_power_of_two());
+const _: () = assert!(crate::representation::WIDE_MAX_FIELD_MILLI < i32::MAX as u32);
 
 /// Largest threshold table one batch uploads: 8,192 rungs.
 // Task 6 uses this cap when preparing wide batches.
@@ -49,6 +53,22 @@ fn saturate(x: f64) -> i32 {
     x as i32
 }
 
+fn metropolis_threshold(e: f64, b: f64) -> i32 {
+    if b <= 0.0 {
+        i32::MAX
+    } else {
+        saturate((e / b).floor())
+    }
+}
+
+fn heat_bath_threshold(logistic: f64, b: f64) -> i32 {
+    if b <= 0.0 {
+        // P = 1/2: `+1` exactly when the draw falls below zero.
+        return if logistic < 0.0 { i32::MAX } else { i32::MIN };
+    }
+    saturate((-logistic / (2.0 * b)).ceil() - 1.0)
+}
+
 fn rows(betas: &[f32], seed: u64, mut entry: impl FnMut(f64, &mut u64) -> i32) -> Vec<i32> {
     let mut state = seed ^ ROW_SALT;
     let mut out = Vec::with_capacity(betas.len() * WIDE_ROW);
@@ -67,11 +87,7 @@ fn rows(betas: &[f32], seed: u64, mut entry: impl FnMut(f64, &mut u64) -> i32) -
 pub(crate) fn metropolis_rows(betas: &[f32], seed: u64) -> Vec<i32> {
     rows(betas, seed, |b, state| {
         let e = -open_unit(state).ln();
-        if b <= 0.0 {
-            i32::MAX
-        } else {
-            saturate((e / b).floor())
-        }
+        metropolis_threshold(e, b)
     })
 }
 
@@ -82,11 +98,7 @@ pub(crate) fn heat_bath_rows(betas: &[f32], seed: u64) -> Vec<i32> {
     rows(betas, seed, |b, state| {
         let u = open_unit(state);
         let logistic = (u / (1.0 - u)).ln();
-        if b <= 0.0 {
-            // P = 1/2: `+1` exactly when the draw falls below zero.
-            return if logistic < 0.0 { i32::MAX } else { i32::MIN };
-        }
-        saturate((-logistic / (2.0 * b)).ceil() - 1.0)
+        heat_bath_threshold(logistic, b)
     })
 }
 
@@ -104,6 +116,38 @@ mod tests {
         assert_eq!(metropolis_rows(&betas, 7), metropolis_rows(&betas, 7));
         assert_ne!(metropolis_rows(&betas, 7), metropolis_rows(&betas, 8));
         assert_eq!(heat_bath_rows(&betas, 7).len(), 3 * WIDE_ROW);
+    }
+
+    #[test]
+    fn rows_match_pre_refactor_samples() {
+        let betas = [0.5_f32, 1.0];
+        let m = metropolis_rows(&betas, 42);
+        let h = heat_bath_rows(&betas, 42);
+        assert_eq!(&m[..8], &[871, 362, 3618, 309, 3118, 653, 2474, 215]);
+        assert_eq!(
+            &m[WIDE_ROW..WIDE_ROW + 8],
+            &[419, 20, 2055, 1461, 2298, 1397, 564, 530]
+        );
+        assert_eq!(&h[..8], &[-606, -1617, 1630, -1787, 1322, -950, 894, -2175]);
+        assert_eq!(
+            &h[WIDE_ROW..WIDE_ROW + 8],
+            &[-327, -1943, 959, 598, 1096, 556, -139, -178]
+        );
+    }
+
+    #[test]
+    fn exact_integer_threshold_boundaries() {
+        // These dyadic inputs are exact in f64: 0.75 / (2 * 0.125) = 3.
+        let h = heat_bath_threshold(-0.75, 0.125);
+        assert_eq!(h, 2);
+        assert!(2 <= h);
+        assert!(3 > h);
+
+        // 0.75 / 0.25 = 3 exactly, so Metropolis accepts delta 3.
+        let m = metropolis_threshold(0.75, 0.25);
+        assert_eq!(m, 3);
+        assert!(3 <= m);
+        assert!(4 > m);
     }
 
     #[test]
