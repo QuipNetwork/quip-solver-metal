@@ -16,6 +16,15 @@ using namespace metal;
 
 typedef unsigned int uint;
 
+#ifdef QUIP_WIDE
+typedef int coef_t;
+typedef int field_t;
+#define WIDE_ROW 2048
+#else
+typedef int8_t coef_t;
+typedef float field_t;
+#endif
+
 // ==============================================================================
 // RNG - xoshiro128** (128-bit state, passes BigCrush)
 // ==============================================================================
@@ -91,27 +100,27 @@ inline void set_spin_packed(int var, int8_t spin, thread int8_t* packed_state) {
 // h_eff = h_i + sum_j(J_ij * x_j)
 // ==============================================================================
 
-inline float compute_effective_field(
+inline field_t compute_effective_field(
     int var,
     thread const int8_t* packed_state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
-    device const int8_t* csr_J_vals,
-    device const int8_t* h_vals
+    device const coef_t* csr_J_vals,
+    device const coef_t* h_vals
 ) {
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
 
     // Start with linear bias
-    float h_eff = float(h_vals[var]);
+    field_t h_eff = field_t(h_vals[var]);
 
     // Sum over neighbors: h_eff += sum_j(J_ij * x_j)
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
-        int8_t Jij = csr_J_vals[p];
+        coef_t Jij = csr_J_vals[p];
         int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
-        h_eff += float(Jij) * float(neighbor_spin);
+        h_eff += field_t(Jij) * field_t(neighbor_spin);
     }
 
     return h_eff;
@@ -141,25 +150,25 @@ inline void set_spin_shared(int var, int8_t spin, threadgroup int8_t* shared_sta
     }
 }
 
-inline float compute_effective_field_shared(
+inline field_t compute_effective_field_shared(
     int var,
     threadgroup const int8_t* shared_state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
-    device const int8_t* csr_J_vals,
-    device const int8_t* h_vals
+    device const coef_t* csr_J_vals,
+    device const coef_t* h_vals
 ) {
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
 
-    float h_eff = float(h_vals[var]);
+    field_t h_eff = field_t(h_vals[var]);
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
-        int8_t Jij = csr_J_vals[p];
+        coef_t Jij = csr_J_vals[p];
         int8_t neighbor_spin = get_spin_shared(neighbor, shared_state);
-        h_eff += float(Jij) * float(neighbor_spin);
+        h_eff += field_t(Jij) * field_t(neighbor_spin);
     }
 
     return h_eff;
@@ -209,6 +218,16 @@ inline int8_t metropolis_update(
     return (rand_normalized < prob) ? -current_spin : current_spin;
 }
 
+#ifdef QUIP_WIDE
+// Heat-bath from an integer field: `+1` exactly when `h_eff <= row[r]`.
+// The host binds update_mode 0 (heat-bath) for every Gibbs dispatch, so the
+// wide build has no Metropolis arm.
+inline int8_t gibbs_sample_wide(int h_eff, device const int* row, thread RngState &rng_state) {
+    uint rand_val = xoshiro128starstar(rng_state);
+    return (h_eff <= row[rand_val & (WIDE_ROW - 1)]) ? 1 : -1;
+}
+#endif
+
 // ==============================================================================
 // Main Block Gibbs Kernel
 // ==============================================================================
@@ -217,7 +236,7 @@ kernel void block_gibbs_sampler(
     // CSR graph structure (concatenated for all problems)
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
-    device const int8_t* csr_J_vals [[buffer(2)]],
+    device const coef_t* csr_J_vals [[buffer(2)]],
     device const int* row_ptr_offsets [[buffer(3)]],
     device const int* col_ind_offsets [[buffer(4)]],
 
@@ -240,7 +259,7 @@ kernel void block_gibbs_sampler(
     constant int& num_reads [[buffer(14)]],
 
     // h field values (concatenated for all problems)
-    device const int8_t* csr_h_vals [[buffer(15)]],
+    device const coef_t* csr_h_vals [[buffer(15)]],
 
     // Color block arrays
     device const int* color_block_starts [[buffer(16)]],   // [4] start indices into color_node_indices
@@ -258,6 +277,10 @@ kernel void block_gibbs_sampler(
     constant int& beta_count [[buffer(22)]],               // betas to process this chunk
     device int8_t* persistent_state [[buffer(23)]],        // [num_threads * packed_size] packed spins
     device uint* persistent_rng [[buffer(24)]],            // [num_threads * 4] xoshiro128** state
+
+#ifdef QUIP_WIDE
+    device const int* wide_rows [[buffer(25)]],            // [num_betas * WIDE_ROW] heat-bath thresholds
+#endif
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -281,8 +304,8 @@ kernel void block_gibbs_sampler(
     // Point to this problem's CSR data
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
-    device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const int8_t* my_h_vals = &csr_h_vals[problem_id * N];
+    device const coef_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
+    device const coef_t* my_h_vals = &csr_h_vals[problem_id * N];
 
     int n = N;
     int num_beta_values = num_betas;
@@ -329,7 +352,11 @@ kernel void block_gibbs_sampler(
     // Block Gibbs annealing over this chunk's beta range
     int chunk_end = min(beta_start + beta_count, num_beta_values);
     for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
+#ifdef QUIP_WIDE
+        device const int* row = &wide_rows[beta_idx * WIDE_ROW];
+#else
         float beta = beta_schedule[beta_idx];
+#endif
 
         for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
             // Process each color block
@@ -344,13 +371,16 @@ kernel void block_gibbs_sampler(
                     int var = color_node_indices[block_start + i];
 
                     // Compute effective field: h_eff = h[var] + sum_j(J[var,j] * x[j])
-                    float h_eff = compute_effective_field(
+                    field_t h_eff = compute_effective_field(
                         var, packed_state,
                         my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals
                     );
 
                     // Update spin based on mode
                     int8_t new_spin;
+#ifdef QUIP_WIDE
+                    new_spin = gibbs_sample_wide(h_eff, row, rng_state);
+#else
                     if (update_mode == 0) {
                         // Gibbs: Sample from conditional distribution
                         new_spin = gibbs_sample(h_eff, beta, rng_state);
@@ -359,6 +389,7 @@ kernel void block_gibbs_sampler(
                         int8_t current_spin = get_spin_packed(var, packed_state);
                         new_spin = metropolis_update(current_spin, h_eff, beta, rng_state);
                     }
+#endif
 
                     set_spin_packed(var, new_spin, packed_state);
                 }
@@ -380,7 +411,7 @@ kernel void block_gibbs_sampler(
         for (int p = start; p < end; ++p) {
             int j = my_csr_col_ind[p];
             if (j > i) {
-                int8_t Jij = my_csr_J_vals[p];
+                coef_t Jij = my_csr_J_vals[p];
                 int8_t spin_j = get_spin_packed(j, packed_state);
                 current_energy += Jij * spin_i * spin_j;
             }
@@ -440,25 +471,25 @@ inline void set_spin_unpacked(int var, int8_t spin, threadgroup int8_t* state) {
     state[var] = spin;
 }
 
-inline float compute_effective_field_unpacked(
+inline field_t compute_effective_field_unpacked(
     int var,
     threadgroup const int8_t* state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
-    device const int8_t* csr_J_vals,
-    device const int8_t* h_vals
+    device const coef_t* csr_J_vals,
+    device const coef_t* h_vals
 ) {
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
 
-    float h_eff = float(h_vals[var]);
+    field_t h_eff = field_t(h_vals[var]);
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
-        int8_t Jij = csr_J_vals[p];
+        coef_t Jij = csr_J_vals[p];
         int8_t neighbor_spin = state[neighbor];
-        h_eff += float(Jij) * float(neighbor_spin);
+        h_eff += field_t(Jij) * field_t(neighbor_spin);
     }
 
     return h_eff;
@@ -468,7 +499,7 @@ kernel void block_gibbs_parallel(
     // CSR graph structure (concatenated for all problems)
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
-    device const int8_t* csr_J_vals [[buffer(2)]],
+    device const coef_t* csr_J_vals [[buffer(2)]],
     device const int* row_ptr_offsets [[buffer(3)]],
     device const int* col_ind_offsets [[buffer(4)]],
 
@@ -491,7 +522,7 @@ kernel void block_gibbs_parallel(
     constant int& num_reads [[buffer(14)]],
 
     // h field values (concatenated for all problems)
-    device const int8_t* csr_h_vals [[buffer(15)]],
+    device const coef_t* csr_h_vals [[buffer(15)]],
 
     // Color block arrays
     device const int* color_block_starts [[buffer(16)]],
@@ -510,6 +541,10 @@ kernel void block_gibbs_parallel(
     constant int& beta_count [[buffer(22)]],               // betas to process this chunk
     device int8_t* persistent_state [[buffer(23)]],        // [num_threadgroups * N] unpacked spins
     device uint* persistent_rng [[buffer(24)]],            // [num_threadgroups * group_size * 4]
+
+#ifdef QUIP_WIDE
+    device const int* wide_rows [[buffer(25)]],            // [num_betas * WIDE_ROW] heat-bath thresholds
+#endif
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -534,8 +569,8 @@ kernel void block_gibbs_parallel(
 
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
-    device const int8_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const int8_t* my_h_vals = &csr_h_vals[problem_id * N];
+    device const coef_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
+    device const coef_t* my_h_vals = &csr_h_vals[problem_id * N];
 
     int n = N;
     int packed_size = (n + 7) / 8;
@@ -578,7 +613,11 @@ kernel void block_gibbs_parallel(
     // Block Gibbs annealing with TRUE parallel updates over this chunk
     int chunk_end = min(beta_start + beta_count, num_betas);
     for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
+#ifdef QUIP_WIDE
+        device const int* row = &wide_rows[beta_idx * WIDE_ROW];
+#else
         float beta = beta_schedule[beta_idx];
+#endif
 
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
             // Process each color block
@@ -592,13 +631,16 @@ kernel void block_gibbs_parallel(
                     int var = color_node_indices[block_start + i];
 
                     // Compute effective field from shared state
-                    float h_eff = compute_effective_field_unpacked(
+                    field_t h_eff = compute_effective_field_unpacked(
                         var, shared_state,
                         my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals
                     );
 
                     // Update spin based on mode
                     int8_t new_spin;
+#ifdef QUIP_WIDE
+                    new_spin = gibbs_sample_wide(h_eff, row, rng_state);
+#else
                     if (update_mode == 0) {
                         // Gibbs sampling
                         float prob_plus = 1.0f / (1.0f + exp(2.0f * beta * h_eff));
@@ -618,6 +660,7 @@ kernel void block_gibbs_parallel(
                             new_spin = (rand_normalized < prob) ? -current_spin : current_spin;
                         }
                     }
+#endif
 
                     shared_state[var] = new_spin;
                 }
@@ -661,7 +704,7 @@ kernel void block_gibbs_parallel(
         for (int p = start; p < end; ++p) {
             int j = my_csr_col_ind[p];
             if (j > i) {
-                int8_t Jij = my_csr_J_vals[p];
+                coef_t Jij = my_csr_J_vals[p];
                 int8_t spin_j = shared_state[j];
                 partial_energy += Jij * spin_i * spin_j;
             }
