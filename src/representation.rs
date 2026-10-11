@@ -18,8 +18,8 @@ use quip_solver_core::IsingGraph;
 pub(crate) const INT8_MAX_FIELD_MILLI: u32 = 63_000;
 
 /// Largest local field the wide path takes, in milli. The SA neighbour update
-/// adds `4·J`, which stays inside `int` because `|J| ≤ field ≤ 2^28`.
-pub(crate) const WIDE_MAX_FIELD_MILLI: u32 = 1 << 28;
+/// adds `4·J`, which stays inside `int` because `|J| ≤ field ≤ 268_435_000`.
+pub(crate) const WIDE_MAX_FIELD_MILLI: u32 = 268_435_000;
 
 /// The coefficient representation a model needs for exact execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +157,13 @@ mod tests {
         );
         let err = classify(&pair([limit_units, 0.0], 1.0)).unwrap_err();
         assert!(err.contains("local field"), "{err}");
+    }
+
+    #[test]
+    fn wide_bound_matches_the_advertised_milli_limit() {
+        assert_eq!(WIDE_MAX_FIELD_MILLI, 268_435_000);
+        assert_eq!(to_milli(268_435.0), Some(268_435_000));
+        assert_eq!(to_milli(268_435.001), None);
     }
 
     #[test]

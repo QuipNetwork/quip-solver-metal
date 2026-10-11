@@ -57,6 +57,8 @@ mod model_checks;
 mod representation;
 mod resident;
 mod slots;
+#[cfg(test)]
+mod wide_reference;
 mod wide_tables;
 
 pub mod iokit_gov;
@@ -166,10 +168,17 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // A real `sample_stream` override and the IOKit governor — the two
-    // capability names `BackendIdentity::features` documents.
-    features: &["streaming", "governor"],
+    limits: quip_solver_core::ModelLimits {
+        max_degree: None,
+        max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
+        exact_resolution_milli: Some(1),
+    },
+    // The stream override, IOKit governor, and exact coefficient refusal.
+    features: &[
+        "streaming",
+        "governor",
+        quip_solver_core::EXACT_COEFFICIENTS_FEATURE,
+    ],
     adapt: METAL_ADAPT,
 };
 
@@ -192,9 +201,17 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
-    features: &["streaming", "governor"],
+    limits: quip_solver_core::ModelLimits {
+        max_degree: None,
+        max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
+        exact_resolution_milli: Some(1),
+    },
+    // Same capability set as `METAL_SA_IDENTITY`.
+    features: &[
+        "streaming",
+        "governor",
+        quip_solver_core::EXACT_COEFFICIENTS_FEATURE,
+    ],
     adapt: METAL_ADAPT,
 };
 
@@ -765,7 +782,7 @@ mod tests {
 
     #[test]
     fn msa_identity_advertises_the_multi_spin_kernel() {
-        use super::{METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        use super::METAL_MSA_IDENTITY;
         assert_eq!(
             METAL_MSA_IDENTITY.backend,
             quip_solver_core::quip_proto::v1::Backend::Metal
@@ -775,7 +792,7 @@ mod tests {
             quip_solver_core::quip_proto::v1::Algorithm::Msa
         );
         assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
-        assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
+        assert_eq!(METAL_MSA_IDENTITY.features, &["streaming", "governor"]);
         // Reads are pinned to whole words.
         assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
         assert_eq!(
@@ -785,6 +802,25 @@ mod tests {
         const {
             assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
         }
+    }
+
+    #[test]
+    fn identities_state_their_model_limits_and_claim_exact_coefficients() {
+        use super::{METAL_GIBBS_IDENTITY, METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        for identity in [METAL_SA_IDENTITY, METAL_GIBBS_IDENTITY] {
+            assert_eq!(identity.limits.max_local_field_milli, Some(268_435_000));
+            assert_eq!(identity.limits.exact_resolution_milli, Some(1));
+            assert!(identity
+                .features
+                .contains(&quip_solver_core::EXACT_COEFFICIENTS_FEATURE));
+        }
+        assert!(!METAL_MSA_IDENTITY
+            .features
+            .contains(&quip_solver_core::EXACT_COEFFICIENTS_FEATURE));
+        assert_eq!(
+            METAL_MSA_IDENTITY.limits,
+            quip_solver_core::ModelLimits::UNSTATED
+        );
     }
 
     #[test]

@@ -67,25 +67,13 @@ pub struct MetalDevice {
     pub(crate) device: Device,
     pub(crate) queue: metal::CommandQueue,
     pub(crate) sa: ComputePipelineState,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wide SA dispatch arrives in Task 6")
-    )]
     pub(crate) sa_wide: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wide Gibbs dispatch arrives in Task 6")
-    )]
     pub(crate) gibbs_wide: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
     pub(crate) gibbs_parallel: ComputePipelineState,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wide Gibbs dispatch arrives in Task 6")
-    )]
     pub(crate) gibbs_parallel_wide: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.

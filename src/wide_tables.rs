@@ -18,16 +18,12 @@ const _: () = assert!(WIDE_ROW.is_power_of_two());
 const _: () = assert!(crate::representation::WIDE_MAX_FIELD_MILLI < i32::MAX as u32);
 
 /// Largest threshold table one batch uploads: 8,192 rungs.
-// Task 6 uses this cap when preparing wide batches.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const WIDE_TABLE_MAX_BYTES: usize = 64 << 20;
 
 /// Distinct from every other stream seeded from the job seed.
 const ROW_SALT: u64 = 0x5749_4445_5441_424C;
 
 /// Whether a schedule of `rungs` rungs fits [`WIDE_TABLE_MAX_BYTES`].
-// Task 6 checks the table cap before upload.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn wide_table_fits(rungs: usize) -> bool {
     rungs.saturating_mul(WIDE_ROW * 4) <= WIDE_TABLE_MAX_BYTES
 }
@@ -82,8 +78,6 @@ fn rows(betas: &[f32], seed: u64, mut entry: impl FnMut(f64, &mut u64) -> i32) -
 }
 
 /// Metropolis rows: accept an uphill `Δ` (milli) when `Δ ≤ entry`.
-// Task 6 passes these rows to the wide Metropolis kernel.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn metropolis_rows(betas: &[f32], seed: u64) -> Vec<i32> {
     rows(betas, seed, |b, state| {
         let e = -open_unit(state).ln();
@@ -92,8 +86,6 @@ pub(crate) fn metropolis_rows(betas: &[f32], seed: u64) -> Vec<i32> {
 }
 
 /// Heat-bath rows: set `s = +1` when the local field `f` (milli) is `≤ entry`.
-// Task 6 passes these rows to the wide heat-bath kernel.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn heat_bath_rows(betas: &[f32], seed: u64) -> Vec<i32> {
     rows(betas, seed, |b, state| {
         let u = open_unit(state);
