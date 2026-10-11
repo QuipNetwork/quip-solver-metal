@@ -54,6 +54,7 @@ mod cutoff;
 mod draw;
 mod lease_turn;
 mod model_checks;
+mod representation;
 mod resident;
 mod slots;
 
