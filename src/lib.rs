@@ -57,6 +57,7 @@ mod model_checks;
 mod representation;
 mod resident;
 mod slots;
+mod wide_tables;
 
 pub mod iokit_gov;
 pub mod metal_device;
