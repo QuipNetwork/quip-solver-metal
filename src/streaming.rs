@@ -245,6 +245,7 @@ pub fn stream_width(_device: &MetalDevice, kernel: Kernel) -> usize {
 struct BatchKey<'a> {
     watermark: Option<u64>,
     n: usize,
+    representation: Option<crate::representation::Representation>,
     edges: &'a [(usize, usize)],
     num_reads: usize,
     num_sweeps: usize,
@@ -257,6 +258,7 @@ impl<'a> BatchKey<'a> {
         Self {
             watermark: job.watermark,
             n: job.graph.h.len(),
+            representation: crate::representation::classify(&job.graph).ok(),
             edges: &job.graph.edges,
             num_reads: job.params.num_reads.clamp(1, sampler::MAX_READS),
             num_sweeps: job.params.num_sweeps,
@@ -272,6 +274,7 @@ impl<'a> BatchKey<'a> {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
+            && self.representation == crate::representation::classify(&job.graph).ok()
             && self.edges == &*job.graph.edges
     }
 }
@@ -1011,6 +1014,23 @@ mod tests {
         let mut other = job(b"b", ring4(), 16, 64, 1);
         other.graph.edges = vec![(0, 1), (1, 2), (2, 3)].into(); // drop one edge
         assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn batch_key_separates_representations() {
+        let ring = |scale: f64| {
+            IsingGraph::new(
+                vec![0.0; 4],
+                vec![-scale; 4],
+                vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+            )
+        };
+        let mut int8 = job(b"int8", ring(1.0), 16, 64, 1);
+        let mut wide = job(b"wide", ring(0.5), 16, 64, 1);
+        int8.watermark = None;
+        wide.watermark = None;
+        assert!(!BatchKey::from_job(&int8).matches(&wide));
+        assert!(BatchKey::from_job(&int8).matches(&job(b"same", ring(1.0), 16, 64, 1)));
     }
 
     #[test]

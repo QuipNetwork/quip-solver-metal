@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the sampler in the next task")
-)]
-
 //! Which coefficient path can run a model exactly, decided before any
 //! quantization.
 //!
@@ -26,20 +21,12 @@ pub(crate) const INT8_MAX_FIELD_MILLI: u32 = 63_000;
 /// adds `4·J`, which stays inside `int` because `|J| ≤ field ≤ 2^28`.
 pub(crate) const WIDE_MAX_FIELD_MILLI: u32 = 1 << 28;
 
-/// Largest local field the multi-spin engines take, in milli: 20 couplings of
-/// magnitude 1 and a field of magnitude 1.
-#[cfg_attr(
-    test,
-    expect(dead_code, reason = "wired into the sampler in the next task")
-)]
-pub(crate) const MSA_MAX_FIELD_MILLI: u32 = 21_000;
-
-/// The coefficient path a model runs on.
+/// The coefficient representation a model needs for exact execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Representation {
     /// Today's `int8_t` kernels, whole units.
     Int8,
-    /// The `QUIP_WIDE` kernels, `int` milli units.
+    /// Reserved for the `QUIP_WIDE` kernels, `int` milli units.
     Wide,
 }
 
@@ -104,16 +91,6 @@ pub(crate) fn classify(graph: &IsingGraph) -> Result<Representation, String> {
     } else {
         Ok(Representation::Wide)
     }
-}
-
-/// Whether every `h` and `J` is `-1`, `0` or `+1`, the values the multi-spin
-/// kernel's sign-only arithmetic represents.
-pub(crate) fn unit_coefficients(graph: &IsingGraph) -> bool {
-    graph
-        .h
-        .iter()
-        .chain(&graph.j)
-        .all(|&v| v == -1.0 || v == 0.0 || v == 1.0)
 }
 
 #[cfg(test)]
@@ -186,12 +163,5 @@ mod tests {
     fn a_coupling_list_shorter_than_the_edges_is_refused() {
         let graph = IsingGraph::new(vec![0.0; 3], vec![1.0], vec![(0, 1), (1, 2)]);
         classify(&graph).unwrap_err();
-    }
-
-    #[test]
-    fn unit_coefficients_accept_only_minus_one_zero_and_one() {
-        assert!(unit_coefficients(&pair([1.0, 0.0], -1.0)));
-        assert!(!unit_coefficients(&pair([2.0, 0.0], 1.0)));
-        assert!(!unit_coefficients(&pair([0.0, 0.0], 0.5)));
     }
 }

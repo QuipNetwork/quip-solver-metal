@@ -354,6 +354,9 @@ fn eligibility(
         && n <= crate::sampler::kernel_max_nodes(kernel)
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
+    if kernel != Kernel::Msa {
+        metal &= crate::representation::classify(graph).is_ok();
+    }
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa
         && n <= 16_384
@@ -1322,6 +1325,27 @@ mod tests {
         j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 2)]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn the_metal_engine_is_ineligible_for_models_it_cannot_run_exactly() {
+        let cfg = config(true, false);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        assert_eq!(
+            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
+            [false, false]
+        );
+        let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        assert_eq!(
+            eligibility(Kernel::Sa, &pm1, &params, cfg, &mut facts),
             [true, false]
         );
     }

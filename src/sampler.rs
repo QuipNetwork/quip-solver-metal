@@ -45,6 +45,7 @@ pub enum Kernel {
     Gibbs,
 }
 
+use crate::representation::{classify, Representation};
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
@@ -963,7 +964,31 @@ fn max_csr_degree(graph: &IsingGraph) -> usize {
     degree.into_iter().max().unwrap_or(0)
 }
 
-/// Validate a batch's shared inputs, returning the establishing graph and `N`.
+/// The one representation every graph in a batch shares, or a capacity
+/// refusal. `BatchKey` keeps representations apart, so a mix is a driver bug.
+fn batch_representation(
+    graphs: &[&IsingGraph],
+    kernel: Kernel,
+) -> Result<Representation, SampleError> {
+    let mut shared = None;
+    for graph in graphs {
+        let rep = if kernel == Kernel::Msa {
+            Representation::Int8
+        } else {
+            classify(graph).map_err(SampleError::TooLarge)?
+        };
+        if shared.is_some_and(|prev| prev != rep) {
+            return Err(SampleError::Driver(
+                "a batch mixes int8 and wide models".into(),
+            ));
+        }
+        shared = Some(rep);
+    }
+    shared.ok_or_else(|| SampleError::Driver("encode_batch needs at least one graph".into()))
+}
+
+/// Validate a batch's shared inputs, returning the establishing graph, `N`,
+/// and coefficient representation.
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device.
@@ -971,7 +996,7 @@ pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
     kernel: Kernel,
-) -> Result<(&'a IsingGraph, usize), SampleError> {
+) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
         // batch would have indexed `graphs[0]` and panicked the miner.
@@ -1010,7 +1035,9 @@ pub(crate) fn validate_batch<'a>(
             params.num_sweeps
         )));
     }
-    Ok((first, n))
+    // Task 6 routes Wide batches to the wide kernels; until then they take the int8 path.
+    let rep = batch_representation(graphs, kernel)?;
+    Ok((first, n, rep))
 }
 
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
@@ -1258,7 +1285,7 @@ fn encode_batch_inner(
     plan_override: Option<&[(i32, i32)]>,
     beta_override: Option<Vec<f32>>,
 ) -> Result<EncodedBatch, SampleError> {
-    let (first, n) = validate_batch(graphs, params, kernel)?;
+    let (first, n, _) = validate_batch(graphs, params, kernel)?;
 
     let num_problems = graphs.len();
     let num_reads = simd_rounded_reads(params.num_reads);
@@ -1721,6 +1748,7 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::representation::Representation;
 
     #[test]
     fn packed_decode_preserves_jobs_reads_and_host_scoring() {
@@ -1963,9 +1991,41 @@ mod tests {
     #[test]
     fn validate_batch_accepts_a_normal_job() {
         let g = ring();
-        let (first, n) = validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
+        let (first, n, _) = validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
         assert_eq!(n, 4);
         assert_eq!(first.num_nodes(), 4);
+    }
+
+    #[test]
+    fn validate_batch_refuses_a_non_representable_model_as_capacity() {
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8,
+            ..Default::default()
+        };
+        let graph = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let err = validate_batch(&[&graph], &params, kernel).unwrap_err();
+            assert!(
+                matches!(err, SampleError::TooLarge(_)),
+                "{kernel:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_batch_reports_the_representation() {
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8,
+            ..Default::default()
+        };
+        let pm1 = IsingGraph::new(vec![1.0, -1.0], vec![-1.0], vec![(0, 1)]);
+        let quarter = IsingGraph::new(vec![0.25, 0.0], vec![-0.75], vec![(0, 1)]);
+        let (_, _, rep) = validate_batch(&[&pm1], &params, Kernel::Sa).unwrap();
+        assert_eq!(rep, Representation::Int8);
+        let (_, _, rep) = validate_batch(&[&quarter], &params, Kernel::Sa).unwrap();
+        assert_eq!(rep, Representation::Wide);
     }
 
     #[test]
