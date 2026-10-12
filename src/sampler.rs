@@ -512,7 +512,8 @@ pub(crate) fn kernel_seed(seed: u64) -> u32 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
-    u32::try_from(z >> 32).unwrap_or(u32::MAX)
+    // The high word always fits, so the cast never truncates.
+    (z >> 32) as u32
 }
 
 /// Unpack one read's bit-packed spins (LSB-first per byte, bit=1 -> -1,
@@ -1351,7 +1352,8 @@ fn encode_batch_inner(
         n,
         num_betas: beta.len() as i32,
         sweeps_per,
-        base_seed: kernel_seed(params.seed).wrapping_add(1),
+        // Every batch kernel maps a zero seed to 1 itself.
+        base_seed: kernel_seed(params.seed),
         num_threads,
         num_problems,
         num_reads,
@@ -2450,6 +2452,77 @@ mod tests {
             batch.inputs.col.length() as usize,
             2 * a.edges.len() * std::mem::size_of::<i32>()
         );
+    }
+
+    /// The spins of every read of one batch run at `seed`: a 64-node ring with
+    /// unit couplings of both signs (degree 2, so MSA takes it), two MSA words
+    /// of reads, and a short anneal kept hot so each spin depends on the RNG.
+    fn seeded_reads(
+        dev: &crate::metal_device::MetalDevice,
+        kernel: Kernel,
+        seed: u64,
+    ) -> Vec<Vec<i8>> {
+        let n = 64;
+        let h = (0..n).map(|i| [-1.0, 0.0, 1.0][i % 3]).collect();
+        let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        let j = (0..n)
+            .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let graph = IsingGraph::new(h, j, edges);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 8,
+            sweeps_per_beta: 1,
+            schedule: quip_solver_core::BetaSchedule::Geometric,
+            beta_range: Some((0.1, 0.5)),
+            seed,
+        };
+        let mut batch = encode_batch(dev, &[&graph], &params, kernel, 1).unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        assert!(batch.failed_status().is_none());
+        let mut problems = harvest_batch(&batch, &[&graph]).unwrap();
+        let reads = problems.remove(0);
+        assert_eq!(reads.len(), 64);
+        reads.into_iter().map(|r| r.spins).collect()
+    }
+
+    /// The batch path feeds the kernel `kernel_seed` of the whole host seed:
+    /// a repeated seed repeats every read, and flipping only the top bit,
+    /// which the low 32 bits cannot see, changes them.
+    fn assert_reads_follow_the_full_seed(kernel: Kernel) {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let seed = 0x0123_4567_89ab_cdef_u64;
+        let first = seeded_reads(&dev, kernel, seed);
+        assert_eq!(
+            first,
+            seeded_reads(&dev, kernel, seed),
+            "{kernel:?}: the same seed must give the same reads"
+        );
+        assert_ne!(
+            first,
+            seeded_reads(&dev, kernel, seed ^ (1 << 63)),
+            "{kernel:?}: a seed differing in bit 63 must give other reads"
+        );
+    }
+
+    #[test]
+    fn sa_reads_follow_the_full_seed() {
+        assert_reads_follow_the_full_seed(Kernel::Sa);
+    }
+
+    #[test]
+    fn gibbs_reads_follow_the_full_seed() {
+        assert_reads_follow_the_full_seed(Kernel::Gibbs);
+    }
+
+    #[test]
+    fn msa_reads_follow_the_full_seed() {
+        assert_reads_follow_the_full_seed(Kernel::Msa);
     }
 
     /// Two problems in one batch with two words each: every (problem, word)

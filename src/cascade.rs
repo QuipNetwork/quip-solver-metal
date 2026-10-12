@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::sampler::build_beta_schedule;
 use crate::slots::Edges;
 use crate::{IsingGraph, SampleParams};
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
 use quip_solver_core::StreamJob;
 
 use crate::cutoff::{Cutoff, CutoffConfig};
@@ -1049,7 +1049,9 @@ pub(crate) fn segment_schedule(
             standard(&mut schedule, first);
             for pair in continuing.windows(2) {
                 schedule.extend(
-                    geometric_beta_schedule(REHEAT_BETA, cold, pair[1] - pair[0])
+                    params
+                        .schedule
+                        .build(REHEAT_BETA, cold, pair[1] - pair[0])
                         .into_iter()
                         .map(|b| b as f32),
                 );
@@ -1183,11 +1185,19 @@ mod tests {
     #[test]
     fn segment_schedule_reheats_through_256_then_runs_fresh_legs() {
         let graph = ring();
-        for range in [None, Some((0.1, 6.0))] {
+        let kinds = [
+            quip_solver_core::BetaSchedule::Geometric,
+            quip_solver_core::BetaSchedule::Linear,
+        ];
+        for (kind, range) in kinds
+            .into_iter()
+            .flat_map(|kind| [None, Some((0.1, 6.0))].map(|range| (kind, range)))
+        {
             for sweeps in [1, 31, 32, 33, 256, 257, 1000] {
                 for repeats in [1, 4, 64] {
                     let mut params = params(sweeps, repeats);
                     params.beta_range = range;
+                    params.schedule = kind;
                     let (actual, checkpoints, fresh_from) =
                         segment_schedule(&graph, &params, &[32, 256]);
                     let (_, cold) = range.unwrap_or_else(|| default_ising_beta_range(&graph));
@@ -1197,13 +1207,8 @@ mod tests {
                         .chain(std::iter::once(sweeps))
                         .collect();
                     let lone = |leg: usize| {
-                        let (standard, repeat) = build_beta_schedule(
-                            &graph,
-                            leg,
-                            repeats,
-                            range,
-                            quip_solver_core::BetaSchedule::Geometric,
-                        );
+                        let (standard, repeat) =
+                            build_beta_schedule(&graph, leg, repeats, range, kind);
                         let mut part: Vec<_> = standard
                             .iter()
                             .flat_map(|b| std::iter::repeat_n(*b, repeat))
@@ -1222,7 +1227,7 @@ mod tests {
                         expected.extend(lone(budgets[0]));
                         for pair in budgets[..continuing].windows(2) {
                             expected.extend(
-                                geometric_beta_schedule(REHEAT_BETA, cold, pair[1] - pair[0])
+                                kind.build(REHEAT_BETA, cold, pair[1] - pair[0])
                                     .into_iter()
                                     .map(|b| b as f32),
                             );
@@ -1719,6 +1724,21 @@ mod tests {
     }
 
     #[test]
+    fn a_linear_job_is_never_chain_gated() {
+        let settings = CascadeSettings::default();
+        let measured = SampleParams {
+            num_reads: CHAIN_GATES.min_reads,
+            ..params(14_336, 1)
+        };
+        assert!(settings.chain_gated(true, &measured));
+        let linear = SampleParams {
+            schedule: quip_solver_core::BetaSchedule::Linear,
+            ..measured
+        };
+        assert!(!settings.chain_gated(true, &linear));
+    }
+
+    #[test]
     fn schedule_cache_shares_equal_schedules_and_rebuilds_on_change() {
         let settings = CascadeSettings::default();
         let mut cache = ScheduleCache::default();
@@ -1752,6 +1772,24 @@ mod tests {
             .prepare(&job(2, 2000), settings, true, true, None)
             .unwrap();
         assert_eq!(gated.checkpoints, vec![8, 16, 64, 256, 768, 1792, 3792]);
+    }
+
+    #[test]
+    fn schedule_cache_keys_on_the_schedule_kind() {
+        let settings = CascadeSettings::default();
+        let mut cache = ScheduleCache::default();
+        let geometric = cache
+            .prepare(&job(0, 1000), settings, false, true, None)
+            .unwrap();
+        let mut linear_job = job(1, 1000);
+        linear_job.params.schedule = quip_solver_core::BetaSchedule::Linear;
+        let linear = cache
+            .prepare(&linear_job, settings, false, true, None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&geometric.betas, &linear.betas));
+        let reference = PreparedSchedule::new(&linear_job, settings, false, true);
+        assert_eq!(&linear.betas[..], &reference.betas[..]);
+        assert_ne!(&linear.betas[..], &geometric.betas[..]);
     }
 
     #[test]
