@@ -9,15 +9,12 @@
 //!
 //! # Batched dispatch (throughput)
 //!
-//! The kernel maps **one threadgroup per problem, one thread per read**
-//! (`thread_id = threadgroup·num_reads + read`, `problem_id = thread_id /
-//! num_reads`). A dispatch of `P` problems is
-//! `dispatchThreadgroups(P, num_reads)` → `P` threadgroups occupy `P` GPU
-//! cores, so a batch of ≈`gpu_cores` problems fills the whole GPU and hides
-//! the kernel's thread-private memory latency. This mirrors v0.2
-//! `metal_sa.py::_dispatch_batch`. Driving `P = 1` (one problem per command
-//! buffer) leaves all but one core idle — a ~`gpu_cores`× slowdown — which is
-//! why the streaming loop batches ([`crate::streaming`]).
+//! Int8 sequential SA and Gibbs use one threadgroup per problem and one thread
+//! per read. Wide sequential SA and Gibbs pack reads into groups sized for the
+//! pipeline, so one problem can occupy several groups. Chromatic Gibbs uses
+//! one group per sample, while multi-spin SA uses one group per 32-read word.
+//! The streaming loop batches problems to keep the GPU busy
+//! ([`crate::streaming`]).
 //!
 //! [`encode_batch`] builds one batch's buffers and encodes the dispatch without
 //! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
