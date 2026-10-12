@@ -500,6 +500,21 @@ pub(crate) fn build_beta_schedule(
     (sched, sweeps_per)
 }
 
+/// The kernels' `uint` seed argument, mixed from all 64 bits of a host seed.
+///
+/// The kernel RNG state is 32-bit, so the seed must be narrowed. Keeping the
+/// low half made seeds that differ only in their high 32 bits run identical
+/// trajectories. The `SplitMix64` finalizer spreads every input bit over the
+/// high word it returns, so any change to the seed changes the kernel seed,
+/// short of a 2^-32 collision.
+pub(crate) fn kernel_seed(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    u32::try_from(z >> 32).unwrap_or(u32::MAX)
+}
+
 /// Unpack one read's bit-packed spins (LSB-first per byte, bit=1 -> -1,
 /// bit=0 -> +1; matches the kernel's `set_spin_packed`). Identical to the
 /// CUDA crate's unpacker — both kernels share the v0.2 packing convention.
@@ -1336,7 +1351,7 @@ fn encode_batch_inner(
         n,
         num_betas: beta.len() as i32,
         sweeps_per,
-        base_seed: (params.seed as u32).wrapping_add(1),
+        base_seed: kernel_seed(params.seed).wrapping_add(1),
         num_threads,
         num_problems,
         num_reads,
@@ -1927,6 +1942,21 @@ mod tests {
     fn a_linear_schedule_is_evenly_spaced() {
         let (sched, _) = build_beta_schedule(&ring(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear);
         assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `--solve` seeds that differ only in their high 32 bits used to give the
+    /// same kernel seed, and so the same samples.
+    #[test]
+    fn the_kernel_seed_depends_on_every_bit_of_the_host_seed() {
+        let base = 0x0000_0000_dead_beef_u64;
+        assert_eq!(kernel_seed(base), kernel_seed(base), "deterministic");
+        for bit in 0..64 {
+            assert_ne!(
+                kernel_seed(base),
+                kernel_seed(base ^ (1 << bit)),
+                "flipping bit {bit} must change the kernel seed"
+            );
+        }
     }
 
     #[test]
