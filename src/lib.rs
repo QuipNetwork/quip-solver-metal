@@ -142,6 +142,46 @@ const _: () = assert!(
     "sampler::MAX_SWEEPS must admit METAL_MSA_ADAPT.max_sweeps"
 );
 
+/// Features every kernel advertises: a real `sample_stream` override, the
+/// IOKit governor, and a host-built ladder that honours
+/// `SampleParams::schedule`.
+const FEATURES: &[&str] = &[
+    "streaming",
+    "governor",
+    quip_solver_core::LINEAR_SCHEDULE_FEATURE,
+];
+
+/// One unit, in milli. Every kernel truncates each coefficient to an `int8` of
+/// whole units (`topology::quantize_i8`), so only whole units are exact.
+const UNIT_MILLI: u32 = 1000;
+
+/// SA's model limits. `kernels/sa.metal` keeps each flip's energy change in an
+/// `int8_t`, `-2 * s * (h + Σ J s)`, so the local field must stay within 63
+/// units or the change wraps.
+pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(63 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// Gibbs's model limits. `kernels/gibbs.metal` sums the field in `float`, so
+/// only the `int8` coefficients bound it: a field of at most 127 units keeps
+/// every coefficient inside one.
+pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(127 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// MSA's model limits, on the GPU and the ANE alike. Both unroll
+/// `sampler::MSA_MAX_DEG` neighbours and anneal on signs, so the field is at
+/// most one unit per neighbour plus one for the bias.
+pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(crate::sampler::MSA_MAX_DEG as u32),
+    max_local_field_milli: Some((crate::sampler::MSA_MAX_DEG as u32 + 1) * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
 /// Backend identity for `quip-metal-sa`.
 ///
 /// # Examples
@@ -164,11 +204,9 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // A real `sample_stream` override and the IOKit governor — the two
-    // capability names `BackendIdentity::features` documents.
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_ADAPT,
+    limits: METAL_SA_LIMITS,
 };
 
 /// Backend identity for `quip-metal-gibbs`.
@@ -190,10 +228,9 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_ADAPT,
+    limits: METAL_GIBBS_LIMITS,
 };
 
 /// Backend identity for `quip-metal-msa`.
@@ -214,9 +251,9 @@ pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     // Union capacity. Routing still enforces each engine's own limits.
     max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_MSA_ADAPT,
+    limits: METAL_MSA_LIMITS,
 };
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
@@ -774,6 +811,10 @@ mod tests {
         );
         assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
+        assert!(METAL_MSA_IDENTITY
+            .features
+            .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE));
+        assert_eq!(METAL_MSA_IDENTITY.limits.max_degree, Some(20));
         // Reads are pinned to whole words.
         assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
         assert_eq!(

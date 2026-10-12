@@ -6,7 +6,7 @@
 use quip_solver_conformance::driver::{
     drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
 };
-use quip_solver_conformance::solve::drive_solve;
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
@@ -245,7 +245,10 @@ async fn quip_metal_msa_passes_conformance() {
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
 }
 
-async fn assert_solve_conformant(bin: &str) {
+/// Grade a kernel against the `--solve` gate, and require the linear-schedule
+/// case and the given limit cases to pass: a model at each advertised limit
+/// solves, one past it is refused as capacity.
+async fn assert_solve_conformant(bin: &str, limit_cases: &[&str]) {
     ensure_built(&[bin]);
     let report = drive_solve(&profile_bin(bin)).await;
     assert!(
@@ -253,21 +256,40 @@ async fn assert_solve_conformant(bin: &str) {
         "{bin}: --solve not conformant:\n{}",
         report.summary()
     );
+    for case in ["linear-schedule"].iter().chain(limit_cases) {
+        assert_eq!(
+            report.outcome(case),
+            Some(&CaseOutcome::Passed),
+            "{bin} {case}:\n{}",
+            report.summary()
+        );
+    }
 }
+
+const FIELD_LIMIT_CASES: &[&str] = &["field-limit-inside", "field-limit-outside"];
 
 #[tokio::test]
 async fn quip_metal_sa_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-sa").await;
+    assert_solve_conformant("quip-metal-sa", FIELD_LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_gibbs_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-gibbs").await;
+    assert_solve_conformant("quip-metal-gibbs", FIELD_LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_msa_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-msa").await;
+    assert_solve_conformant(
+        "quip-metal-msa",
+        &[
+            "degree-limit-inside",
+            "degree-limit-outside",
+            "field-limit-inside",
+            "field-limit-outside",
+        ],
+    )
+    .await;
 }
 
 #[test]
