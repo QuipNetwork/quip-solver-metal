@@ -172,9 +172,10 @@ kernel void pure_simulated_annealing(
 
         // A zero xorshift32 state is a fixed point (xorshift(0) == 0), which
         // freezes this thread's whole RNG stream at a constant. The mixing
-        // above can yield 0 (e.g. public seed 12344 -> base_seed 12345, whose
-        // thread_id 1 mixes to 12345 ^ 12345 == 0). Substitute the nonzero
-        // state 1; every nonzero mixed value is preserved unchanged.
+        // above yields 0 whenever base_seed, the host's kernel_seed of the
+        // public seed, equals thread_id * 12345u (e.g. base_seed 12345 at
+        // thread_id 1). Substitute the nonzero state 1; every nonzero mixed
+        // value is preserved unchanged.
         if (rng_state == 0u) {
             rng_state = 1u;
         }

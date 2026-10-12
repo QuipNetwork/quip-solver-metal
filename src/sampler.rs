@@ -1352,7 +1352,8 @@ fn encode_batch_inner(
         n,
         num_betas: beta.len() as i32,
         sweeps_per,
-        base_seed: kernel_seed(params.seed).wrapping_add(1),
+        // Every batch kernel maps a zero seed to 1 itself.
+        base_seed: kernel_seed(params.seed),
         num_threads,
         num_problems,
         num_reads,
