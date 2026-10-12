@@ -182,6 +182,7 @@ impl CascadeSettings {
             && params.num_reads >= CHAIN_GATES.min_reads
             && params.sweeps_per_beta == 1
             && params.beta_range.is_none()
+            && params.schedule == quip_solver_core::BetaSchedule::Geometric
     }
 
     /// The configured settings, or the chain-gated plan when `gated`. Open
@@ -827,6 +828,7 @@ struct ScheduleKey {
     cold: u64,
     sweeps: usize,
     per_beta: usize,
+    kind: quip_solver_core::BetaSchedule,
     stages: [usize; MAX_STAGES],
 }
 
@@ -870,6 +872,7 @@ impl ScheduleCache {
             cold: cold.to_bits(),
             sweeps: job.params.num_sweeps,
             per_beta: job.params.sweeps_per_beta,
+            kind: job.params.schedule,
             stages,
         };
         // Compute the graph-dependent range before locking. Cache hits only
@@ -1021,8 +1024,13 @@ pub(crate) fn segment_schedule(
         .beta_range
         .unwrap_or_else(|| resident_beta_range(graph));
     let standard = |schedule: &mut Vec<f32>, sweeps: usize| {
-        let (betas, repeats) =
-            build_beta_schedule(graph, sweeps, params.sweeps_per_beta, Some((hot, cold)));
+        let (betas, repeats) = build_beta_schedule(
+            graph,
+            sweeps,
+            params.sweeps_per_beta,
+            Some((hot, cold)),
+            params.schedule,
+        );
         let end = schedule.len() + sweeps;
         for beta in &betas {
             schedule.extend(std::iter::repeat_n(
@@ -1189,7 +1197,13 @@ mod tests {
                         .chain(std::iter::once(sweeps))
                         .collect();
                     let lone = |leg: usize| {
-                        let (standard, repeat) = build_beta_schedule(&graph, leg, repeats, range);
+                        let (standard, repeat) = build_beta_schedule(
+                            &graph,
+                            leg,
+                            repeats,
+                            range,
+                            quip_solver_core::BetaSchedule::Geometric,
+                        );
                         let mut part: Vec<_> = standard
                             .iter()
                             .flat_map(|b| std::iter::repeat_n(*b, repeat))
@@ -1234,7 +1248,17 @@ mod tests {
     fn a_job_without_checkpoints_keeps_one_standard_schedule() {
         for sweeps in [100, 256, 1000] {
             let (s, c, _) = segment_schedule(&ring(), &params(sweeps, 1), &[]);
-            assert_eq!(s, build_beta_schedule(&ring(), sweeps, 1, None).0);
+            assert_eq!(
+                s,
+                build_beta_schedule(
+                    &ring(),
+                    sweeps,
+                    1,
+                    None,
+                    quip_solver_core::BetaSchedule::Geometric
+                )
+                .0
+            );
             assert_eq!(c, vec![sweeps]);
         }
     }
@@ -1405,7 +1429,14 @@ mod tests {
         assert_eq!(s.len(), 256 + 1000);
         assert_eq!(c, vec![32, 256, 1256]);
         assert_eq!(fresh_from, 2);
-        let standard = build_beta_schedule(&ring(), 32, 4, None).0;
+        let standard = build_beta_schedule(
+            &ring(),
+            32,
+            4,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         for (chunk, beta) in s[..32].chunks(4).zip(standard) {
             assert_eq!(chunk, &[beta; 4]);
         }
@@ -1426,9 +1457,39 @@ mod tests {
     #[test]
     fn a_fresh_leg_equals_a_lone_anneal_of_its_budget() {
         let (s, _, _) = segment_schedule(&ring(), &params(1000, 1), &[32, 256, 512]);
-        assert_eq!(s[..32], build_beta_schedule(&ring(), 32, 1, None).0);
-        assert_eq!(s[256..768], build_beta_schedule(&ring(), 512, 1, None).0);
-        assert_eq!(s[768..], build_beta_schedule(&ring(), 1000, 1, None).0);
+        assert_eq!(
+            s[..32],
+            build_beta_schedule(
+                &ring(),
+                32,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric
+            )
+            .0
+        );
+        assert_eq!(
+            s[256..768],
+            build_beta_schedule(
+                &ring(),
+                512,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric
+            )
+            .0
+        );
+        assert_eq!(
+            s[768..],
+            build_beta_schedule(
+                &ring(),
+                1000,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric
+            )
+            .0
+        );
     }
 
     #[test]
@@ -1989,7 +2050,17 @@ mod tests {
             let (t, s, checkpoints) = c.admit(&job(0, budget));
             assert_eq!(t.gates, 0);
             assert_eq!(checkpoints, vec![budget]);
-            assert_eq!(s, build_beta_schedule(&ring(), budget, 1, None).0);
+            assert_eq!(
+                s,
+                build_beta_schedule(
+                    &ring(),
+                    budget,
+                    1,
+                    None,
+                    quip_solver_core::BetaSchedule::Geometric
+                )
+                .0
+            );
         }
     }
 
@@ -2012,11 +2083,17 @@ mod tests {
         assert_eq!(original.watermark, Some(1));
         assert_eq!(
             s[..32],
-            build_beta_schedule(&original.graph, 32, 2, Some((0.1, 4.0)))
-                .0
-                .into_iter()
-                .flat_map(|b| [b; 2])
-                .collect::<Vec<_>>()
+            build_beta_schedule(
+                &original.graph,
+                32,
+                2,
+                Some((0.1, 4.0)),
+                quip_solver_core::BetaSchedule::Geometric
+            )
+            .0
+            .into_iter()
+            .flat_map(|b| [b; 2])
+            .collect::<Vec<_>>()
         );
         {
             let mut p = c.plan.lock().unwrap();
@@ -2146,11 +2223,17 @@ mod tests {
         let (s, checkpoints, fresh_from) = segment_schedule(&ring(), &params, &[32, 256]);
         assert_eq!(checkpoints, vec![32, 256, 1256]);
         assert_eq!(fresh_from, 2);
-        let continuing: Vec<_> = build_beta_schedule(&ring(), 256, 2, params.beta_range)
-            .0
-            .into_iter()
-            .flat_map(|b| [b; 2])
-            .collect();
+        let continuing: Vec<_> = build_beta_schedule(
+            &ring(),
+            256,
+            2,
+            params.beta_range,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0
+        .into_iter()
+        .flat_map(|b| [b; 2])
+        .collect();
         assert_eq!(s[..256], continuing[..]);
         assert_eq!(s[256], 0.5);
         assert_eq!(s[1255], 4.0);

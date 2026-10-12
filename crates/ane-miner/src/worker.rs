@@ -34,6 +34,7 @@ pub(crate) struct RawJob {
     pub(crate) num_sweeps: usize,
     pub(crate) sweeps_per_beta: usize,
     pub(crate) beta_range: Option<(f64, f64)>,
+    pub(crate) schedule: quip_solver_core::BetaSchedule,
     pub(crate) seed: u64,
 }
 
@@ -47,6 +48,7 @@ impl RawJob {
             num_sweeps: params.num_sweeps,
             sweeps_per_beta: params.sweeps_per_beta,
             beta_range: params.beta_range,
+            schedule: params.schedule,
             seed: params.seed,
         }
     }
@@ -62,8 +64,8 @@ impl RawJob {
                 num_reads: self.num_reads,
                 num_sweeps: self.num_sweeps,
                 sweeps_per_beta: self.sweeps_per_beta,
-                schedule: quip_solver_core::BetaSchedule::Geometric,
                 beta_range: self.beta_range,
+                schedule: self.schedule,
                 seed: self.seed,
             },
         )
@@ -240,7 +242,7 @@ mod tests {
 
     #[test]
     fn internal_messages_round_trip_exactly() {
-        let request = br#"{"command":"sample","job":{"h":[-1.0,1.0],"j":[1.0],"edges":[[0,1]],"num_reads":2,"num_sweeps":3,"sweeps_per_beta":1,"beta_range":[0.1,2.0],"seed":42}}"#;
+        let request = br#"{"command":"sample","job":{"h":[-1.0,1.0],"j":[1.0],"edges":[[0,1]],"num_reads":2,"num_sweeps":3,"sweeps_per_beta":1,"beta_range":[0.1,2.0],"schedule":"linear","seed":42}}"#;
         let parsed: WorkerRequest = read_message(&request[..]).unwrap();
         let mut bytes = Vec::new();
         write_message(&mut bytes, &parsed).unwrap();
@@ -259,11 +261,12 @@ mod tests {
             num_reads: 2,
             num_sweeps: 3,
             sweeps_per_beta: 2,
-            schedule: quip_solver_core::BetaSchedule::Geometric,
             beta_range: Some((0.25, 4.0)),
+            schedule: quip_solver_core::BetaSchedule::Linear,
             seed: 99,
         };
         let (graph_copy, params_copy) = RawJob::from_parts(&graph, &params).into_parts();
+        assert_eq!(params_copy.schedule, quip_solver_core::BetaSchedule::Linear);
         assert_eq!(graph_copy.h, vec![-1.0, 1.0]);
         assert_eq!(graph_copy.j, vec![1.0]);
         assert_eq!(*graph_copy.edges, [(0, 1)]);

@@ -987,7 +987,14 @@ mod tests {
 
     fn job(seed: u64, sweeps: usize, checkpoints: Vec<usize>) -> SlotJob {
         let graph = advantage2_system1(seed);
-        let schedule = build_beta_schedule(&graph, sweeps, 1, None).0;
+        let schedule = build_beta_schedule(
+            &graph,
+            sweeps,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         SlotJob {
             graph,
             schedule: schedule.into(),
@@ -1129,7 +1136,15 @@ mod tests {
             return;
         };
         let graph = advantage2_system1(7);
-        let shared: Arc<[f32]> = build_beta_schedule(&graph, 32, 1, None).0.into();
+        let shared: Arc<[f32]> = build_beta_schedule(
+            &graph,
+            32,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0
+        .into();
         let halved: Arc<[f32]> = shared.iter().map(|b| b * 0.5).collect();
         let with = |seed: u64, schedule: &Arc<[f32]>| SlotJob {
             graph: graph.clone(),
@@ -1299,8 +1314,22 @@ mod tests {
             return;
         };
         let graph = advantage2_system1(7);
-        let first = build_beta_schedule(&graph, 16, 1, None).0;
-        let second = build_beta_schedule(&graph, 48, 1, None).0;
+        let first = build_beta_schedule(
+            &graph,
+            16,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
+        let second = build_beta_schedule(
+            &graph,
+            48,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         let legs: Vec<f32> = first.iter().chain(&second).copied().collect();
         let mut pool = SlotPool::new(&device, &graph, 64, 2, legs.len()).unwrap();
         let two_legs = pool
@@ -1581,7 +1610,9 @@ mod tests {
         let graphs: Vec<_> = [7, 19, 43].into_iter().map(advantage2_system1).collect();
         let schedules: Vec<_> = graphs
             .iter()
-            .map(|g| build_beta_schedule(g, 32, 1, None).0)
+            .map(|g| {
+                build_beta_schedule(g, 32, 1, None, quip_solver_core::BetaSchedule::Geometric).0
+            })
             .collect();
         let steps = vec![vec![
             step(2, 43, 0, 32, 32),
@@ -1611,7 +1642,8 @@ mod tests {
             return;
         };
         let x = advantage2_system1(7);
-        let sched = build_beta_schedule(&x, 32, 1, None).0;
+        let sched =
+            build_beta_schedule(&x, 32, 1, None, quip_solver_core::BetaSchedule::Geometric).0;
         let alone = dispatch_slots(
             &device,
             std::slice::from_ref(&x),
@@ -1620,8 +1652,22 @@ mod tests {
         );
         let graphs = vec![advantage2_system1(19), advantage2_system1(43), x];
         let schedules = vec![
-            build_beta_schedule(&graphs[0], 16, 1, None).0,
-            build_beta_schedule(&graphs[1], 48, 1, None).0,
+            build_beta_schedule(
+                &graphs[0],
+                16,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric,
+            )
+            .0,
+            build_beta_schedule(
+                &graphs[1],
+                48,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric,
+            )
+            .0,
             sched,
         ];
         let beside = dispatch_slots(
@@ -1644,7 +1690,14 @@ mod tests {
             return;
         };
         let graph = advantage2_system1(7);
-        let schedule = build_beta_schedule(&graph, 64, 1, None).0;
+        let schedule = build_beta_schedule(
+            &graph,
+            64,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         let run = |count| {
             let steps: Vec<_> = (0..64)
                 .step_by(count)
@@ -1671,7 +1724,14 @@ mod tests {
         let first = limit + 17;
         let total = first + 31;
         assert!(total <= sampler::MAX_SWEEPS);
-        let schedule = build_beta_schedule(&graph, total, 1, None).0;
+        let schedule = build_beta_schedule(
+            &graph,
+            total,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         let mut pool = SlotPool::new(&device, &graph, READS, 1, total).unwrap();
         pool.admit(SlotJob {
             graph: graph.clone(),
@@ -1856,7 +1916,15 @@ mod tests {
         // from device memory regardless of where the previous one stopped).
         let checkpoint = 2 * OBSERVE_INTERVAL + 17;
         let graph = advantage2_system1(11);
-        let schedule: Arc<[f32]> = build_beta_schedule(&graph, checkpoint, 1, None).0.into();
+        let schedule: Arc<[f32]> = build_beta_schedule(
+            &graph,
+            checkpoint,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0
+        .into();
 
         let mut observed_pool = SlotPool::new(&device, &graph, READS, 1, checkpoint).unwrap();
         observed_pool
@@ -1909,7 +1977,14 @@ mod tests {
             return;
         };
         let graph = advantage2_system1(7);
-        let schedule = build_beta_schedule(&graph, 32, 1, None).0;
+        let schedule = build_beta_schedule(
+            &graph,
+            32,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         let mut no_output = step(0, 99, 0, 32, 32);
         no_output.flags = 0;
         let (energies, samples) =
@@ -2113,12 +2188,27 @@ mod tests {
             .collect();
         let device = MetalDevice::open(0).expect("Metal device 0");
         let graph = advantage2_system1(7);
-        let leg = build_beta_schedule(&graph, 8, 1, None).0;
+        let leg = build_beta_schedule(
+            &graph,
+            8,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
         let legs = 40_000;
         let screen: Arc<[f32]> = leg.iter().copied().cycle().take(8 * legs).collect();
         let screen_checkpoints: Vec<usize> = (1..=legs).map(|k| 8 * k).collect();
         let deep_sweeps = 4_000_000;
-        let deep_schedule: Arc<[f32]> = build_beta_schedule(&graph, deep_sweeps, 1, None).0.into();
+        let deep_schedule: Arc<[f32]> = build_beta_schedule(
+            &graph,
+            deep_sweeps,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0
+        .into();
         let capacity = crate::streaming::batch_size_for_reads(crate::Kernel::Msa, READS);
         for &deep_slice in &slices {
             let mut pool = SlotPool::new(&device, &graph, READS, capacity, deep_sweeps).unwrap();
