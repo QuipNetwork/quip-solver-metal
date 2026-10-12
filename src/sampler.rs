@@ -156,9 +156,12 @@ pub(crate) const MSA_THREADS: usize = 1024;
 /// Fixed group width for wide node-parallel Gibbs RNG streams.
 pub(crate) const WIDE_GIBBS_GROUP: usize = 128;
 
-/// Wide work per spin update for chunk sizing, measured in
+/// Wide SA work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-10-11-wide-path.md`.
-const WIDE_COST_FACTOR: f64 = 1.4;
+const WIDE_SA_COST_FACTOR: f64 = 1.4;
+/// Wide Gibbs work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-10-11-wide-path.md`.
+const WIDE_GIBBS_COST_FACTOR: f64 = 2.0;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -1451,15 +1454,18 @@ fn encode_batch_inner(
     );
     let inputs = upload_inputs(device, &cached, graphs, kernel, rep);
 
+    let cost = if wide {
+        match kernel {
+            Kernel::Sa => WIDE_SA_COST_FACTOR,
+            Kernel::Gibbs => WIDE_GIBBS_COST_FACTOR,
+            Kernel::Msa => 1.0,
+        }
+    } else {
+        1.0
+    };
     let plan = match plan_override {
         Some(p) => p.to_vec(),
-        None => chunk_plan(
-            kernel,
-            &dims,
-            groups,
-            in_flight,
-            if wide { WIDE_COST_FACTOR } else { 1.0 },
-        ),
+        None => chunk_plan(kernel, &dims, groups, in_flight, cost),
     };
     let mut pooled = Vec::new();
     let (out, kstate) = match kernel {
