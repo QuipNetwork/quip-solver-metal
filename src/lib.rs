@@ -820,10 +820,6 @@ mod tests {
         );
         assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
-        assert!(METAL_MSA_IDENTITY
-            .features
-            .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE));
-        assert_eq!(METAL_MSA_IDENTITY.limits.max_degree, Some(20));
         // Reads are pinned to whole words.
         assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
         assert_eq!(
@@ -832,6 +828,37 @@ mod tests {
         );
         const {
             assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
+        }
+    }
+
+    /// Every identity lists `linear-schedule` and states its node cap and
+    /// model limits. Device-free, like `--capabilities`.
+    #[test]
+    fn identities_advertise_linear_schedule_and_their_limits() {
+        use super::{METAL_GIBBS_IDENTITY, METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        use quip_solver_core::ModelLimits;
+        for (identity, nodes, degree, field) in [
+            (&METAL_SA_IDENTITY, 4593, 0, 63_000),
+            (&METAL_GIBBS_IDENTITY, 4800, 0, 127_000),
+            (&METAL_MSA_IDENTITY, 6016, 20, 21_000),
+        ] {
+            let algorithm = identity.algorithm;
+            assert!(
+                identity
+                    .features
+                    .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE),
+                "{algorithm:?}"
+            );
+            assert_eq!(identity.max_nodes, nodes, "{algorithm:?}");
+            assert_eq!(
+                identity.limits,
+                ModelLimits {
+                    max_degree: Some(degree),
+                    max_local_field_milli: Some(field),
+                    exact_resolution_milli: Some(1000),
+                },
+                "{algorithm:?}"
+            );
         }
     }
 
