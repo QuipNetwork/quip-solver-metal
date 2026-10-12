@@ -174,8 +174,13 @@ pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::
 };
 
 /// MSA's model limits, on the GPU and the ANE alike. Both unroll
-/// `sampler::MSA_MAX_DEG` neighbours and anneal on signs, so the field is at
-/// most one unit per neighbour plus one for the bias.
+/// `sampler::MSA_MAX_DEG` neighbours, which caps the degree, and the field
+/// limit is one unit per neighbour plus one for the bias. Like every
+/// `ModelLimits`, these are checked on the model as received. Both MSA engines
+/// anneal on signs only, so a model inside these limits with a coefficient
+/// above one unit in magnitude runs as its sign model, with only its energies
+/// rescored. `ModelLimits` cannot state a ±1-only contract yet (QUI-1832);
+/// refusing such a model is QUI-1642.
 pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
     max_degree: Some(crate::sampler::MSA_MAX_DEG as u32),
     max_local_field_milli: Some((crate::sampler::MSA_MAX_DEG as u32 + 1) * UNIT_MILLI),
