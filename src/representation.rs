@@ -60,6 +60,11 @@ pub(crate) fn classify(graph: &IsingGraph) -> Result<Representation, String> {
             graph.edges.len()
         ));
     }
+    for (k, &(u, v)) in graph.edges.iter().enumerate() {
+        if u == v {
+            return Err(format!("edge {k} is a self-loop at node {u}"));
+        }
+    }
     let mut field = vec![0_i64; n];
     for (i, &h) in graph.h.iter().enumerate() {
         let m = to_milli(h).ok_or_else(|| {
@@ -74,8 +79,6 @@ pub(crate) fn classify(graph: &IsingGraph) -> Result<Representation, String> {
         if u >= n || v >= n {
             return Err(format!("edge {k} has an endpoint outside 0..{n}"));
         }
-        // Both endpoints, also for a self-loop: an over-count only refuses
-        // sooner.
         field[u] += i64::from(m).abs();
         field[v] += i64::from(m).abs();
     }
@@ -170,5 +173,12 @@ mod tests {
     fn a_coupling_list_shorter_than_the_edges_is_refused() {
         let graph = IsingGraph::new(vec![0.0; 3], vec![1.0], vec![(0, 1), (1, 2)]);
         classify(&graph).unwrap_err();
+    }
+
+    #[test]
+    fn self_loop_is_refused_before_coefficient_conversion() {
+        let graph = IsingGraph::new(vec![0.0], vec![0.0005], vec![(0, 0)]);
+        let err = classify(&graph).unwrap_err();
+        assert!(err.contains("self-loop"), "{err}");
     }
 }

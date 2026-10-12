@@ -397,6 +397,9 @@ kernel void block_gibbs_sampler(
         }
     }
 
+#ifdef QUIP_WIDE
+    // The host scores wide samples; their total energy can exceed int.
+#else
     // Compute final energy: E = sum_i(h_i * x_i) + sum_{i<j}(J_ij * x_i * x_j)
     int current_energy = 0;
     for (int i = 0; i < n; i++) {
@@ -417,6 +420,7 @@ kernel void block_gibbs_sampler(
             }
         }
     }
+#endif
 
     // Persist state for next chunk (always write — the host decides
     // whether there will be a next chunk or not)
@@ -439,7 +443,11 @@ kernel void block_gibbs_sampler(
         output[byte_idx] = packed_state[byte_idx];
     }
 
+#ifdef QUIP_WIDE
+    // No device energy is needed for wide samples.
+#else
     final_energies[thread_id] = current_energy;
+#endif
 }
 
 // ==============================================================================
@@ -689,6 +697,9 @@ kernel void block_gibbs_parallel(
         }
     }
 
+#ifdef QUIP_WIDE
+    // The host scores wide samples; their total energy can exceed int.
+#else
     // Compute final energy collaboratively
     // Each thread computes partial energy for its subset of nodes
     int partial_energy = 0;
@@ -724,6 +735,7 @@ kernel void block_gibbs_parallel(
         }
         final_energies[sample_id] = total_energy;
     }
+#endif
 
     // Write final state to output - convert unpacked to packed format
     device int8_t* output = &final_samples[sample_id * packed_size];

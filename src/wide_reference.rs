@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! Integer host model of the wide SA and node-parallel Gibbs kernels.
+//! Integer host model of the wide SA and both Gibbs kernels.
 
 use quip_solver_core::{IsingGraph, SampleParams};
 
@@ -176,6 +176,44 @@ pub(crate) fn reference_gibbs_parallel(
         .collect()
 }
 
+fn reference_gibbs_sequential(graph: &IsingGraph, params: &SampleParams) -> Vec<Vec<i8>> {
+    let (topo, c) = csr(graph);
+    let colors = &topo.colors;
+    let n = graph.h.len();
+    let (betas, sweeps_per) = build_beta_schedule(
+        graph,
+        params.num_sweeps,
+        params.sweeps_per_beta,
+        params.beta_range,
+    );
+    let rows = heat_bath_rows(&betas, params.seed);
+    let base = (params.seed as u32).wrapping_add(1);
+    let base = if base == 0 { 1 } else { base };
+    (0..params.num_reads as u32)
+        .map(|thread_id| {
+            let mut rng = Xoshiro::seeded(base ^ thread_id.wrapping_mul(2_654_435_761));
+            let mut s: Vec<i32> = (0..n)
+                .map(|_| if rng.next() & 1 == 1 { -1 } else { 1 })
+                .collect();
+            for row in rows.as_chunks::<WIDE_ROW>().0 {
+                for _ in 0..sweeps_per {
+                    for color in 0..colors.num_colors as usize {
+                        let start = colors.starts[color] as usize;
+                        let count = colors.counts[color] as usize;
+                        for i in 0..count {
+                            let var = colors.nodes[start + i] as usize;
+                            let f = field(&c, var, &s);
+                            let r = rng.next() as usize & (WIDE_ROW - 1);
+                            s[var] = if f <= row[r] { 1 } else { -1 };
+                        }
+                    }
+                }
+            }
+            s.into_iter().map(|v| v as i8).collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,14 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn wide_gibbs_sequential_dispatches_when_selected() {
+    fn wide_gibbs_sequential_matches_the_host_reference_bit_for_bit() {
         if MetalDevice::device_count() == 0 || crate::sampler::gibbs_node_parallel() {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
         let graph = quarter_model();
-        let got = sample_ising(&dev, &graph, &params(), Kernel::Gibbs).unwrap();
-        assert_eq!(got.len(), params().num_reads);
-        assert!(got.iter().all(|read| read.spins.len() == graph.h.len()));
+        let got: Vec<Vec<i8>> = sample_ising(&dev, &graph, &params(), Kernel::Gibbs)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.spins)
+            .collect();
+        assert_eq!(got, reference_gibbs_sequential(&graph, &params()));
     }
 }

@@ -141,6 +141,21 @@ fn a_non_representable_model_is_refused_as_capacity() {
 }
 
 #[test]
+fn sa_and_gibbs_refuse_self_loops_for_int8_and_milli_models() {
+    let Some(dev) = device() else { return };
+    for j in [1.0, 0.5] {
+        let graph = IsingGraph::new(vec![0.0], vec![j], vec![(0, 0)]);
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let err = sample_ising(&dev, &graph, &params(16), kernel).unwrap_err();
+            assert!(
+                matches!(&err, SampleError::TooLarge(message) if message.contains("self-loop")),
+                "{kernel:?}, J={j}: {err:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_wide_path_repeats_exactly_for_a_fixed_seed() {
     let Some(dev) = device() else { return };
     let graph = quarter_qubo();
