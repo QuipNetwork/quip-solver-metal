@@ -248,8 +248,12 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: quip_solver_core::quip_proto::v1::Backend::Metal,
     algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
-    // Union capacity. Routing still enforces each engine's own limits.
-    max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
+    // The GPU kernel's capacity, the same constant as its dispatch guard. The
+    // ANE holds up to 16,384 nodes, but only with unit coefficients, at most
+    // 128 reads, and while it is enabled, so advertising its cap would admit
+    // models that the binary then refuses. `const` context, so the narrowing
+    // cast is checked at compile time.
+    max_nodes: crate::sampler::MSA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
     features: FEATURES,
     adapt: METAL_MSA_ADAPT,
@@ -809,7 +813,7 @@ mod tests {
             METAL_MSA_IDENTITY.algorithm,
             quip_solver_core::quip_proto::v1::Algorithm::Msa
         );
-        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
+        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
         assert!(METAL_MSA_IDENTITY
             .features

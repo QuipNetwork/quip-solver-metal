@@ -28,6 +28,7 @@ The existing `utilization` and `yielding` keys control Metal, including when it 
 ANE accepts unit values from `{-1,0,1}` and at most 128 reads. Its limits are 16,384 nodes, 163,840 edges, and nonzero degree 20.
 The ANE worker also checks its program and memory limits. Eligible jobs can still fail those later checks.
 A job outside ANE limits can use Metal if the settings permit Metal and the job fits its limits. Jobs outside every enabled engine return a capacity error.
+`quip-metal-msa` advertises Metal's 6,016-node cap, so the core refuses a larger model before it reaches either engine. ANE's own node limit applies only below that cap.
 
 Invalid TOML or an invalid engine selection closes admission until valid settings arrive. The first affected job returns a device fault with a config reason.
 The core `apply_config` interface returns no status, so the miner cannot reject the `Configure` frame itself.
