@@ -512,7 +512,8 @@ pub(crate) fn kernel_seed(seed: u64) -> u32 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
-    u32::try_from(z >> 32).unwrap_or(u32::MAX)
+    // The high word always fits, so the cast never truncates.
+    (z >> 32) as u32
 }
 
 /// Unpack one read's bit-packed spins (LSB-first per byte, bit=1 -> -1,
