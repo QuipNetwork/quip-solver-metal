@@ -156,8 +156,9 @@ pub(crate) const MSA_THREADS: usize = 1024;
 /// Fixed group width for wide node-parallel Gibbs RNG streams.
 pub(crate) const WIDE_GIBBS_GROUP: usize = 128;
 
-/// Exploratory wide work per spin update for chunk sizing; Task 8 calibrates it.
-const WIDE_COST_FACTOR: f64 = 4.0;
+/// Wide work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-10-11-wide-path.md`.
+const WIDE_COST_FACTOR: f64 = 1.4;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
