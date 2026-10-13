@@ -78,10 +78,10 @@ inline int8_t get_flip_energy(
     int8_t h_var = h_vals[var];
     energy += h_var;
 
-    // Delta energy = -2 * state[var] * energy
-    // Cast to int8_t (safe because -42 <= delta_E ≤ 42 for all topologies)
-    // Remember, it's a single flip, and J values are only ±1, so max energy is degree (~20 for Zephyr) + h (±1)
-    // Therefore, max delta_E = 2 * (degree + |h|) = 2 * 21 = 42, well within int8_t range
+    // Delta energy = -2 * state[var] * energy, cast to int8_t. The host
+    // advertises a local field |h| + sum |J| of at most 63 units
+    // (METAL_SA_LIMITS in src/lib.rs), so |delta_E| = 2 * |energy| <= 126,
+    // inside int8_t.
     int8_t var_spin = get_spin_packed(var, packed_state);
     return (int8_t)(-2 * var_spin * energy);
 }

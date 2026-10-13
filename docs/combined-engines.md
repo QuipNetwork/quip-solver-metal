@@ -25,9 +25,12 @@ Engines open on first use. An engine set to off stays closed. Metal also leaves 
 The miner reads the settings when it assigns each job. A later change does not move a job already assigned to an engine.
 The existing `utilization` and `yielding` keys control Metal, including when it opens after the first config.
 
-ANE accepts unit values from `{-1,0,1}` and at most 128 reads. Its limits are 16,384 nodes, 163,840 edges, and nonzero degree 20.
+ANE accepts unit values from `{-1,0,1}`, at most 128 reads, at most 163,840 edges, and nonzero degree 20.
 The ANE worker also checks its program and memory limits. Eligible jobs can still fail those later checks.
 A job outside ANE limits can use Metal if the settings permit Metal and the job fits its limits. Jobs outside every enabled engine return a capacity error.
+`quip-metal-msa` advertises Metal's 6,016-node cap, so the core refuses a larger model before it reaches either engine, and the ANE's 16,384-node limit never binds.
+Below the cap, the ANE's coefficient, read and degree limits decide whether it can take a job.
+For routing callers: ±1 models of 6,017 to 16,384 nodes with at most 128 reads, which an ANE-enabled `quip-metal-msa` used to solve, are now refused.
 
 Invalid TOML or an invalid engine selection closes admission until valid settings arrive. The first affected job returns a device fault with a config reason.
 The core `apply_config` interface returns no status, so the miner cannot reject the `Configure` frame itself.

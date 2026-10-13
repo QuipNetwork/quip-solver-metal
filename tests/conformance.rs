@@ -6,7 +6,7 @@
 use quip_solver_conformance::driver::{
     drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
 };
-use quip_solver_conformance::solve::drive_solve;
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_proto::v1::RejectReason;
 use std::process::Command;
 
@@ -245,7 +245,10 @@ async fn quip_metal_msa_passes_conformance() {
     assert_conformant("quip-metal-msa", &report, CONFIGURED_SWEEPS);
 }
 
-async fn assert_solve_conformant(bin: &str) {
+/// Grade a kernel against the `--solve` gate, and require the linear-schedule
+/// case and the given limit cases to pass: a model at each advertised limit
+/// solves, one past it is refused as capacity.
+async fn assert_solve_conformant(bin: &str, limit_cases: &[&str]) {
     ensure_built(&[bin]);
     let report = drive_solve(&profile_bin(bin)).await;
     assert!(
@@ -253,31 +256,51 @@ async fn assert_solve_conformant(bin: &str) {
         "{bin}: --solve not conformant:\n{}",
         report.summary()
     );
+    for case in ["linear-schedule"].iter().chain(limit_cases) {
+        assert_eq!(
+            report.outcome(case),
+            Some(&CaseOutcome::Passed),
+            "{bin} {case}:\n{}",
+            report.summary()
+        );
+    }
 }
+
+const FIELD_LIMIT_CASES: &[&str] = &["field-limit-inside", "field-limit-outside"];
 
 #[tokio::test]
 async fn quip_metal_sa_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-sa").await;
+    assert_solve_conformant("quip-metal-sa", FIELD_LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_gibbs_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-gibbs").await;
+    assert_solve_conformant("quip-metal-gibbs", FIELD_LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_msa_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-msa").await;
+    assert_solve_conformant(
+        "quip-metal-msa",
+        &[
+            "degree-limit-inside",
+            "degree-limit-outside",
+            "field-limit-inside",
+            "field-limit-outside",
+        ],
+    )
+    .await;
 }
 
 #[test]
 fn capabilities_and_version_and_check() {
     ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
 
-    for (bin, algo) in [
-        ("quip-metal-sa", "sa"),
-        ("quip-metal-msa", "msa"),
-        ("quip-metal-gibbs", "gibbs"),
+    // Per binary: algorithm, node cap, and the advertised model limits.
+    for (bin, algo, nodes, degree, field) in [
+        ("quip-metal-sa", "sa", 4593, 0, 63_000),
+        ("quip-metal-msa", "msa", 6016, 20, 21_000),
+        ("quip-metal-gibbs", "gibbs", 4800, 0, 127_000),
     ] {
         let path = profile_bin(bin);
 
@@ -291,6 +314,17 @@ fn capabilities_and_version_and_check() {
         );
         assert!(s.contains("\"protocolVersion\":2"), "{bin}: {s}");
         assert!(s.contains("\"ISING_GENERATE\""), "{bin}: {s}");
+        let caps: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            caps["features"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
+            "{bin}: {caps}"
+        );
+        assert_eq!(caps["maxNodes"], nodes, "{bin}: {caps}");
+        assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
+        assert_eq!(caps["exactResolutionMilli"], 1000, "{bin}: {caps}");
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());

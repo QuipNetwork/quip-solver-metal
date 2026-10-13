@@ -142,6 +142,51 @@ const _: () = assert!(
     "sampler::MAX_SWEEPS must admit METAL_MSA_ADAPT.max_sweeps"
 );
 
+/// Features every kernel advertises: a real `sample_stream` override, the
+/// IOKit governor, and a host-built ladder that honours
+/// `SampleParams::schedule`.
+const FEATURES: &[&str] = &[
+    "streaming",
+    "governor",
+    quip_solver_core::LINEAR_SCHEDULE_FEATURE,
+];
+
+/// One unit, in milli. Every kernel truncates each coefficient to an `int8` of
+/// whole units (`topology::quantize_i8`), so only whole units are exact.
+const UNIT_MILLI: u32 = 1000;
+
+/// SA's model limits. `kernels/sa.metal` keeps each flip's energy change in an
+/// `int8_t`, `-2 * s * (h + Σ J s)`, so the local field must stay within 63
+/// units or the change wraps.
+pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(63 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// Gibbs's model limits. `kernels/gibbs.metal` sums the field in `float`, so
+/// only the `int8` coefficients bound it: a field of at most 127 units keeps
+/// every coefficient inside one.
+pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(127 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// MSA's model limits, on the GPU and the ANE alike. Both unroll
+/// `sampler::MSA_MAX_DEG` neighbours, which caps the degree, and the field
+/// limit is one unit per neighbour plus one for the bias. Like every
+/// `ModelLimits`, these are checked on the model as received. Both MSA engines
+/// anneal on signs only, so a model inside these limits with a coefficient
+/// above one unit in magnitude runs as its sign model, with only its energies
+/// rescored. `ModelLimits` cannot state a ±1-only contract yet (QUI-1832);
+/// refusing such a model is QUI-1642.
+pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(crate::sampler::MSA_MAX_DEG as u32),
+    max_local_field_milli: Some((crate::sampler::MSA_MAX_DEG as u32 + 1) * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
 /// Backend identity for `quip-metal-sa`.
 ///
 /// # Examples
@@ -164,11 +209,9 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // A real `sample_stream` override and the IOKit governor — the two
-    // capability names `BackendIdentity::features` documents.
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_ADAPT,
+    limits: METAL_SA_LIMITS,
 };
 
 /// Backend identity for `quip-metal-gibbs`.
@@ -190,10 +233,9 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    // Same capability set as `METAL_SA_IDENTITY`: streaming + governor.
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_ADAPT,
+    limits: METAL_GIBBS_LIMITS,
 };
 
 /// Backend identity for `quip-metal-msa`.
@@ -211,12 +253,16 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: quip_solver_core::quip_proto::v1::Backend::Metal,
     algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
-    // Union capacity. Routing still enforces each engine's own limits.
-    max_nodes: quip_solver_ane::ANE_MSA_IDENTITY.max_nodes,
+    // The GPU kernel's capacity, the same constant as its dispatch guard. The
+    // ANE holds up to 16,384 nodes, but only with unit coefficients, at most
+    // 128 reads, and while it is enabled, so advertising its cap would admit
+    // models that the binary then refuses. `const` context, so the narrowing
+    // cast is checked at compile time.
+    max_nodes: crate::sampler::MSA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    limits: quip_solver_core::ModelLimits::UNSTATED,
-    features: &["streaming", "governor"],
+    features: FEATURES,
     adapt: METAL_MSA_ADAPT,
+    limits: METAL_MSA_LIMITS,
 };
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
@@ -772,7 +818,7 @@ mod tests {
             METAL_MSA_IDENTITY.algorithm,
             quip_solver_core::quip_proto::v1::Algorithm::Msa
         );
-        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 16_384);
+        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
         assert_eq!(METAL_MSA_IDENTITY.features, METAL_SA_IDENTITY.features);
         // Reads are pinned to whole words.
         assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
@@ -782,6 +828,37 @@ mod tests {
         );
         const {
             assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
+        }
+    }
+
+    /// Every identity lists `linear-schedule` and states its node cap and
+    /// model limits. Device-free, like `--capabilities`.
+    #[test]
+    fn identities_advertise_linear_schedule_and_their_limits() {
+        use super::{METAL_GIBBS_IDENTITY, METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+        use quip_solver_core::ModelLimits;
+        for (identity, nodes, degree, field) in [
+            (&METAL_SA_IDENTITY, 4593, 0, 63_000),
+            (&METAL_GIBBS_IDENTITY, 4800, 0, 127_000),
+            (&METAL_MSA_IDENTITY, 6016, 20, 21_000),
+        ] {
+            let algorithm = identity.algorithm;
+            assert!(
+                identity
+                    .features
+                    .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE),
+                "{algorithm:?}"
+            );
+            assert_eq!(identity.max_nodes, nodes, "{algorithm:?}");
+            assert_eq!(
+                identity.limits,
+                ModelLimits {
+                    max_degree: Some(degree),
+                    max_local_field_milli: Some(field),
+                    exact_resolution_milli: Some(1000),
+                },
+                "{algorithm:?}"
+            );
         }
     }
 
