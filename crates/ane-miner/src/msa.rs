@@ -1,6 +1,6 @@
 use crate::graph::MAX_LANES;
 use crate::AneError;
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
 use quip_solver_core::{IsingGraph, SampleParams};
 
 const MAX_SWEEPS: usize = 65_536;
@@ -59,7 +59,7 @@ pub(crate) fn schedule(graph: &IsingGraph, params: &SampleParams) -> Result<Vec<
     let (hot, cold) = params
         .beta_range
         .unwrap_or_else(|| default_ising_beta_range(graph));
-    let betas = geometric_beta_schedule(hot, cold, rung_count);
+    let betas = params.schedule.build(hot, cold, rung_count);
     let rungs = betas
         .into_iter()
         .enumerate()
@@ -434,6 +434,23 @@ mod tests {
         );
         assert!((rungs[0].beta - 0.25).abs() < 1e-12);
         assert!((rungs[2].beta - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_linear_schedule_spaces_its_rungs_evenly() {
+        let graph = IsingGraph::new(vec![1.0], vec![], vec![]);
+        let params = SampleParams {
+            num_sweeps: 5,
+            beta_range: Some((1.0, 5.0)),
+            schedule: quip_solver_core::BetaSchedule::Linear,
+            ..SampleParams::default()
+        };
+        let betas: Vec<f64> = schedule(&graph, &params)
+            .unwrap()
+            .iter()
+            .map(|rung| rung.beta)
+            .collect();
+        assert_eq!(betas, [1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
     #[test]

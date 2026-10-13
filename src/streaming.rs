@@ -250,6 +250,7 @@ struct BatchKey<'a> {
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    schedule: quip_solver_core::BetaSchedule,
 }
 
 impl<'a> BatchKey<'a> {
@@ -262,6 +263,7 @@ impl<'a> BatchKey<'a> {
             num_sweeps: job.params.num_sweeps,
             sweeps_per_beta: job.params.sweeps_per_beta.max(1),
             beta_range: job.params.beta_range,
+            schedule: job.params.schedule,
         }
     }
 
@@ -272,6 +274,7 @@ impl<'a> BatchKey<'a> {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
+            && self.schedule == job.params.schedule
             && self.edges == &*job.graph.edges
     }
 }
@@ -792,6 +795,17 @@ mod tests {
             // rule `quip-solver-core`'s `prepare_job` applies on the real path.
             watermark: None,
         }
+    }
+
+    /// A linear job must not share a geometric batch's beta buffer.
+    #[test]
+    fn batch_key_separates_schedule_kinds() {
+        let graph = IsingGraph::new(vec![0.0], vec![], vec![]);
+        let first = job(b"first", graph.clone(), 32, 4, 1);
+        let mut second = job(b"second", graph, 32, 4, 1);
+        assert!(BatchKey::from_job(&first).matches(&second));
+        second.params.schedule = quip_solver_core::BetaSchedule::Linear;
+        assert!(!BatchKey::from_job(&first).matches(&second));
     }
 
     #[test]
