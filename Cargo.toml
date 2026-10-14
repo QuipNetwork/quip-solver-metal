@@ -1,6 +1,6 @@
 [package]
 name = "quip-solver-metal"
-version = "0.3.3-rc7"
+version = "0.3.3"
 edition = "2021"
 # MSRV contract for consumers. `rust-toolchain.toml` pins the *build* toolchain
 # (1.97.1); this is the oldest compiler the crate is supported on.
