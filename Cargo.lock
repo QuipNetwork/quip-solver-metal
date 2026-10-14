@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-metal"
-version = "0.3.3-rc6"
+version = "0.3.3-rc7"
 dependencies = [
  "clap",
  "core-foundation-sys",
