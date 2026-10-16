@@ -91,6 +91,13 @@ pub(crate) struct CascadeSettings {
     pub(crate) keep_max: f64,
     pub(crate) audit: u32,
     pub(crate) yield_per_million: Option<f64>,
+    /// Screen chain-gated salts with unit couplings and zero fields through
+    /// [`ChainGates::screen`] before their slot stages.
+    pub(crate) screen: bool,
+    /// The job passed the screen: its gated plan starts at
+    /// [`ChainGates::deep_from`]. Set per job by preparation, never by
+    /// configuration.
+    pub(crate) deep: bool,
 }
 
 impl Default for CascadeSettings {
@@ -104,6 +111,8 @@ impl Default for CascadeSettings {
             keep_max: 30_000.0,
             audit: 200,
             yield_per_million: None,
+            screen: true,
+            deep: false,
         }
     }
 }
@@ -117,6 +126,13 @@ impl Default for CascadeSettings {
 /// one per doubling from 512 to 524,288, are the shallowest best over 2 seeds
 /// that run every checkpoint and a 1,048,576-sweep final leg, plus 20. No
 /// traced run fails a gate. 57 percent of the deep runs reach -14,750.
+///
+/// The screen stages replace the four screening gates for salts the
+/// nonce-parallel screen takes (`crate::screen`). Each is a new standard
+/// anneal of 4 reads, gated on their best. Measured on the same problems with
+/// `screen::tests::screen_trace` (10 seeds) against 3,000 fresh problems
+/// (2 seeds): the pair keeps 99.1 percent of winner runs and passes 2 of
+/// 6,000 fresh runs.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
     pub(crate) stages: &'static [usize],
@@ -125,6 +141,10 @@ pub(crate) struct ChainGates {
     /// Final budget for a gated job, whatever the job asked for. Few models
     /// survive the last gate, so a deep final stage costs little.
     pub(crate) full_sweeps: usize,
+    /// `(sweeps, gate)` of each screen stage.
+    pub(crate) screen: &'static [(usize, i64)],
+    /// First slot stage of a job that passed the screen.
+    pub(crate) deep_from: usize,
 }
 
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
@@ -152,6 +172,8 @@ pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     ],
     min_reads: 64,
     full_sweeps: 1_048_576,
+    screen: &[(16, -13_614_000), (128, -14_274_000)],
+    deep_from: 4,
 };
 
 /// FNV-1a over the node count and the sorted, normalized edge list, so edge
@@ -184,14 +206,16 @@ impl CascadeSettings {
 
     /// The configured settings, or the chain-gated plan when `gated`. Open
     /// gates keep the configured stages, so a study can place checkpoints.
+    /// A [`Self::deep`] job keeps the gates from [`ChainGates::deep_from`].
     pub(crate) fn effective(self, gated: bool) -> Self {
         if gated && !self.open_gates {
+            let from = if self.deep { CHAIN_GATES.deep_from } else { 0 };
             let mut gates = [None; MAX_STAGES];
-            for (gate, &value) in gates.iter_mut().zip(CHAIN_GATES.gates) {
+            for (gate, &value) in gates.iter_mut().zip(&CHAIN_GATES.gates[from..]) {
                 *gate = Some(value);
             }
             Self {
-                stages: stage_array(CHAIN_GATES.stages),
+                stages: stage_array(&CHAIN_GATES.stages[from..]),
                 gates,
                 ..self
             }
@@ -210,6 +234,7 @@ pub(crate) struct CascadeToml {
     pub(crate) cascade_keep_max: Option<u32>,
     pub(crate) cascade_audit: Option<u32>,
     pub(crate) cascade_yield_per_million: Option<f64>,
+    pub(crate) cascade_screen: Option<bool>,
 }
 
 impl CascadeSettings {
@@ -231,6 +256,9 @@ impl CascadeSettings {
         }
         if let Some(open) = cfg.cascade_open_gates {
             self.open_gates = open;
+        }
+        if let Some(screen) = cfg.cascade_screen {
+            self.screen = screen;
         }
         let keep = cfg.cascade_keep.map_or(self.keep, f64::from);
         let min = cfg.cascade_keep_min.map_or(self.keep_min, f64::from);
@@ -346,6 +374,8 @@ pub(crate) struct Stats {
     started: Instant,
     pub(crate) models: u64,
     pub(crate) levels: [Option<LevelStats>; MAX_STAGES],
+    /// Screen stages, reported before the slot checkpoints.
+    pub(crate) screen: [Option<LevelStats>; 2],
 }
 
 impl Stats {
@@ -354,11 +384,16 @@ impl Stats {
             started: now,
             models: 0,
             levels: [None; MAX_STAGES],
+            screen: [None; 2],
         }
     }
 
     fn record(&mut self, level: usize, sweeps: usize, kept: bool) {
-        let entry = self.levels[level].get_or_insert(LevelStats {
+        Self::count(&mut self.levels[level], sweeps, kept);
+    }
+
+    fn count(level: &mut Option<LevelStats>, sweeps: usize, kept: bool) {
+        let entry = level.get_or_insert(LevelStats {
             sweeps,
             checked: 0,
             kept: 0,
@@ -500,14 +535,19 @@ impl Controller {
         }
         let stats = std::mem::replace(&mut self.stats, Stats::new(now));
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
+        let percent = |l: &LevelStats| 100.0 * l.kept as f64 / l.checked.max(1) as f64;
         let pass: Vec<String> = stats
-            .levels
+            .screen
             .iter()
             .flatten()
-            .map(|l| {
-                let percent = 100.0 * l.kept as f64 / l.checked.max(1) as f64;
-                format!("{}sw:{percent:.2}%", l.sweeps)
-            })
+            .map(|l| format!("screen{}sw:{:.3}%", l.sweeps, percent(l)))
+            .chain(
+                stats
+                    .levels
+                    .iter()
+                    .flatten()
+                    .map(|l| format!("{}sw:{:.2}%", l.sweeps, percent(l))),
+            )
             .collect();
         let (best, worst) = self.range.map_or((String::new(), String::new()), |(b, w)| {
             (energy(b), energy(w))
@@ -612,13 +652,20 @@ impl Controller {
         // Only settings changes rebuild on the runner. Queued jobs must use
         // the current gate plan.
         if schedule.settings.stages != self.settings.stages {
-            let rebuilt =
-                PreparedSchedule::new(job, self.settings, schedule.gated, schedule.screen);
+            let settings = CascadeSettings {
+                deep: schedule.settings.deep,
+                ..self.settings
+            };
+            let rebuilt = PreparedSchedule::new(job, settings, schedule.gated, schedule.screen);
             crate::slots::validate_schedule(&rebuilt.betas, &rebuilt.checkpoints)?;
             *schedule = rebuilt;
         }
         if schedule.checkpoints.len() > 1 {
-            let wanted = self.settings.effective(schedule.gated);
+            let wanted = CascadeSettings {
+                deep: schedule.settings.deep,
+                ..self.settings
+            }
+            .effective(schedule.gated);
             if !self.same_topology(job.graph.num_nodes(), edges) {
                 self.plan = Arc::new(Mutex::new(StagePlan::new(wanted)));
                 self.topology = Some((job.graph.num_nodes(), Arc::clone(edges)));
@@ -746,6 +793,27 @@ impl Controller {
         if round > self.round {
             self.round = round;
             self.range = None;
+        }
+    }
+
+    /// A salt checked at screen stage `stage` of [`ChainGates::screen`].
+    pub(crate) fn screened(&mut self, stage: usize, kept: bool) {
+        Stats::count(
+            &mut self.stats.screen[stage],
+            CHAIN_GATES.screen[stage].0,
+            kept,
+        );
+    }
+
+    /// A salt the screen answered, with its lease round and best.
+    pub(crate) fn screen_finished(&mut self, round: u64, best: i64) {
+        self.enter_round(round);
+        self.stats.models += 1;
+        if round == self.round {
+            self.range = Some(
+                self.range
+                    .map_or((best, best), |(b, w)| (b.min(best), w.max(best))),
+            );
         }
     }
 

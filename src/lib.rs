@@ -56,6 +56,7 @@ mod lease_turn;
 mod model_checks;
 mod representation;
 mod resident;
+mod screen;
 mod slots;
 #[cfg(test)]
 mod wide_reference;

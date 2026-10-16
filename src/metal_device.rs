@@ -81,6 +81,8 @@ pub struct MetalDevice {
     pub(crate) msa: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
+    /// Nonce-parallel screen: eight models of four reads per word.
+    pub(crate) msa_screen: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,
     /// Multi-spin batch buffers returned after their command buffers retire.
@@ -133,6 +135,7 @@ impl MetalDevice {
             compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
+        let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -147,6 +150,7 @@ impl MetalDevice {
             gibbs_parallel_wide,
             msa,
             msa_slots,
+            msa_screen,
             topology_cache: crate::sampler::TopologyCache::default(),
             buffer_pool: std::sync::Arc::new(crate::sampler::BufferPool::default()),
         })
@@ -305,7 +309,7 @@ mod tests {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
-        for pipeline in [&dev.msa, &dev.msa_slots] {
+        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
             assert!(pipeline.static_threadgroup_memory_length() as usize <= 32 * 4 + 16);
         }
     }
@@ -318,7 +322,7 @@ mod tests {
         let dev = MetalDevice::open(0).unwrap();
         // The host requests 1,024 threads per multi-spin threadgroup and clamps
         // to the pipeline maximum. Require support for at least 256 threads.
-        for pipeline in [&dev.msa, &dev.msa_slots] {
+        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
             assert!(pipeline.max_total_threads_per_threadgroup() >= 256);
             // Static threadgroup lane totals must leave room for the
             // largest advertised N at 4 bytes per spin under the 32 KB cap.

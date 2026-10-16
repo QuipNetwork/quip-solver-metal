@@ -209,6 +209,9 @@ pub(crate) struct Checkpoint {
     pub(crate) observe: bool,
     /// Sweeps of the current anneal completed as of this readback.
     pub(crate) position: usize,
+    /// Every read's energy at this readback, for the trace tools.
+    #[cfg(test)]
+    pub(crate) energies: Vec<i32>,
 }
 
 struct ResidentJob {
@@ -532,10 +535,23 @@ impl SlotPool {
     /// jobs at their final checkpoint before submitting another step. A job
     /// in a fresh leg (see [`SlotJob::fresh_from`]) advances up to
     /// `deep_slice` sweeps, every other job up to `slice`.
+    #[cfg(test)]
     pub(crate) fn commit_step(
         &mut self,
         slice: usize,
         deep_slice: usize,
+    ) -> Result<bool, SampleError> {
+        self.commit_step_with(slice, deep_slice, None)
+    }
+
+    /// [`Self::commit_step`], with `screen`'s dispatch in the same compute
+    /// encoder under concurrent dispatch, so the two overlap on the GPU.
+    /// Commits nothing, and returns false, when no slot is live.
+    pub(crate) fn commit_step_with(
+        &mut self,
+        slice: usize,
+        deep_slice: usize,
+        screen: Option<&crate::screen::ScreenBank>,
     ) -> Result<bool, SampleError> {
         self.idle()?;
         if self.live() == 0 {
@@ -602,7 +618,11 @@ impl SlotPool {
         }
         self.write(25, 0, &self.steps)?;
         let command = self.queue.new_command_buffer().to_owned();
-        let encoder = command.new_compute_command_encoder();
+        let encoder = if screen.is_some() {
+            command.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        } else {
+            command.new_compute_command_encoder()
+        };
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&self.cached.row), 0);
         encoder.set_buffer(1, Some(&self.cached.col), 0);
@@ -634,11 +654,20 @@ impl SlotPool {
             MTLSize::new((self.steps.len() * self.words) as u64, 1, 1),
             MTLSize::new(self.threads as u64, 1, 1),
         );
+        if let Some(Err(error)) = screen.map(|screen| screen.encode(encoder)) {
+            encoder.end_encoding();
+            return Err(error);
+        }
         encoder.end_encoding();
         self.committed = sampler::host_seconds();
         command.commit();
         self.command = Some(command);
         Ok(true)
+    }
+
+    /// The command in flight, if any.
+    pub(crate) fn command(&self) -> Option<metal::CommandBuffer> {
+        self.command.clone()
     }
 
     pub(crate) fn wait(&self) {
@@ -726,6 +755,8 @@ impl SlotPool {
                     best,
                     observe,
                     position: r.position - r.anneal_start(index),
+                    #[cfg(test)]
+                    energies: slot_energies,
                 });
             }
         }
@@ -2038,7 +2069,10 @@ mod tests {
     /// Ignored: needs a Metal device and a problem directory written by
     /// `scripts/testnet/regen`. Every problem must share one topology with
     /// zero fields, so one schedule serves all of them. Writes
-    /// `qblock_id,k,best_<stage>...,best_<sweeps>`.
+    /// `qblock_id,k,best_<stage>...,best_<sweeps>`. An empty
+    /// `QUIP_TRACE_STAGES` runs one standard anneal of `QUIP_TRACE_SWEEPS`.
+    /// `QUIP_TRACE_READ_COUNTS=4,8` adds `best_<stage>_r4` and `best_<stage>_r8`
+    /// after each `best_<stage>`: the best over that many of the reads.
     ///
     /// ```text
     /// QUIP_TRACE_PROBLEMS=dir QUIP_TRACE_OUT=trace.csv QUIP_TRACE_STAGES=8,16,64 \
@@ -2066,8 +2100,17 @@ mod tests {
         let out = std::env::var("QUIP_TRACE_OUT").expect("QUIP_TRACE_OUT");
         let stages: Vec<usize> = var("QUIP_TRACE_STAGES", "8,16,64")
             .split(',')
+            .filter(|s| !s.is_empty())
             .map(|s| s.parse().unwrap())
             .collect();
+        // Best over the first k reads at each checkpoint, for each k listed;
+        // empty keeps the best over all reads only.
+        let read_counts: Vec<usize> = var("QUIP_TRACE_READ_COUNTS", "")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert!(read_counts.iter().all(|&k| (1..=READS).contains(&k)));
         let sweeps: usize = var("QUIP_TRACE_SWEEPS", "256").parse().unwrap();
         let seeds: u64 = var("QUIP_TRACE_SEEDS", "30").parse().unwrap();
         let slice: usize = var("QUIP_TRACE_SLICE", "4096").parse().unwrap();
@@ -2138,7 +2181,11 @@ mod tests {
             pool.wait();
             for checkpoint in pool.take_checkpoints().unwrap() {
                 let key = owner[checkpoint.slot].expect("live slot has an owner");
-                rows.entry(key).or_default().push(checkpoint.best);
+                let row = rows.entry(key).or_default();
+                row.push(checkpoint.best);
+                for &k in &read_counts {
+                    row.push(i64::from(*checkpoint.energies[..k].iter().min().unwrap()));
+                }
                 if checkpoint.last {
                     pool.release(checkpoint.slot).unwrap();
                     owner[checkpoint.slot] = None;
@@ -2153,6 +2200,9 @@ mod tests {
         let mut text = String::from("qblock_id,k");
         for stage in stages.iter().filter(|&&s| s < sweeps).chain([&sweeps]) {
             text.push_str(&format!(",best_{stage}"));
+            for k in &read_counts {
+                text.push_str(&format!(",best_{stage}_r{k}"));
+            }
         }
         text.push('\n');
         for ((qblock, k), bests) in &rows {
