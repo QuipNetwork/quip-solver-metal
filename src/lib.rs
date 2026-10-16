@@ -374,7 +374,9 @@ impl MetalSampler {
         gov: crate::iokit_gov::UtilGovernor,
         kernel: Kernel,
     ) -> Self {
-        let (salts_tx, salts_rx) = std::sync::mpsc::sync_channel(resident::PREP_BOUND);
+        // Deep enough that preparation keeps the screen fed while the runner
+        // waits on the GPU.
+        let (salts_tx, salts_rx) = std::sync::mpsc::sync_channel(resident::SCREEN_PREP_BOUND);
         Self {
             device,
             gov,

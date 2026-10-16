@@ -11,7 +11,7 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, SampleError, MSA_THREADS};
-use crate::IsingGraph;
+use crate::{IsingGraph, SamplerResult};
 use metal::MTLSize;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -284,7 +284,6 @@ impl ScreenBank {
     }
 
     /// The spins of read `read` of model `group` in `word`.
-    #[cfg(test)]
     pub(crate) fn spins(
         &self,
         word: usize,
@@ -298,9 +297,10 @@ impl ScreenBank {
     }
 }
 
-/// Words each of a [`Screener`]'s two banks holds: 1,280 models. A
-/// dispatch of this many 16-sweep words takes about 4 ms on an M4 Max.
-pub(crate) const BANK_WORDS: usize = 160;
+/// Words each of a [`Screener`]'s two banks holds: 2,560 models. A
+/// 128-sweep word takes about 7 ms on one core; this many 16-sweep words
+/// keep the other cores of an M4 Max busy for about as long.
+pub(crate) const BANK_WORDS: usize = 320;
 /// Longest wait of a model for the rest of its word.
 const FLUSH: Duration = Duration::from_millis(2);
 
@@ -313,7 +313,13 @@ struct Entry<T> {
 /// What one harvested model did at its screen stage.
 pub(crate) enum Verdict<T> {
     /// Failed stage `stage` with best `best`; the model leaves the screen.
-    Failed { item: T, stage: usize, best: i64 },
+    /// `reads` holds its [`READS`] reads when the harvest asked for them.
+    Failed {
+        item: T,
+        stage: usize,
+        best: i64,
+        reads: Option<Vec<SamplerResult>>,
+    },
     /// Passed stage `stage` and waits for the next one.
     Kept { stage: usize },
     /// Passed the last stage with best `best`; the model leaves the screen.
@@ -441,9 +447,14 @@ impl<T> Screener<T> {
         Ok(())
     }
 
-    /// Wait for bank `bank`'s command and gate its models. Returns the
+    /// Wait for bank `bank`'s command and gate its models. A failed model
+    /// for which `wants_reads` returns true carries its reads. Returns the
     /// verdicts and the command's GPU time when it held only the screen.
-    pub(crate) fn harvest(&mut self, bank: usize) -> Result<(Vec<Verdict<T>>, u64), SampleError> {
+    pub(crate) fn harvest(
+        &mut self,
+        bank: usize,
+        mut wants_reads: impl FnMut(&T, i64) -> bool,
+    ) -> Result<(Vec<Verdict<T>>, u64), SampleError> {
         let Some(command) = self.command[bank].take() else {
             return Ok((Vec::new(), 0));
         };
@@ -462,16 +473,26 @@ impl<T> Screener<T> {
             .enumerate()
         {
             for (group, entry) in entries.into_iter().enumerate() {
-                let best = self.banks[bank]
-                    .energies(word, group)?
-                    .into_iter()
-                    .min()
-                    .unwrap_or(i64::MAX);
+                let energies = self.banks[bank].energies(word, group)?;
+                let best = energies.into_iter().min().unwrap_or(i64::MAX);
                 if best > self.gates[stage] {
+                    let reads = if wants_reads(&entry.item, best) {
+                        let mut reads = Vec::with_capacity(READS);
+                        for (read, &energy_milli) in energies.iter().enumerate() {
+                            reads.push(SamplerResult {
+                                spins: self.banks[bank].spins(word, group, read)?,
+                                energy_milli,
+                            });
+                        }
+                        Some(reads)
+                    } else {
+                        None
+                    };
                     verdicts.push(Verdict::Failed {
                         item: entry.item,
                         stage,
                         best,
+                        reads,
                     });
                 } else if stage + 1 < self.gates.len() {
                     verdicts.push(Verdict::Kept { stage });

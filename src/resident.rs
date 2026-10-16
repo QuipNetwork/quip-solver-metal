@@ -90,13 +90,6 @@ impl LeaseTopK {
         })))
     }
 
-    /// Whether `energy_milli` would enter the running top
-    /// [`LEASE_TOP_N`], without entering it.
-    fn qualifies(&self, energy_milli: i64) -> bool {
-        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        state.len < LEASE_TOP_N || energy_milli < state.energies[LEASE_TOP_N - 1]
-    }
-
     /// Offers a finished unit's best energy to the lease's running top
     /// [`LEASE_TOP_N`]. Returns whether it enters. A tie with the current
     /// worst kept entry does not enter. Inserts in sorted position when it
@@ -1034,7 +1027,7 @@ pub(crate) const PREP_WORKERS: usize = 8;
 pub(crate) const PREP_BOUND: usize = 40;
 /// Outstanding preparations while salts go to the screen. A candidate holds
 /// 5 KB of sign bits, not a model, and the screen takes up to 2,560 per turn.
-pub(crate) const SCREEN_PREP_BOUND: usize = 2_048;
+pub(crate) const SCREEN_PREP_BOUND: usize = 4_096;
 /// Models the runner keeps queued in the screen before it stops taking more.
 const SCREEN_QUEUE: usize = 2 * screen::BANK_WORDS * screen::GROUPS;
 /// Most sweeps a deep slot advances per step beside a screen dispatch, which
@@ -1395,9 +1388,8 @@ fn run_fallback(
     }
 }
 
-/// Answer or advance one screened salt. Survivors, and failures that a
-/// lease still wants (a running top-N entry or a live-target hit), go back
-/// to preparation for the deep plan.
+/// Answer or advance one screened salt. Survivors, and failures below the
+/// live target, go back to preparation for the deep plan.
 fn screen_verdict(
     verdict: Verdict<Salt>,
     controller: &mut Controller,
@@ -1410,8 +1402,21 @@ fn screen_verdict(
             controller.screened(stage, true);
             return;
         }
-        Verdict::Failed { item, stage, best } => {
+        Verdict::Failed {
+            item,
+            stage,
+            best,
+            reads,
+        } => {
             controller.screened(stage, false);
+            if let Some(reads) = reads {
+                controller.screen_finished(item.round, best);
+                let _ = item.reply.send(SaltOutcome::Survived {
+                    index: item.index,
+                    reads,
+                });
+                return;
+            }
             (item, best, false)
         }
         Verdict::Passed { item, best } => {
@@ -1423,9 +1428,7 @@ fn screen_verdict(
         let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
         return;
     }
-    let wanted = passed
-        || salt.top10.qualifies(best)
-        || salt.target.get().is_some_and(|target| best < target);
+    let wanted = passed || salt.target.get().is_some_and(|target| best < target);
     if wanted {
         let settings = CascadeSettings {
             deep: true,
@@ -1439,6 +1442,43 @@ fn screen_verdict(
         index: salt.index,
         energy_milli: best,
     });
+}
+
+/// Screen intake over a report window.
+struct ScreenWindow {
+    started: Instant,
+    offered: u64,
+    dispatches: u64,
+    words: u64,
+}
+
+impl ScreenWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            offered: 0,
+            dispatches: 0,
+            words: 0,
+        }
+    }
+
+    /// Log and restart once [`REPORT_PERIOD`] has passed.
+    fn report(&mut self, queued: usize, preparing: usize, parked: usize) {
+        let secs = self.started.elapsed().as_secs_f64();
+        if secs < REPORT_PERIOD.as_secs_f64() {
+            return;
+        }
+        tracing::info!(
+            salts_per_s = (self.offered as f64 / secs).round() as u64,
+            dispatches_per_s = (self.dispatches as f64 / secs).round() as u64,
+            words_per_dispatch = self.words / self.dispatches.max(1),
+            queued,
+            preparing,
+            parked,
+            "screen report"
+        );
+        *self = Self::new();
+    }
 }
 
 /// Run on the sampler's blocking thread; no Metal object leaves this thread.
@@ -1476,6 +1516,10 @@ pub(crate) fn run(
     // The screen of the current lease topology, created by its first candidate.
     let mut screener: Option<(Arc<ScreenPlan>, Screener<Salt>)> = None;
     let mut pending: Option<Ready> = None;
+    // Slot units that found the pool full while the screen runs. They wait
+    // here so screen candidates behind them keep flowing.
+    let mut parked: VecDeque<Prepared> = VecDeque::new();
+    let mut screen_window = ScreenWindow::new();
     let mut eof = false;
     let mut prefer_salt = true;
     let mut turn = 0;
@@ -1540,7 +1584,12 @@ pub(crate) fn run(
         }
 
         if let Some((_, screen)) = &mut screener {
-            match screen.harvest(turn) {
+            // A screen failure that enters its lease's running top-N is
+            // pushed with its screen reads, as a gate-screened slot unit is.
+            let enters = |salt: &Salt, best: i64| {
+                !salt.stop.load(Ordering::Acquire) && salt.top10.offer(best)
+            };
+            match screen.harvest(turn, enters) {
                 Ok((verdicts, busy)) => {
                     gov.record_gpu_busy_us(busy);
                     busy_us = busy_us.saturating_add(busy);
@@ -1569,6 +1618,9 @@ pub(crate) fn run(
             let screen_full = screener
                 .as_ref()
                 .is_some_and(|(_, screen)| screen.queued() >= SCREEN_QUEUE);
+            if pending.is_none() && !full {
+                pending = parked.pop_front().map(Ready::Unit);
+            }
             if pending.is_none() {
                 // Refill as admissions consume replies. The preparation bound
                 // must not cap slot occupancy for small read counts or a larger
@@ -1623,10 +1675,15 @@ pub(crate) fn run(
                         continue;
                     }
                     preparation.bound = SCREEN_PREP_BOUND;
+                    screen_window.offered += 1;
                     screen.offer(candidate.salt, candidate.bits);
                     continue;
                 }
                 Some(Ready::Unit(prepared)) => {
+                    if full && screener.is_some() {
+                        parked.push_back(prepared);
+                        continue;
+                    }
                     if full {
                         pending = Some(Ready::Unit(prepared));
                         break;
@@ -1770,7 +1827,13 @@ pub(crate) fn run(
         let screen_idle = screener
             .as_ref()
             .is_none_or(|(_, screen)| screen.is_empty());
-        if empty && screen_idle && eof && pending.is_none() && preparation.len() == 0 {
+        if empty
+            && screen_idle
+            && eof
+            && pending.is_none()
+            && parked.is_empty()
+            && preparation.len() == 0
+        {
             break;
         }
         // Flush partial screen words when no more salts are on the way.
@@ -1785,6 +1848,13 @@ pub(crate) fn run(
             },
             None => 0,
         };
+        if words > 0 {
+            screen_window.dispatches += 1;
+            screen_window.words += words as u64;
+        }
+        if let Some((_, screen)) = &screener {
+            screen_window.report(screen.queued(), preparation.len(), parked.len());
+        }
         let mut shared = false;
         if let Some(pools) = &mut pools {
             if gov.should_throttle() {
@@ -1877,6 +1947,9 @@ pub(crate) fn run(
     // one terminal send attempt, and workers never send stream results.
     let error =
         fault.unwrap_or_else(|| SampleError::Driver("resident result receiver closed".into()));
+    for prepared in parked {
+        reject_or_cancel(out, prepared.origin, prepared.job, &error, cancel);
+    }
     reject_preparation(
         &mut preparation,
         pending,
@@ -2934,6 +3007,43 @@ mod tests {
         );
         runner.join().unwrap();
         assert!(outcomes.try_recv().is_err());
+    }
+
+    /// With an empty lease top-N, screen failures that enter it are pushed
+    /// with their four screen reads and never run the deep plan; the rest
+    /// are screened.
+    #[test]
+    fn screen_pushes_top_n_entrants_with_their_screen_reads() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let total = 1_000;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (runner, outcomes) = run_aglais_salts(total, &LeaseTopK::new(), &stop);
+        let mut entrants = 0;
+        for _ in 0..total {
+            match outcomes
+                .recv_timeout(Duration::from_secs(600))
+                .expect("every salt answers")
+            {
+                SaltOutcome::Survived { reads, .. } if reads.len() == screen::READS => {
+                    for read in &reads {
+                        assert_eq!(read.spins.len(), 4577);
+                    }
+                    entrants += 1;
+                }
+                SaltOutcome::Survived { reads, .. } => assert_eq!(reads.len(), 64),
+                SaltOutcome::Screened { .. } => {}
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("salt {index}: {error}"),
+            }
+        }
+        runner.join().unwrap();
+        // About k + k ln(n / k) = 56 running top-10 entrants in 1,000 salts.
+        assert!(
+            (LEASE_TOP_N..=150).contains(&entrants),
+            "{entrants} entrants"
+        );
     }
 
     /// End-to-end screen rate on Aglais salts: preparation, screen and
