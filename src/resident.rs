@@ -1674,7 +1674,7 @@ impl ScreenWindow {
             return;
         }
         let (sweeps, slot_steps, commands) = progress();
-        // A slot advances about this many sweeps per second it is live.
+        // A deep slot in a long leg steps a whole slice in every command.
         let per_slot = sweeps as f64 / slot_steps.max(1) as f64 * commands as f64 / secs;
         tracing::info!(
             salts_per_s = (self.offered as f64 / secs).round() as u64,

@@ -259,7 +259,8 @@ pub(crate) struct SlotPool {
     /// Host time of the last commit, for [`StepSpan::committed`].
     committed: f64,
     faulted: bool,
-    /// Sweeps advanced, slot steps and step commands since [`Self::take_progress`].
+    /// Sweeps and count of deep steps that ran a whole slice, and step
+    /// commands, since [`Self::take_progress`].
     progress: (u64, u64, u64),
     num_reads: usize,
     words: usize,
@@ -567,6 +568,7 @@ impl SlotPool {
         let slice = sampler::msa_step_limit(self.cached.n, groups, slice);
         let deep_slice = sampler::msa_step_limit(self.cached.n, groups, deep_slice);
         self.steps.clear();
+        let mut full = (0u64, 0u64);
         for (slot, resident) in self.slots.iter().enumerate() {
             let Some(r) = resident else {
                 continue;
@@ -600,6 +602,9 @@ impl SlotPool {
                 slice
             };
             let count = limit.min(room);
+            if leg >= r.job.fresh_from && count == limit {
+                full = (full.0 + count as u64, full.1 + 1);
+            }
             let mut flags = if count == checkpoint_room {
                 SLOT_WRITE_OUTPUT
             } else if observe_stop && count == room {
@@ -619,6 +624,8 @@ impl SlotPool {
                 flags,
             });
         }
+        self.progress.0 += full.0;
+        self.progress.1 += full.1;
         self.write(25, 0, &self.steps)?;
         let command = self.queue.new_command_buffer().to_owned();
         let encoder = if screen.is_some() {
@@ -668,7 +675,8 @@ impl SlotPool {
         Ok(true)
     }
 
-    /// Sweeps advanced, slot steps and step commands since the last call.
+    /// Whole-slice deep sweeps and steps, and step commands, since the last
+    /// call.
     pub(crate) fn take_progress(&mut self) -> (u64, u64, u64) {
         std::mem::take(&mut self.progress)
     }
@@ -722,8 +730,6 @@ impl SlotPool {
                 continue;
             };
             r.position += step.beta_count as usize;
-            self.progress.0 += step.beta_count as u64;
-            self.progress.1 += 1;
             // Attribute equal shares, distributing the integer remainder so
             // per-job totals reconcile exactly with command-buffer time.
             r.device_us = r.device_us.saturating_add(device_time_share(
