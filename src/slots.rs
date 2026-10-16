@@ -259,9 +259,12 @@ pub(crate) struct SlotPool {
     /// Host time of the last commit, for [`StepSpan::committed`].
     committed: f64,
     faulted: bool,
-    /// Sweeps and count of deep steps that ran a whole slice, and step
-    /// commands, since [`Self::take_progress`].
-    progress: (u64, u64, u64),
+    /// Sweeps and count of deep steps that ran a whole slice, and the
+    /// seconds and count of intervals between commits with live slots, since
+    /// [`Self::take_progress`].
+    progress: (u64, u64, f64, u64),
+    /// Host time of the last commit, while slots stay live.
+    live_commit: Option<f64>,
     num_reads: usize,
     words: usize,
     threads: usize,
@@ -342,7 +345,8 @@ impl SlotPool {
             span: None,
             committed: 0.0,
             faulted: false,
-            progress: (0, 0, 0),
+            progress: (0, 0, 0.0, 0),
+            live_commit: None,
             num_reads,
             words,
             threads,
@@ -559,6 +563,7 @@ impl SlotPool {
     ) -> Result<bool, SampleError> {
         self.idle()?;
         if self.live() == 0 {
+            self.live_commit = None;
             return Ok(false);
         }
         if slice == 0 || deep_slice == 0 {
@@ -670,14 +675,18 @@ impl SlotPool {
         }
         encoder.end_encoding();
         self.committed = sampler::host_seconds();
+        if let Some(previous) = self.live_commit.replace(self.committed) {
+            self.progress.2 += self.committed - previous;
+            self.progress.3 += 1;
+        }
         command.commit();
         self.command = Some(command);
         Ok(true)
     }
 
-    /// Whole-slice deep sweeps and steps, and step commands, since the last
-    /// call.
-    pub(crate) fn take_progress(&mut self) -> (u64, u64, u64) {
+    /// Whole-slice deep sweeps and steps, and the seconds and count of
+    /// intervals between live commits, since the last call.
+    pub(crate) fn take_progress(&mut self) -> (u64, u64, f64, u64) {
         std::mem::take(&mut self.progress)
     }
 
@@ -709,7 +718,6 @@ impl SlotPool {
             ));
         }
         let device_us = sampler::gpu_time_us(command);
-        self.progress.2 += 1;
         self.span = sampler::gpu_span(command).map(|(start, end)| StepSpan {
             committed: self.committed,
             start,

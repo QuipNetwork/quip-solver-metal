@@ -1659,7 +1659,8 @@ impl ScreenWindow {
     }
 
     /// Log and restart once [`REPORT_PERIOD`] has passed.
-    /// `progress` reads the slot pools' (sweeps, slot steps, commands) when
+    /// `progress` reads the slot pools' whole-slice deep sweeps and steps,
+    /// and the seconds and count of intervals between live commits, when
     /// the window closes.
     fn report(
         &mut self,
@@ -1667,15 +1668,20 @@ impl ScreenWindow {
         preparing: usize,
         parked: usize,
         deep_slice: usize,
-        progress: impl FnOnce() -> (u64, u64, u64),
+        progress: impl FnOnce() -> (u64, u64, f64, u64),
     ) {
         let secs = self.started.elapsed().as_secs_f64();
         if secs < REPORT_PERIOD.as_secs_f64() {
             return;
         }
-        let (sweeps, slot_steps, commands) = progress();
-        // A deep slot in a long leg steps a whole slice in every command.
-        let per_slot = sweeps as f64 / slot_steps.max(1) as f64 * commands as f64 / secs;
+        let (sweeps, steps, live_s, intervals) = progress();
+        // A deep slot in a long leg steps a whole slice in every command, so
+        // its pace is the mean slice over the mean interval between commits.
+        let per_slot = if steps == 0 || intervals == 0 || live_s <= 0.0 {
+            0.0
+        } else {
+            sweeps as f64 / steps as f64 * intervals as f64 / live_s
+        };
         tracing::info!(
             salts_per_s = (self.offered as f64 / secs).round() as u64,
             dispatches_per_s = (self.dispatches as f64 / secs).round() as u64,
@@ -2077,9 +2083,9 @@ pub(crate) fn run(
                 parked.len(),
                 screen_deep_slice,
                 || {
-                    pools.as_mut().map_or((0, 0, 0), |ps| {
+                    pools.as_mut().map_or((0, 0, 0.0, 0), |ps| {
                         let (a, b) = (ps[0].slots.take_progress(), ps[1].slots.take_progress());
-                        (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+                        (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
                     })
                 },
             );
