@@ -229,6 +229,54 @@ inline void lane_energies(
     }
 }
 
+// The screen's couplings are all +-1 with no fields, so a lane's energy is
+// 500 * (slots - 2 * satisfied) over this thread's directed CSR slots.
+// Count satisfied bonds bit-sliced: popcount21 gives each node's per-lane
+// count, and a 16-plane ripple add sums them, about 80 operations a node
+// instead of a loop over 32 lanes per slot.
+inline void lane_energies(
+    thread int* ener,
+    threadgroup const uint* state,
+    device const int* row_ptr,
+    device const int* col_ind,
+    ScreenCouplings couplings,
+    int n, uint tid, uint gsz
+) {
+    uint acc[16];
+    for (int k = 0; k < 16; ++k) {
+        acc[k] = 0u;
+    }
+    int slots = 0;
+    for (uint var = tid; var < uint(n); var += gsz) {
+        uint bi = state[var];
+        int pstart = row_ptr[var];
+        int pend = row_ptr[var + 1];
+        uint x[MSA_MAX_DEG + 1];
+        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+            int p = pstart + q;
+            x[q] = (p < pend) ? (couplings.bond(p).neg ^ bi ^ state[col_ind[p]]) : 0u;
+        }
+        x[MSA_MAX_DEG] = 0u;
+        slots += pend - pstart;
+        uint planes[MSA_PLANES];
+        popcount21(x, planes);
+        uint carry = 0u;
+        for (int k = 0; k < 16; ++k) {
+            uint b = (k < MSA_PLANES) ? planes[k] : 0u;
+            uint a = acc[k];
+            acc[k] = a ^ b ^ carry;
+            carry = (a & b) | (carry & (a ^ b));
+        }
+    }
+    for (int r = 0; r < MSA_LANES; ++r) {
+        int satisfied = 0;
+        for (int k = 0; k < 16; ++k) {
+            satisfied |= int((acc[k] >> uint(r)) & 1u) << k;
+        }
+        ener[r] = 500 * (slots - 2 * satisfied);
+    }
+}
+
 // ==============================================================================
 // Kernel
 // ==============================================================================
