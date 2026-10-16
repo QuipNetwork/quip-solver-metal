@@ -1461,6 +1461,185 @@ fn screen_verdict(
     });
 }
 
+/// Harvest screen bank `bank` and act on its verdicts. Returns the GPU time
+/// of a command that held only the screen.
+fn harvest_screen(
+    screen: &mut Screener<Salt>,
+    bank: usize,
+    controller: &mut Controller,
+    preparation: &mut Preparation,
+    config: CascadeSettings,
+) -> Result<u64, SampleError> {
+    // A screen failure that enters its lease's running top-N is pushed with
+    // its screen reads, as a gate-screened slot unit is.
+    let enters =
+        |salt: &Salt, best: i64| !salt.stop.load(Ordering::Acquire) && salt.top10.offer(best);
+    let (verdicts, busy) = screen.harvest(bank, enters)?;
+    for verdict in verdicts {
+        screen_verdict(verdict, controller, preparation, config);
+    }
+    Ok(busy)
+}
+
+/// The outcome of [`admit_unit`].
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per slot unit; boxing adds an allocation per unit"
+)]
+enum UnitAdmission {
+    /// Admitted, answered, or rejected.
+    Done,
+    /// Waits until the slot pools are empty.
+    Held(Prepared),
+    Fault(SampleError),
+}
+
+/// Admit one prepared slot unit to `pools[turn]`, which must be idle and
+/// have room.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner's device services and per-turn state"
+)]
+fn admit_unit(
+    prepared: Prepared,
+    pools: &mut Option<[Pool; 2]>,
+    turn: usize,
+    controller: &mut Controller,
+    device: &MetalDevice,
+    out: &Sender<StreamResult>,
+    gov: &dyn GpuGovernor,
+    cancel: &CancelToken,
+    window: &mut Instant,
+) -> UnitAdmission {
+    let empty = pools
+        .as_ref()
+        .is_none_or(|ps| ps.iter().all(|p| p.slots.live() == 0));
+    let Prepared {
+        mut job,
+        origin,
+        data,
+    } = prepared;
+    if abandoned(cancel, &job, &origin) {
+        let _ = answer(out, origin, job, Answer::Cancelled, 0);
+        return UnitAdmission::Done;
+    }
+    let mut data = match data {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            if job.graph.num_nodes() == 0 {
+                let reads = (0..job.params.num_reads.max(1))
+                    .map(|_| SamplerResult {
+                        spins: Vec::new(),
+                        energy_milli: 0,
+                    })
+                    .collect();
+                let _ = answer(out, origin, job, Answer::Reads(reads), 0);
+                return UnitAdmission::Done;
+            }
+            // Run on the Metal-owning runner only after live slots drain,
+            // so a rare full-budget fallback cannot stall slot stepping.
+            if !empty {
+                return UnitAdmission::Held(Prepared {
+                    job,
+                    origin,
+                    data: Ok(None),
+                });
+            }
+            let started = Instant::now();
+            let result = run_fallback(device, job, origin, out, gov, cancel);
+            // Fallback time belongs to the governor, not cascade load.
+            *window += started.elapsed();
+            if let Err(error) = result {
+                return UnitAdmission::Fault(error);
+            }
+            return UnitAdmission::Done;
+        }
+        Err(error) => {
+            reject_or_cancel(out, origin, job, &error, cancel);
+            return UnitAdmission::Done;
+        }
+    };
+    let edges = Arc::clone(data.inputs.edges());
+    let schedule_len = data.schedule.betas.len();
+    if pools
+        .as_mut()
+        .is_none_or(|ps| !ps[turn].fits(&job, &edges, schedule_len))
+    {
+        if !empty {
+            return UnitAdmission::Held(Prepared {
+                job,
+                origin,
+                data: Ok(Some(data)),
+            });
+        }
+        let capacity = batch_size_for_reads(
+            Kernel::Msa,
+            job.params.num_reads.clamp(1, sampler::MAX_READS),
+        );
+        // Both pools are empty, so changing storage cannot discard work.
+        let rebuilt = Pool::new(device, &job, capacity, schedule_len)
+            .and_then(|a| Pool::new(device, &job, capacity, schedule_len).map(|b| [a, b]));
+        match rebuilt {
+            Ok(rebuilt) => {
+                *pools = Some(rebuilt);
+            }
+            Err(error) => {
+                reject_or_cancel(out, origin, job, &error, cancel);
+                return UnitAdmission::Done;
+            }
+        }
+    }
+    let Some(pools) = pools.as_mut() else {
+        return UnitAdmission::Done;
+    };
+    let pool = &mut pools[turn];
+    // Plain jobs have no target and leave the yield check alone.
+    let initial_target_milli = if let Origin::Salt { target, round, .. } = &origin {
+        controller.enter_round(*round);
+        let target_milli = target.get();
+        controller.set_yield_target(target_milli);
+        target_milli
+    } else {
+        None
+    };
+    let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            reject_or_cancel(out, origin, job, &error, cancel);
+            return UnitAdmission::Done;
+        }
+    };
+    // Only salts carry a live target, so only they can finish early
+    // at an observe point. Stream jobs never get observe points.
+    let observe = matches!(origin, Origin::Salt { .. });
+    // The slot keeps the graph for the device energy audit; the live
+    // entry needs only the job's identity and parameters.
+    let graph = std::mem::replace(
+        &mut job.graph,
+        IsingGraph::new(Vec::new(), Vec::new(), Vec::new()),
+    );
+    let admitted =
+        pool.slots
+            .admit_prepared(data.inputs, graph, data.schedule, job.params.seed, observe);
+    match admitted {
+        Ok(slot) => {
+            pool.live[slot] = Some(Live {
+                job,
+                origin,
+                ticket,
+                accounted_us: 0,
+                admitted: Instant::now(),
+                last_target_milli: initial_target_milli,
+            })
+        }
+        Err(error) => {
+            controller.finish(&ticket, None, false);
+            reject_or_cancel(out, origin, job, &error, cancel);
+        }
+    }
+    UnitAdmission::Done
+}
+
 /// Screen intake over a report window.
 struct ScreenWindow {
     started: Instant,
@@ -1480,11 +1659,23 @@ impl ScreenWindow {
     }
 
     /// Log and restart once [`REPORT_PERIOD`] has passed.
-    fn report(&mut self, queued: usize, preparing: usize, parked: usize, deep_slice: usize) {
+    /// `progress` reads the slot pools' (sweeps, slot steps, commands) when
+    /// the window closes.
+    fn report(
+        &mut self,
+        queued: usize,
+        preparing: usize,
+        parked: usize,
+        deep_slice: usize,
+        progress: impl FnOnce() -> (u64, u64, u64),
+    ) {
         let secs = self.started.elapsed().as_secs_f64();
         if secs < REPORT_PERIOD.as_secs_f64() {
             return;
         }
+        let (sweeps, slot_steps, commands) = progress();
+        // A slot advances about this many sweeps per second it is live.
+        let per_slot = sweeps as f64 / slot_steps.max(1) as f64 * commands as f64 / secs;
         tracing::info!(
             salts_per_s = (self.offered as f64 / secs).round() as u64,
             dispatches_per_s = (self.dispatches as f64 / secs).round() as u64,
@@ -1493,6 +1684,7 @@ impl ScreenWindow {
             preparing,
             parked,
             deep_slice,
+            deep_sweeps_per_slot_s = per_slot.round() as u64,
             "screen report"
         );
         *self = Self::new();
@@ -1552,19 +1744,25 @@ pub(crate) fn run(
             break;
         }
         preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
+        // While the screen runs, one pool holds every slot unit and steps in
+        // every command, beside the screen dispatch; the two screen banks
+        // alternate. Pool 1 drains in the alternating mode first.
+        let pipeline =
+            screener.is_some() && pools.as_ref().is_none_or(|ps| ps[1].slots.live() == 0);
+        let slot_turn = if pipeline { 0 } else { turn };
         if let Some(pools) = &mut pools {
             let waited = Instant::now();
-            pools[turn].slots.wait();
+            pools[slot_turn].slots.wait();
             let waited = waited.elapsed();
             second.wait += waited;
             minute.wait += waited;
-            let capacity = pools[turn].slots.capacity();
-            match pools[turn].harvest(&mut controller, out, cancel, gov) {
+            let capacity = pools[slot_turn].slots.capacity();
+            match pools[slot_turn].harvest(&mut controller, out, cancel, gov) {
                 Ok(us) => {
                     busy_us = busy_us.saturating_add(us);
-                    if let Some(span) = pools[turn].slots.take_span() {
+                    if let Some(span) = pools[slot_turn].slots.take_span() {
                         tracing::trace!(
-                            pool = turn,
+                            pool = slot_turn,
                             committed = span.committed,
                             start = span.start,
                             end = span.end,
@@ -1605,19 +1803,119 @@ pub(crate) fn run(
             }
         }
 
-        if let Some((_, screen)) = &mut screener {
-            // A screen failure that enters its lease's running top-N is
-            // pushed with its screen reads, as a gate-screened slot unit is.
-            let enters = |salt: &Salt, best: i64| {
-                !salt.stop.load(Ordering::Acquire) && salt.top10.offer(best)
+        if pipeline {
+            // Pool 0 is idle: admit the units that waited, then commit the
+            // next command at once with the bank loaded last turn, so host
+            // work below overlaps it on the GPU.
+            while let Some(prepared) = parked.pop_front() {
+                let full = pools.as_ref().is_some_and(|ps| {
+                    ps[0].slots.live() >= scale_budget(ps[0].slots.capacity(), gov.budget_scale())
+                });
+                if full {
+                    parked.push_front(prepared);
+                    break;
+                }
+                match admit_unit(
+                    prepared,
+                    &mut pools,
+                    0,
+                    &mut controller,
+                    device,
+                    out,
+                    gov,
+                    cancel,
+                    &mut window,
+                ) {
+                    UnitAdmission::Done => {}
+                    UnitAdmission::Held(prepared) => {
+                        parked.push_front(prepared);
+                        break;
+                    }
+                    UnitAdmission::Fault(error) => {
+                        fault = Some(error);
+                        break 'run;
+                    }
+                }
+            }
+            if let Some((_, screen)) = &mut screener {
+                // A bank left in flight by the alternating mode.
+                if screen.in_flight(turn) {
+                    match harvest_screen(screen, turn, &mut controller, &mut preparation, config) {
+                        Ok(busy) => {
+                            gov.record_gpu_busy_us(busy);
+                            busy_us = busy_us.saturating_add(busy);
+                        }
+                        Err(error) => {
+                            fault = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            if gov.should_throttle() {
+                if let Some(pools) = &pools {
+                    pools[0].slots.wait();
+                }
+                crate::streaming::yield_gate(out, gov);
+            }
+            let words = screener
+                .as_ref()
+                .filter(|(_, screen)| !screen.in_flight(turn))
+                .map_or(0, |(_, screen)| screen.bank(turn).len());
+            let committed = match &mut pools {
+                Some(ps) => {
+                    let bank = screener
+                        .as_ref()
+                        .filter(|_| words > 0)
+                        .map(|(_, screen)| screen.bank(turn));
+                    match ps[0].slots.commit_step_with(
+                        config.stages[0].max(1),
+                        screen_deep_slice,
+                        bank,
+                    ) {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            fault = Some(error);
+                            break;
+                        }
+                    }
+                }
+                None => false,
             };
-            match screen.harvest(turn, enters) {
-                Ok((verdicts, busy)) => {
+            if words > 0 {
+                screen_window.dispatches += 1;
+                screen_window.words += words as u64;
+                if let Some((_, screen)) = &mut screener {
+                    let command = pools
+                        .as_ref()
+                        .filter(|_| committed)
+                        .and_then(|ps| ps[0].slots.command());
+                    match command {
+                        Some(command) => screen.attach(turn, command),
+                        None => {
+                            if let Err(error) = screen.commit(turn, &device.queue) {
+                                fault = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The pipeline harvests the bank the last command carried.
+        let harvest_bank = if pipeline { turn ^ 1 } else { turn };
+        if let Some((_, screen)) = &mut screener {
+            match harvest_screen(
+                screen,
+                harvest_bank,
+                &mut controller,
+                &mut preparation,
+                config,
+            ) {
+                Ok(busy) => {
                     gov.record_gpu_busy_us(busy);
                     busy_us = busy_us.saturating_add(busy);
-                    for verdict in verdicts {
-                        screen_verdict(verdict, &mut controller, &mut preparation, config);
-                    }
                 }
                 Err(error) => {
                     fault = Some(error);
@@ -1630,13 +1928,12 @@ pub(crate) fn run(
             if out.is_closed() {
                 break 'run;
             }
-            let empty = pools
-                .as_ref()
-                .is_none_or(|ps| ps.iter().all(|p| p.slots.live() == 0));
-            let full = pools.as_ref().is_some_and(|ps| {
-                let pool = &ps[turn];
-                pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
-            });
+            // The pipeline's pool is in flight now; its units wait in `parked`.
+            let full = pipeline
+                || pools.as_ref().is_some_and(|ps| {
+                    let pool = &ps[turn];
+                    pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
+                });
             let screen_full = screener
                 .as_ref()
                 .is_some_and(|(_, screen)| screen.queued() >= SCREEN_QUEUE);
@@ -1718,132 +2015,25 @@ pub(crate) fn run(
                     prepared
                 }
             };
-            let Prepared {
-                mut job,
-                origin,
-                data,
-            } = prepared;
-            if abandoned(cancel, &job, &origin) {
-                let _ = answer(out, origin, job, Answer::Cancelled, 0);
-                continue;
-            }
-            let mut data = match data {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    if job.graph.num_nodes() == 0 {
-                        let reads = (0..job.params.num_reads.max(1))
-                            .map(|_| SamplerResult {
-                                spins: Vec::new(),
-                                energy_milli: 0,
-                            })
-                            .collect();
-                        let _ = answer(out, origin, job, Answer::Reads(reads), 0);
-                        continue;
-                    }
-                    // Run on the Metal-owning runner only after live slots drain,
-                    // so a rare full-budget fallback cannot stall slot stepping.
-                    if !empty {
-                        pending = Some(Ready::Unit(Prepared {
-                            job,
-                            origin,
-                            data: Ok(None),
-                        }));
-                        break;
-                    }
-                    let started = Instant::now();
-                    let result = run_fallback(device, job, origin, out, gov, cancel);
-                    // Fallback time belongs to the governor, not cascade load.
-                    window += started.elapsed();
-                    if let Err(error) = result {
-                        fault = Some(error);
-                        break 'run;
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    reject_or_cancel(out, origin, job, &error, cancel);
-                    continue;
-                }
-            };
-            let edges = Arc::clone(data.inputs.edges());
-            let schedule_len = data.schedule.betas.len();
-            if pools
-                .as_mut()
-                .is_none_or(|ps| !ps[turn].fits(&job, &edges, schedule_len))
-            {
-                if !empty {
-                    pending = Some(Ready::Unit(Prepared {
-                        job,
-                        origin,
-                        data: Ok(Some(data)),
-                    }));
+            match admit_unit(
+                prepared,
+                &mut pools,
+                turn,
+                &mut controller,
+                device,
+                out,
+                gov,
+                cancel,
+                &mut window,
+            ) {
+                UnitAdmission::Done => {}
+                UnitAdmission::Held(prepared) => {
+                    pending = Some(Ready::Unit(prepared));
                     break;
                 }
-                let capacity = batch_size_for_reads(
-                    Kernel::Msa,
-                    job.params.num_reads.clamp(1, sampler::MAX_READS),
-                );
-                // Both pools are empty, so changing storage cannot discard work.
-                let rebuilt = Pool::new(device, &job, capacity, schedule_len)
-                    .and_then(|a| Pool::new(device, &job, capacity, schedule_len).map(|b| [a, b]));
-                match rebuilt {
-                    Ok(rebuilt) => {
-                        pools = Some(rebuilt);
-                    }
-                    Err(error) => {
-                        reject_or_cancel(out, origin, job, &error, cancel);
-                        continue;
-                    }
-                }
-            }
-            let Some(pools) = &mut pools else { continue };
-            let pool = &mut pools[turn];
-            // Plain jobs have no target and leave the yield check alone.
-            let initial_target_milli = if let Origin::Salt { target, round, .. } = &origin {
-                controller.enter_round(*round);
-                let target_milli = target.get();
-                controller.set_yield_target(target_milli);
-                target_milli
-            } else {
-                None
-            };
-            let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    reject_or_cancel(out, origin, job, &error, cancel);
-                    continue;
-                }
-            };
-            // Only salts carry a live target, so only they can finish early
-            // at an observe point. Stream jobs never get observe points.
-            let observe = matches!(origin, Origin::Salt { .. });
-            // The slot keeps the graph for the device energy audit; the live
-            // entry needs only the job's identity and parameters.
-            let graph = std::mem::replace(
-                &mut job.graph,
-                IsingGraph::new(Vec::new(), Vec::new(), Vec::new()),
-            );
-            let admitted = pool.slots.admit_prepared(
-                data.inputs,
-                graph,
-                data.schedule,
-                job.params.seed,
-                observe,
-            );
-            match admitted {
-                Ok(slot) => {
-                    pool.live[slot] = Some(Live {
-                        job,
-                        origin,
-                        ticket,
-                        accounted_us: 0,
-                        admitted: Instant::now(),
-                        last_target_milli: initial_target_milli,
-                    })
-                }
-                Err(error) => {
-                    controller.finish(&ticket, None, false);
-                    reject_or_cancel(out, origin, job, &error, cancel);
+                UnitAdmission::Fault(error) => {
+                    fault = Some(error);
+                    break 'run;
                 }
             }
         }
@@ -1865,8 +2055,9 @@ pub(crate) fn run(
         }
         // Flush partial screen words when no more salts are on the way.
         let flush = preparation.len() == 0 && pending.is_none();
+        let load_bank = if pipeline { turn ^ 1 } else { turn };
         let words = match &mut screener {
-            Some((_, screen)) => match screen.load(turn, flush) {
+            Some((_, screen)) => match screen.load(load_bank, flush) {
                 Ok(words) => words,
                 Err(error) => {
                     fault = Some(error);
@@ -1875,7 +2066,7 @@ pub(crate) fn run(
             },
             None => 0,
         };
-        if words > 0 {
+        if words > 0 && !pipeline {
             screen_window.dispatches += 1;
             screen_window.words += words as u64;
         }
@@ -1885,10 +2076,16 @@ pub(crate) fn run(
                 preparation.len(),
                 parked.len(),
                 screen_deep_slice,
+                || {
+                    pools.as_mut().map_or((0, 0, 0), |ps| {
+                        let (a, b) = (ps[0].slots.take_progress(), ps[1].slots.take_progress());
+                        (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+                    })
+                },
             );
         }
         let mut shared = false;
-        if let Some(pools) = &mut pools {
+        if let Some(pools) = pools.as_mut().filter(|_| !pipeline) {
             if gov.should_throttle() {
                 // Drain submitted work before the pause so it frees GPU time.
                 for pool in pools.iter() {
@@ -1926,7 +2123,7 @@ pub(crate) fn run(
                 }
             }
         }
-        if words > 0 && !shared {
+        if words > 0 && !shared && !pipeline {
             if let Some((_, screen)) = &mut screener {
                 if let Err(error) = screen.commit(turn, &device.queue) {
                     fault = Some(error);
@@ -2950,6 +3147,16 @@ mod tests {
         top10: &LeaseTopK,
         stop: &Arc<AtomicBool>,
     ) -> (std::thread::JoinHandle<()>, mpsc::Receiver<SaltOutcome>) {
+        run_aglais_salts_at(total, top10, stop, None)
+    }
+
+    /// [`run_aglais_salts`] with a live target for every salt.
+    fn run_aglais_salts_at(
+        total: u64,
+        top10: &LeaseTopK,
+        stop: &Arc<AtomicBool>,
+        target_milli: Option<i64>,
+    ) -> (std::thread::JoinHandle<()>, mpsc::Receiver<SaltOutcome>) {
         let topology = aglais_view();
         let (reply, outcomes) = mpsc::channel();
         let (salts_tx, salts) = mpsc::sync_channel(total as usize);
@@ -2957,6 +3164,7 @@ mod tests {
             let mut salt = aglais_salt(&topology, index, &reply);
             salt.top10 = top10.clone();
             salt.stop = Arc::clone(stop);
+            salt.target = LiveTarget::new(target_milli);
             salts_tx.send(salt).unwrap();
         }
         let runner = std::thread::spawn(move || {
@@ -3075,6 +3283,43 @@ mod tests {
         assert!(
             (LEASE_TOP_N..=150).contains(&entrants),
             "{entrants} entrants"
+        );
+    }
+
+    /// Screen failures below the live target run the deep plan in the one
+    /// pool beside the screen and finish there on a target hit with all
+    /// their reads; every salt answers once.
+    #[test]
+    fn screen_survivors_run_deep_beside_the_screen() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let total = 1_000;
+        let stop = Arc::new(AtomicBool::new(false));
+        // Above every 128-sweep best, below every 16-sweep one: each salt
+        // that reaches the second stage goes deep and hits at 512 sweeps.
+        let (runner, outcomes) =
+            run_aglais_salts_at(total, &full_top10(), &stop, Some(-13_900_000));
+        let (mut deep, mut screened) = (0, 0);
+        for _ in 0..total {
+            match outcomes
+                .recv_timeout(Duration::from_secs(600))
+                .expect("every salt answers")
+            {
+                SaltOutcome::Survived { reads, .. } => {
+                    assert_eq!(reads.len(), 64);
+                    assert!(reads.iter().any(|r| r.energy_milli < -13_900_000));
+                    deep += 1;
+                }
+                SaltOutcome::Screened { .. } => screened += 1,
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("salt {index}: {error}"),
+            }
+        }
+        runner.join().unwrap();
+        assert!(
+            (20..=100).contains(&deep),
+            "{deep} deep, {screened} screened"
         );
     }
 

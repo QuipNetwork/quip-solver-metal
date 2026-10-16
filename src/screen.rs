@@ -485,6 +485,11 @@ impl<T> Screener<T> {
         Ok(self.banks[bank].len())
     }
 
+    /// Whether bank `bank` has a command not yet harvested.
+    pub(crate) fn in_flight(&self, bank: usize) -> bool {
+        self.command[bank].is_some()
+    }
+
     pub(crate) fn bank(&self, bank: usize) -> &ScreenBank {
         &self.banks[bank]
     }

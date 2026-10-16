@@ -259,6 +259,8 @@ pub(crate) struct SlotPool {
     /// Host time of the last commit, for [`StepSpan::committed`].
     committed: f64,
     faulted: bool,
+    /// Sweeps advanced, slot steps and step commands since [`Self::take_progress`].
+    progress: (u64, u64, u64),
     num_reads: usize,
     words: usize,
     threads: usize,
@@ -339,6 +341,7 @@ impl SlotPool {
             span: None,
             committed: 0.0,
             faulted: false,
+            progress: (0, 0, 0),
             num_reads,
             words,
             threads,
@@ -665,6 +668,11 @@ impl SlotPool {
         Ok(true)
     }
 
+    /// Sweeps advanced, slot steps and step commands since the last call.
+    pub(crate) fn take_progress(&mut self) -> (u64, u64, u64) {
+        std::mem::take(&mut self.progress)
+    }
+
     /// The command in flight, if any.
     pub(crate) fn command(&self) -> Option<metal::CommandBuffer> {
         self.command.clone()
@@ -693,6 +701,7 @@ impl SlotPool {
             ));
         }
         let device_us = sampler::gpu_time_us(command);
+        self.progress.2 += 1;
         self.span = sampler::gpu_span(command).map(|(start, end)| StepSpan {
             committed: self.committed,
             start,
@@ -713,6 +722,8 @@ impl SlotPool {
                 continue;
             };
             r.position += step.beta_count as usize;
+            self.progress.0 += step.beta_count as u64;
+            self.progress.1 += 1;
             // Attribute equal shares, distributing the integer remainder so
             // per-job totals reconcile exactly with command-buffer time.
             r.device_us = r.device_us.saturating_add(device_time_share(
@@ -2211,6 +2222,100 @@ mod tests {
         }
         std::fs::write(&out, text).unwrap();
         eprintln!("{total} jobs in {:.0} s", started.elapsed().as_secs_f64());
+    }
+
+    /// Whether a slot step and a screen dispatch in one concurrent encoder
+    /// overlap on the GPU: times each alone and both together.
+    ///
+    /// ```text
+    /// cargo test --release --lib concurrent_dispatch_overlap -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a quiet Metal device; a benchmark"]
+    #[expect(clippy::print_stderr, reason = "the benchmark reports on stderr")]
+    fn concurrent_dispatch_overlap() {
+        use crate::screen::{key_words, Draw, ScreenBank};
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let full = advantage2_system1(7);
+        let keep: Vec<usize> = (0..full.edges.len())
+            .filter(|&e| full.edges[e].0 != full.edges[e].1)
+            .collect();
+        let graph = IsingGraph::new(
+            vec![0.0; full.num_nodes()],
+            keep.iter().map(|&e| full.j[e]).collect(),
+            keep.iter().map(|&e| full.edges[e]).collect(),
+        );
+        let schedule = |sweeps| {
+            build_beta_schedule(
+                &graph,
+                sweeps,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric,
+            )
+            .0
+        };
+        let (a, b) = (schedule(16), schedule(128));
+        let draw = Draw {
+            first_word: graph.num_nodes() as u32,
+            allowed_j: vec![-1, 1],
+        };
+        let mut bank = ScreenBank::new(&device, &graph, 640, &[&a, &b], Some(&draw)).unwrap();
+        for w in 0..640u32 {
+            let keys: Vec<Vec<u32>> = (0..8u8)
+                .map(|g| key_words(std::array::from_fn(|i| (w as u8) ^ g ^ (i as u8))))
+                .collect();
+            let rows: Vec<&[u32]> = keys.iter().map(Vec::as_slice).collect();
+            bank.push(usize::from(w >= 608), w + 1, &rows).unwrap();
+        }
+        let deep: Arc<[f32]> = schedule(4_000_000).into();
+        let mut pool = SlotPool::new(&device, &graph, READS, 20, deep.len()).unwrap();
+        for k in 0..4 {
+            pool.admit(SlotJob {
+                graph: graph.clone(),
+                schedule: Arc::clone(&deep),
+                checkpoints: vec![deep.len()],
+                fresh_from: 0,
+                seed: k + 1,
+                observe: false,
+            })
+            .unwrap();
+        }
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 5.0
+        };
+        let alone = time(&mut || {
+            let command = device.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            bank.encode(encoder).unwrap();
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+        });
+        eprintln!("screen alone (640 words): {alone:.1} ms");
+        for slice in [128, 256, 512] {
+            let slots = time(&mut || {
+                assert!(pool.commit_step(8, slice).unwrap());
+                pool.wait();
+                pool.take_checkpoints().unwrap();
+            });
+            let both = time(&mut || {
+                assert!(pool.commit_step_with(8, slice, Some(&bank)).unwrap());
+                pool.wait();
+                pool.take_checkpoints().unwrap();
+            });
+            eprintln!(
+                "deep slice {slice}: 4 deep slots alone {slots:.1} ms, together {both:.1} ms \
+                 (serial {:.1}, overlapped {:.1})",
+                slots + alone,
+                slots.max(alone)
+            );
+        }
     }
 
     /// Screen throughput against deep-leg speed for several deep step sizes.
