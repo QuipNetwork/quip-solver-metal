@@ -1040,12 +1040,16 @@ pub(crate) const PREP_WORKERS: usize = 8;
 pub(crate) const PREP_BOUND: usize = 40;
 /// Outstanding preparations while salts go to the screen. A candidate holds
 /// 5 KB of sign bits, not a model, and the screen takes up to 2,560 per turn.
-pub(crate) const SCREEN_PREP_BOUND: usize = 4_096;
+pub(crate) const SCREEN_PREP_BOUND: usize = 8_192;
 /// Models the runner keeps queued in the screen before it stops taking more.
 const SCREEN_QUEUE: usize = 2 * screen::BANK_WORDS * screen::GROUPS;
-/// Most sweeps a deep slot advances per step beside a screen dispatch, which
-/// takes about as long.
-const SCREEN_DEEP_SLICE: usize = 64;
+/// Microseconds per sweep of one deep slot's threadgroup on an M4 Max core
+/// (measured 89 to 94 for the multi-spin kernels), rounded up.
+const DEEP_SWEEP_US: f64 = 100.0;
+/// Bounds on the sweeps a deep slot advances per step beside a screen
+/// dispatch. Each step sizes it to the last command's GPU time, so deep
+/// slots run as long as the screen words and do not hold the command open.
+const SCREEN_DEEP_SLICES: (usize, usize) = (DEEP_SLICE, 4_096);
 
 /// Run one preparation, turning a panic into an error so the worker still
 /// returns its job to the runner exactly once.
@@ -1476,7 +1480,7 @@ impl ScreenWindow {
     }
 
     /// Log and restart once [`REPORT_PERIOD`] has passed.
-    fn report(&mut self, queued: usize, preparing: usize, parked: usize) {
+    fn report(&mut self, queued: usize, preparing: usize, parked: usize, deep_slice: usize) {
         let secs = self.started.elapsed().as_secs_f64();
         if secs < REPORT_PERIOD.as_secs_f64() {
             return;
@@ -1488,6 +1492,7 @@ impl ScreenWindow {
             queued,
             preparing,
             parked,
+            deep_slice,
             "screen report"
         );
         *self = Self::new();
@@ -1533,6 +1538,7 @@ pub(crate) fn run(
     // here so screen candidates behind them keep flowing.
     let mut parked: VecDeque<Prepared> = VecDeque::new();
     let mut screen_window = ScreenWindow::new();
+    let mut screen_deep_slice = SCREEN_DEEP_SLICES.0;
     let mut eof = false;
     let mut prefer_salt = true;
     let mut turn = 0;
@@ -1567,6 +1573,9 @@ pub(crate) fn run(
                         );
                         second.record(span, capacity);
                         minute.record(span, capacity);
+                        let fit = (span.end - span.start) * 1e6 / DEEP_SWEEP_US;
+                        screen_deep_slice =
+                            (fit as usize).clamp(SCREEN_DEEP_SLICES.0, SCREEN_DEEP_SLICES.1);
                     }
                 }
                 Err(error) => {
@@ -1871,7 +1880,12 @@ pub(crate) fn run(
             screen_window.words += words as u64;
         }
         if let Some((_, screen)) = &screener {
-            screen_window.report(screen.queued(), preparation.len(), parked.len());
+            screen_window.report(
+                screen.queued(),
+                preparation.len(),
+                parked.len(),
+                screen_deep_slice,
+            );
         }
         let mut shared = false;
         if let Some(pools) = &mut pools {
@@ -1890,7 +1904,7 @@ pub(crate) fn run(
                 .filter(|_| words > 0)
                 .map(|(_, screen)| screen.bank(turn));
             let deep_slice = if screener.is_some() {
-                SCREEN_DEEP_SLICE
+                screen_deep_slice
             } else {
                 DEEP_SLICE
             };

@@ -360,10 +360,10 @@ impl ScreenBank {
     }
 }
 
-/// Words each of a [`Screener`]'s two banks holds: 2,560 models. A
-/// 128-sweep word takes about 7 ms on one core; this many 16-sweep words
-/// keep the other cores of an M4 Max busy for about as long.
-pub(crate) const BANK_WORDS: usize = 320;
+/// Words each of a [`Screener`]'s two banks holds: 5,120 models. End to
+/// end on a quiet M4 Max, 320-word banks reached 105,000 salts per second
+/// and 640-word banks 120,000; more words cover the 128-sweep words' tail.
+pub(crate) const BANK_WORDS: usize = 640;
 /// Longest wait of a model for the rest of its word.
 const FLUSH: Duration = Duration::from_millis(2);
 
