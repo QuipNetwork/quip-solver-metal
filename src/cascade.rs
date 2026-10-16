@@ -109,17 +109,14 @@ impl Default for CascadeSettings {
 }
 
 /// Gates for the chain topology `cbec1eb4` (4,577 nodes, 41,514 edges, h = 0,
-/// J = ±1), measured at 64 reads and one sweep per beta on a schedule where
-/// every leg reheated the previous leg's spins to beta 0.25
-/// (`tests/gate_trace.rs`, removed in 44a4126). The screening legs, up to 256
-/// sweeps, still run that way. The deep legs are now fresh anneals of their
-/// full budget (see [`segment_schedule`]), so the deep gates apply to a
-/// schedule they were not measured on until they are measured again. The four screening gates are the
-/// shallowest checkpoint best over 30 seeds of the chain's 100 deepest winners
-/// (-14,742 to -14,708), plus 10. The deep gates, one per doubling from 512 to
-/// 524,288, are the shallowest best among 10 seeds of the same winners that
-/// had not yet reached -14,710 but did later, plus 20. Winners shallower than
-/// about -14,700 can fall outside the gates.
+/// J = ±1), measured with `slots::tests::checkpoint_trace` at 64 reads on the
+/// production schedule ([`segment_schedule`]). The source is the 255 Aglais
+/// wins of qblocks 154 to 408, where the target held near -14,750 (wins
+/// -14,792 to -14,692). The four screening gates are the shallowest
+/// checkpoint best over 30 seeds of those problems, plus 10. The deep gates,
+/// one per doubling from 512 to 524,288, are the shallowest best over 2 seeds
+/// that run every checkpoint and a 1,048,576-sweep final leg, plus 20. No
+/// traced run fails a gate. 57 percent of the deep runs reach -14,750.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
     pub(crate) stages: &'static [usize],
@@ -137,21 +134,21 @@ pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
         524_288,
     ],
     gates: &[
-        -13_252_000,
-        -13_836_000,
-        -14_276_000,
-        -14_466_000,
-        -14_512_000,
-        -14_552_000,
-        -14_584_000,
-        -14_608_000,
-        -14_624_000,
-        -14_640_000,
-        -14_648_000,
-        -14_658_000,
-        -14_662_000,
-        -14_670_000,
-        -14_678_000,
+        -13_284_000,
+        -13_870_000,
+        -14_290_000,
+        -14_490_000,
+        -14_532_000,
+        -14_572_000,
+        -14_606_000,
+        -14_632_000,
+        -14_652_000,
+        -14_666_000,
+        -14_666_000,
+        -14_682_000,
+        -14_692_000,
+        -14_696_000,
+        -14_704_000,
     ],
     min_reads: 64,
     full_sweeps: 1_048_576,
