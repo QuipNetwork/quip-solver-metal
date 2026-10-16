@@ -600,9 +600,43 @@ kernel void msa_anneal_slots(
 // One threadgroup anneals one word of eight models with four reads each:
 // lane r is read r / 8 of model r % 8. Every word runs a complete anneal in
 // one dispatch and nothing persists. The prologue builds the word's mask
-// bytes in device memory from the models' edge sign bits (bit e of a model's
-// row is set where edge e has coupling -1); threadgroup memory cannot hold
-// them beside the spin words.
+// bytes in device memory; threadgroup memory cannot hold them beside the
+// spin words. A model's row is either its edge sign bits (bit e set where
+// edge e has coupling -1) or, in draw mode, its ChaCha8 key: the lease draw
+// of quip-protocol's chacha8, where keystream word first_word + e picks
+// allowed_j[word % allowed_len] for edge e.
+
+// The draw mode of a dispatch. mode 0 reads sign bits.
+struct ScreenDraw {
+    uint mode;         // 1: rows are ChaCha8 keys
+    uint first_word;   // keystream word of edge 0
+    uint allowed_len;  // allowed coupling values, 1..32
+    uint neg_table;    // bit k set where allowed_j[k] < 0
+};
+
+// One ChaCha8 block (four double rounds) at block `counter`, stream 0.
+inline void chacha8_block(device const uint* key, uint counter, thread uint* out) {
+    uint s[16] = {0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
+                  key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                  counter, 0u, 0u, 0u};
+    uint x[16];
+    for (int i = 0; i < 16; ++i) {
+        x[i] = s[i];
+    }
+#define QR(a, b, c, d)                                   \
+    x[a] += x[b]; x[d] ^= x[a]; x[d] = rotate(x[d], 16u); \
+    x[c] += x[d]; x[b] ^= x[c]; x[b] = rotate(x[b], 12u); \
+    x[a] += x[b]; x[d] ^= x[a]; x[d] = rotate(x[d], 8u);  \
+    x[c] += x[d]; x[b] ^= x[c]; x[b] = rotate(x[b], 7u);
+    for (int round = 0; round < 4; ++round) {
+        QR(0, 4, 8, 12) QR(1, 5, 9, 13) QR(2, 6, 10, 14) QR(3, 7, 11, 15)
+        QR(0, 5, 10, 15) QR(1, 6, 11, 12) QR(2, 7, 8, 13) QR(3, 4, 9, 14)
+    }
+#undef QR
+    for (int i = 0; i < 16; ++i) {
+        out[i] = x[i] + s[i];
+    }
+}
 
 struct ScreenWord {
     uint sched;      // offset of this word's betas in beta_schedule
@@ -615,16 +649,17 @@ kernel void msa_screen(
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
     device uchar* masks [[buffer(2)]],                     // [words * nnz]
-    device const uint* sign_bits [[buffer(3)]],            // [words * 8 * edge_words]
+    device const uint* rows [[buffer(3)]],                 // [words * 8 * row_words]
     device const uint2* edge_pos [[buffer(4)]],            // [num_edges] CSR slots (ij, ji)
     constant int& N [[buffer(5)]],
     constant int& nnz [[buffer(6)]],
     constant int& num_edges [[buffer(7)]],
-    constant int& edge_words [[buffer(8)]],
+    constant int& row_words [[buffer(8)]],                 // edge_words, or 8 in draw mode
     device const float* beta_schedule [[buffer(9)]],
     device int8_t* final_samples [[buffer(10)]],           // [words * 32 * packed_size]
     device int* final_energies [[buffer(11)]],             // [words * 32] milli
     constant int& num_threadgroups [[buffer(12)]],         // words this dispatch
+    constant ScreenDraw& draw [[buffer(13)]],
     device const int* color_block_starts [[buffer(16)]],
     device const int* color_block_counts [[buffer(17)]],
     device const int* color_node_indices [[buffer(18)]],
@@ -645,17 +680,45 @@ kernel void msa_screen(
     uint gsz = threads_per_group.x;
     ScreenWord word = words[tg];
     device uchar* my_masks = &masks[tg * uint(nnz)];
-    device const uint* bits = &sign_bits[tg * 8u * uint(edge_words)];
-    for (uint e = tid; e < uint(num_edges); e += gsz) {
-        uint shift = e & 31u;
-        uint at = e >> 5;
-        uint byte = 0u;
-        for (uint g = 0; g < 8u; ++g) {
-            byte |= ((bits[g * uint(edge_words) + at] >> shift) & 1u) << g;
+    device const uint* my_rows = &rows[tg * 8u * uint(row_words)];
+    if (draw.mode == 1u) {
+        // One thread owns a keystream block for all eight models, so it owns
+        // every mask byte of the block's edges.
+        uint first = draw.first_word;
+        uint end = first + uint(num_edges);
+        for (uint b = first / 16u + tid; b * 16u < end; b += gsz) {
+            uint bytes[16];
+            for (int i = 0; i < 16; ++i) {
+                bytes[i] = 0u;
+            }
+            for (uint g = 0; g < 8u; ++g) {
+                uint block[16];
+                chacha8_block(&my_rows[g * uint(row_words)], b, block);
+                for (int i = 0; i < 16; ++i) {
+                    bytes[i] |= ((draw.neg_table >> (block[i] % draw.allowed_len)) & 1u) << g;
+                }
+            }
+            for (uint i = 0; i < 16u; ++i) {
+                uint w = b * 16u + i;
+                if (w >= first && w < end) {
+                    uint2 pos = edge_pos[w - first];
+                    my_masks[pos.x] = uchar(bytes[i]);
+                    my_masks[pos.y] = uchar(bytes[i]);
+                }
+            }
         }
-        uint2 pos = edge_pos[e];
-        my_masks[pos.x] = uchar(byte);
-        my_masks[pos.y] = uchar(byte);
+    } else {
+        for (uint e = tid; e < uint(num_edges); e += gsz) {
+            uint shift = e & 31u;
+            uint at = e >> 5;
+            uint byte = 0u;
+            for (uint g = 0; g < 8u; ++g) {
+                byte |= ((my_rows[g * uint(row_words) + at] >> shift) & 1u) << g;
+            }
+            uint2 pos = edge_pos[e];
+            my_masks[pos.x] = uchar(byte);
+            my_masks[pos.y] = uchar(byte);
+        }
     }
     threadgroup_barrier(mem_flags::mem_device);
     ScreenCouplings couplings{my_masks};

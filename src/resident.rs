@@ -535,21 +535,26 @@ pub(crate) struct ScreenPlan {
     graph: IsingGraph,
     /// One standard anneal per [`CHAIN_GATES`] screen stage.
     schedules: Vec<Vec<f32>>,
+    /// The lease draw the screen runs on the device.
+    draw: screen::Draw,
 }
 
 impl ScreenPlan {
     /// Each preparation worker builds its own plan; equal plans share a
     /// screener.
     fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.graph.edges, &other.graph.edges) && self.schedules == other.schedules
+        Arc::ptr_eq(&self.graph.edges, &other.graph.edges)
+            && self.schedules == other.schedules
+            && self.draw.first_word == other.draw.first_word
+            && self.draw.allowed_j == other.draw.allowed_j
     }
 }
 
-/// A salt for the nonce-parallel screen: its edge sign bits only.
+/// A salt for the nonce-parallel screen: its ChaCha8 key only.
 pub(crate) struct Candidate {
     salt: Salt,
     plan: Arc<ScreenPlan>,
-    bits: Vec<u32>,
+    key: Vec<u32>,
 }
 
 /// What preparation hands the runner.
@@ -681,7 +686,19 @@ impl SaltTopology {
                         crate::cascade::segment_schedule(&graph, &params, &[]).0
                     })
                     .collect();
-                Arc::new(ScreenPlan { graph, schedules })
+                let draw = screen::Draw {
+                    first_word: n as u32,
+                    allowed_j: view
+                        .allowed_j_milli
+                        .iter()
+                        .map(|&j| (j / 1000) as i8)
+                        .collect(),
+                };
+                Arc::new(ScreenPlan {
+                    graph,
+                    schedules,
+                    draw,
+                })
             });
         Some(Self {
             view: Arc::clone(view),
@@ -838,16 +855,15 @@ impl Preparer {
             // screen it too, so a lease never mixes plans.
             let learned = self.salt.as_ref().filter(|k| Arc::ptr_eq(&k.view, view));
             if let Some(plan) = learned.and_then(|k| k.screen_for(salt, settings, screen)) {
-                let signs: Vec<i8> = j_milli
-                    .iter()
-                    .map(|&j| if j < 0 { -1 } else { 1 })
-                    .collect();
-                return SaltPrep::Screen(Arc::clone(plan), screen::sign_bits(&signs));
+                return SaltPrep::Screen(Arc::clone(plan), screen::key_words(salt.nonce));
             }
             return SaltPrep::Unit(job, data);
         };
         let prepared = &known.prepared;
-        let screened = known.screen_for(salt, settings, screen);
+        // The screen draws the model on the device from the nonce.
+        if let Some(plan) = known.screen_for(salt, settings, screen) {
+            return SaltPrep::Screen(Arc::clone(plan), screen::key_words(salt.nonce));
+        }
         let (fields, j_units) = match crate::draw::draw_units(
             salt.nonce,
             view.num_nodes,
@@ -861,9 +877,6 @@ impl Preparer {
                 return SaltPrep::Unit(modelless_job(salt), Err(error));
             }
         };
-        if let Some(plan) = screened {
-            return SaltPrep::Screen(Arc::clone(plan), screen::sign_bits(&j_units));
-        }
         let to_f64 = |values: &[i8]| values.iter().map(|&v| f64::from(v)).collect();
         let mut params = salt.params.clone();
         params.seed = salt_seed(salt.nonce);
@@ -1115,8 +1128,8 @@ impl Preparation {
                                         )
                                     });
                                 match made {
-                                    SaltPrep::Screen(plan, bits) => {
-                                        Ready::Screen(Candidate { salt, plan, bits })
+                                    SaltPrep::Screen(plan, key) => {
+                                        Ready::Screen(Candidate { salt, plan, key })
                                     }
                                     SaltPrep::Unit(job, data) => Ready::Unit(Prepared {
                                         job,
@@ -1650,7 +1663,13 @@ pub(crate) fn run(
                         let schedules: Vec<&[f32]> =
                             plan.schedules.iter().map(Vec::as_slice).collect();
                         let gates: Vec<i64> = CHAIN_GATES.screen.iter().map(|&(_, g)| g).collect();
-                        match Screener::new(device, &plan.graph, &schedules, &gates) {
+                        match Screener::new(
+                            device,
+                            &plan.graph,
+                            &schedules,
+                            &gates,
+                            Some(&plan.draw),
+                        ) {
                             Ok(screen) => screener = Some((plan, screen)),
                             Err(error) => {
                                 screener = None;
@@ -1666,8 +1685,7 @@ pub(crate) fn run(
                         pending = Some(Ready::Screen(candidate));
                         break;
                     }
-                    if candidate.salt.stop.load(Ordering::Acquire) || !screen.fits(&candidate.bits)
-                    {
+                    if candidate.salt.stop.load(Ordering::Acquire) || !screen.fits(&candidate.key) {
                         refuse_salt(
                             candidate.salt,
                             &SampleError::Driver("screen candidate does not fit".into()),
@@ -1676,7 +1694,7 @@ pub(crate) fn run(
                     }
                     preparation.bound = SCREEN_PREP_BOUND;
                     screen_window.offered += 1;
-                    screen.offer(candidate.salt, candidate.bits);
+                    screen.offer(candidate.salt, candidate.key);
                     continue;
                 }
                 Some(Ready::Unit(prepared)) => {

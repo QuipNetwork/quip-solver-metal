@@ -6,8 +6,10 @@
 //! A [`ScreenBank`] holds up to `capacity` words and encodes one
 //! `msa_screen` dispatch. Every word is a complete anneal of one of the
 //! bank's stage schedules, so nothing persists between dispatches. Models
-//! must have couplings of ±1, zero fields and no self-loops; a model is
-//! given as its edge sign bits ([`sign_bits`]).
+//! must have couplings of ±1, zero fields and no self-loops. A model is
+//! given as its edge sign bits ([`sign_bits`]), or, for a bank built with a
+//! [`Draw`], as its lease nonce ([`key_words`]): the kernel then draws the
+//! couplings itself, as `quip_protocol::chacha8::draw_ising` does.
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, BufferPool, CachedTopology, SampleError, MSA_THREADS};
@@ -23,6 +25,7 @@ pub(crate) const GROUPS: usize = 8;
 pub(crate) const READS: usize = sampler::MSA_LANES / GROUPS;
 
 /// Bit `e` of the result is set where edge `e` has a negative coupling.
+#[cfg(test)]
 pub(crate) fn sign_bits(j_units: &[i8]) -> Vec<u32> {
     let mut bits = vec![0u32; j_units.len().div_ceil(32)];
     for (word, chunk) in bits.iter_mut().zip(j_units.chunks(32)) {
@@ -31,6 +34,34 @@ pub(crate) fn sign_bits(j_units: &[i8]) -> Vec<u32> {
         }
     }
     bits
+}
+
+/// The lease draw a bank runs on the device.
+pub(crate) struct Draw {
+    /// Keystream word of edge 0: the model's node count.
+    pub(crate) first_word: u32,
+    /// The allowed couplings in whole units, at most 32 of them.
+    pub(crate) allowed_j: Vec<i8>,
+}
+
+/// The ChaCha8 key of a lease nonce, as eight little-endian words.
+pub(crate) fn key_words(nonce: [u8; 32]) -> Vec<u32> {
+    nonce
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
+        .collect()
+}
+
+/// Matches `ScreenDraw` in `kernels/msa.metal`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ScreenDraw {
+    mode: u32,
+    first_word: u32,
+    allowed_len: u32,
+    neg_table: u32,
 }
 
 #[repr(C)]
@@ -53,17 +84,21 @@ pub(crate) struct ScreenBank {
     stages: Vec<(u32, i32)>,
     words: Vec<ScreenWord>,
     capacity: usize,
-    edge_words: usize,
+    /// Words per model row: sign bits, or a key in draw mode.
+    row_words: usize,
+    draw: ScreenDraw,
     threads: usize,
 }
 
 impl ScreenBank {
-    /// `schedules[s]` is stage `s`'s anneal, one beta per sweep.
+    /// `schedules[s]` is stage `s`'s anneal, one beta per sweep. With
+    /// `draw`, model rows are keys and the device draws the couplings.
     pub(crate) fn new(
         device: &MetalDevice,
         graph: &IsingGraph,
         capacity: usize,
         schedules: &[&[f32]],
+        draw: Option<&Draw>,
     ) -> Result<Self, SampleError> {
         let n = graph.num_nodes();
         if n == 0
@@ -71,6 +106,7 @@ impl ScreenBank {
             || schedules.is_empty()
             || schedules.iter().any(|s| s.is_empty())
             || graph.edges.iter().any(|&(u, v)| u == v)
+            || draw.is_some_and(|d| !(1..=32).contains(&d.allowed_j.len()))
         {
             return Err(SampleError::TooLarge(
                 "screen bank needs nodes, words, stages and no self-loops".into(),
@@ -87,7 +123,21 @@ impl ScreenBank {
         let cached = device.topology_cache.get_or_build(device, graph, true);
         let nnz = cached.topo.nnz;
         let edges = cached.topo.edge_pos.len();
-        let edge_words = edges.div_ceil(32);
+        let row_words = if draw.is_some() {
+            8
+        } else {
+            edges.div_ceil(32)
+        };
+        let draw = draw.map_or(ScreenDraw::default(), |d| ScreenDraw {
+            mode: 1,
+            first_word: d.first_word,
+            allowed_len: d.allowed_j.len() as u32,
+            neg_table: d
+                .allowed_j
+                .iter()
+                .enumerate()
+                .fold(0, |table, (k, &j)| table | (u32::from(j < 0) << k)),
+        });
         let sched_len: usize = schedules.iter().map(|s| s.len()).sum();
         let region = |factors: &[usize]| -> Result<u64, SampleError> {
             factors
@@ -101,7 +151,7 @@ impl ScreenBank {
         };
         let sizes = [
             (2, region(&[capacity, nnz])?),
-            (3, region(&[capacity, GROUPS, edge_words, 4])?),
+            (3, region(&[capacity, GROUPS, row_words, 4])?),
             (9, region(&[sched_len, 4])?),
             (10, region(&[capacity, sampler::MSA_LANES, n.div_ceil(8)])?),
             (11, region(&[capacity, sampler::MSA_LANES, 4])?),
@@ -129,7 +179,8 @@ impl ScreenBank {
             stages: Vec::with_capacity(schedules.len()),
             words: Vec::with_capacity(capacity),
             capacity,
-            edge_words,
+            row_words,
+            draw,
             threads,
         };
         let mut offset = 0usize;
@@ -149,9 +200,9 @@ impl ScreenBank {
         self.words.len()
     }
 
-    /// Sign-bit words per model, the length [`Self::push`] expects.
-    pub(crate) fn edge_words(&self) -> usize {
-        self.edge_words
+    /// Words per model row, the length [`Self::push`] expects.
+    pub(crate) fn row_words(&self) -> usize {
+        self.row_words
     }
 
     /// Drop every loaded word.
@@ -202,14 +253,14 @@ impl ScreenBank {
             return Err(SampleError::TooLarge("screen bank is full".into()));
         }
         let word = self.words.len();
-        let row = self.edge_words;
+        let row = self.row_words;
         for g in 0..GROUPS {
             let at = (word * GROUPS + g) * row;
             match models.get(g) {
                 Some(bits) if bits.len() == row => self.write(3, at, bits)?,
                 Some(_) => {
                     return Err(SampleError::Driver(
-                        "sign bits do not match the topology".into(),
+                        "model row does not match the bank".into(),
                     ))
                 }
                 None => self.write(3, at, &vec![0u32; row])?,
@@ -247,12 +298,17 @@ impl ScreenBank {
             (5, self.cached.n as i32),
             (6, self.cached.topo.nnz as i32),
             (7, self.cached.topo.edge_pos.len() as i32),
-            (8, self.edge_words as i32),
+            (8, self.row_words as i32),
             (12, self.words.len() as i32),
             (20, self.cached.topo.colors.num_colors),
         ] {
             encoder.set_bytes(index, 4, (&value as *const i32).cast());
         }
+        encoder.set_bytes(
+            13,
+            std::mem::size_of::<ScreenDraw>() as u64,
+            (&self.draw as *const ScreenDraw).cast(),
+        );
         encoder.set_threadgroup_memory_length(0, ((self.cached.n * 4).div_ceil(16) * 16) as u64);
         encoder.dispatch_thread_groups(
             MTLSize::new(self.words.len() as u64, 1, 1),
@@ -281,6 +337,13 @@ impl ScreenBank {
         Ok(std::array::from_fn(|r| {
             i64::from(lanes[r * GROUPS + group])
         }))
+    }
+
+    /// The mask bytes the last dispatch built for `word`, one per CSR slot.
+    #[cfg(test)]
+    fn masks(&self, word: usize) -> Result<&[u8], SampleError> {
+        let nnz = self.cached.topo.nnz;
+        self.read::<u8>(2, word * nnz, nnz)
     }
 
     /// The spins of read `read` of model `group` in `word`.
@@ -348,14 +411,15 @@ impl<T> Screener<T> {
         graph: &IsingGraph,
         schedules: &[&[f32]],
         gates: &[i64],
+        draw: Option<&Draw>,
     ) -> Result<Self, SampleError> {
         if schedules.len() != gates.len() {
             return Err(SampleError::Driver("one gate per screen stage".into()));
         }
         Ok(Self {
             banks: [
-                ScreenBank::new(device, graph, BANK_WORDS, schedules)?,
-                ScreenBank::new(device, graph, BANK_WORDS, schedules)?,
+                ScreenBank::new(device, graph, BANK_WORDS, schedules, draw)?,
+                ScreenBank::new(device, graph, BANK_WORDS, schedules, draw)?,
             ],
             loaded: [Vec::new(), Vec::new()],
             command: [None, None],
@@ -366,9 +430,9 @@ impl<T> Screener<T> {
         })
     }
 
-    /// Whether `bits` fit this screener's topology.
-    pub(crate) fn fits(&self, bits: &[u32]) -> bool {
-        bits.len() == self.banks[0].edge_words()
+    /// Whether a model row fits this screener.
+    pub(crate) fn fits(&self, row: &[u32]) -> bool {
+        row.len() == self.banks[0].row_words()
     }
 
     pub(crate) fn offer(&mut self, item: T, bits: Vec<u32>) {
@@ -612,7 +676,7 @@ mod tests {
             quip_solver_core::BetaSchedule::Geometric,
         )
         .0;
-        let mut bank = ScreenBank::new(&device, &graphs[0], 4, &[&schedule]).unwrap();
+        let mut bank = ScreenBank::new(&device, &graphs[0], 4, &[&schedule], None).unwrap();
         let all: Vec<&[u32]> = bits.iter().map(Vec::as_slice).collect();
         bank.push(0, 7, &all).unwrap();
         bank.push(0, 9, &all[..3]).unwrap();
@@ -630,6 +694,69 @@ mod tests {
                     assert!(
                         energy < -10_000_000,
                         "word {word} model {g} read {r}: {energy}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// In draw mode the device builds, from each lease nonce, the same
+    /// couplings as the host draw, bit for bit, and every lane's energy is
+    /// its spins' energy under that model.
+    #[test]
+    fn device_draw_matches_the_host_draw() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let topology = advantage2(1);
+        let n = topology.num_nodes();
+        let edges = topology.edges.len();
+        let schedule = sampler::build_beta_schedule(
+            &topology,
+            16,
+            1,
+            None,
+            quip_solver_core::BetaSchedule::Geometric,
+        )
+        .0;
+        let cached = device.topology_cache.get_or_build(&device, &topology, true);
+        for allowed_j in [vec![-1i8, 1], vec![1, -1], vec![-1, 1, 1]] {
+            let draw = Draw {
+                first_word: n as u32,
+                allowed_j: allowed_j.clone(),
+            };
+            let mut bank =
+                ScreenBank::new(&device, &topology, 2, &[&schedule], Some(&draw)).unwrap();
+            let nonces: Vec<[u8; 32]> = (0..11u8)
+                .map(|k| std::array::from_fn(|i| k.wrapping_mul(37).wrapping_add(i as u8 * 11)))
+                .collect();
+            let keys: Vec<Vec<u32>> = nonces.iter().map(|&nonce| key_words(nonce)).collect();
+            let rows: Vec<&[u32]> = keys.iter().map(Vec::as_slice).collect();
+            bank.push(0, 5, &rows[..GROUPS]).unwrap();
+            bank.push(0, 6, &rows[GROUPS..]).unwrap();
+            run(&device, &bank);
+            for (index, &nonce) in nonces.iter().enumerate() {
+                let (word, group) = (index / GROUPS, index % GROUPS);
+                let (h, j) = crate::draw::draw_units(nonce, n, edges, &[0], &allowed_j).unwrap();
+                let masks = bank.masks(word).unwrap();
+                for (e, &(ij, ji)) in cached.topo.edge_pos.iter().enumerate() {
+                    let negative = j[e] < 0;
+                    for slot in [ij, ji] {
+                        let bit = (masks[slot as usize] >> group) & 1 == 1;
+                        assert_eq!(bit, negative, "set {allowed_j:?} nonce {index} edge {e}");
+                    }
+                }
+                let model = IsingGraph::new(
+                    h.iter().map(|&v| f64::from(v)).collect(),
+                    j.iter().map(|&v| f64::from(v)).collect(),
+                    topology.edges.to_vec(),
+                );
+                for (r, &energy) in bank.energies(word, group).unwrap().iter().enumerate() {
+                    let spins = bank.spins(word, group, r).unwrap();
+                    assert_eq!(
+                        energy,
+                        energy_milli(&spins, &model.h, &model.j, &model.edges)
                     );
                 }
             }
@@ -701,7 +828,7 @@ mod tests {
         let (schedule, _, _) = crate::cascade::segment_schedule(&graph, &params, &[]);
         let device = MetalDevice::open(0).expect("Metal device 0");
         let capacity = 256;
-        let mut bank = ScreenBank::new(&device, &graph, capacity, &[&schedule]).unwrap();
+        let mut bank = ScreenBank::new(&device, &graph, capacity, &[&schedule], None).unwrap();
         let started = std::time::Instant::now();
         let mut text = format!("qblock_id,k,best_{sweeps}_r{READS}\n");
         for (batch, chunk) in runs.chunks(capacity * GROUPS).enumerate() {
@@ -760,7 +887,7 @@ mod tests {
                 quip_solver_core::BetaSchedule::Geometric,
             )
             .0;
-            let mut bank = ScreenBank::new(&device, &graphs[0], words, &[&schedule]).unwrap();
+            let mut bank = ScreenBank::new(&device, &graphs[0], words, &[&schedule], None).unwrap();
             for w in 0..words {
                 bank.push(0, w as u32 + 1, &models).unwrap();
             }
