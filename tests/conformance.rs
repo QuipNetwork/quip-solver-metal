@@ -297,10 +297,10 @@ fn capabilities_and_version_and_check() {
     ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
 
     // Per binary: algorithm, node cap, and the advertised model limits.
-    for (bin, algo, nodes, degree, field) in [
-        ("quip-metal-sa", "sa", 4593, 0, 63_000),
-        ("quip-metal-msa", "msa", 6016, 20, 21_000),
-        ("quip-metal-gibbs", "gibbs", 4800, 0, 127_000),
+    for (bin, algo, nodes, degree, field, resolution) in [
+        ("quip-metal-sa", "sa", 4593, 0, 268_435_000, 1),
+        ("quip-metal-msa", "msa", 6016, 20, 21_000, 1000),
+        ("quip-metal-gibbs", "gibbs", 4800, 0, 268_435_000, 1),
     ] {
         let path = profile_bin(bin);
 
@@ -324,7 +324,7 @@ fn capabilities_and_version_and_check() {
         assert_eq!(caps["maxNodes"], nodes, "{bin}: {caps}");
         assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
         assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
-        assert_eq!(caps["exactResolutionMilli"], 1000, "{bin}: {caps}");
+        assert_eq!(caps["exactResolutionMilli"], resolution, "{bin}: {caps}");
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());

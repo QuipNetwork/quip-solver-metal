@@ -357,6 +357,33 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
     fill_h_j_inspecting_edges(topology, graph, |_, _| {})
 }
 
+/// [`fill_h_j`] for the wide kernels: integer milli units without quantization.
+///
+/// The caller has classified `graph` as wide, so every coefficient converts.
+pub(crate) fn fill_h_j_wide(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> (Vec<i32>, Vec<i32>) {
+    use crate::representation::to_milli;
+
+    let mut j_csr = vec![0_i32; topology.nnz];
+    for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
+        let Some(&(u, v)) = graph.edges.get(k) else {
+            continue;
+        };
+        if u >= topology.n || v >= topology.n {
+            continue;
+        }
+        let val = graph.j.get(k).copied().and_then(to_milli).unwrap_or(0);
+        j_csr[pos_ij as usize] = val;
+        if u != v {
+            j_csr[pos_ji as usize] = val;
+        }
+    }
+    let h = graph.h.iter().map(|&v| to_milli(v).unwrap_or(0)).collect();
+    (j_csr, h)
+}
+
 /// [`fill_h_j`]'s couplings from whole-unit `j_units` in the establishing
 /// edge order.
 ///
@@ -591,6 +618,21 @@ mod tests {
         assert_eq!(h, vec![1i8, -1, 0, 1]);
         // Each edge's J appears at both directed CSR positions.
         assert_eq!(j.iter().filter(|&&v| v != 0).count(), 8);
+    }
+
+    #[test]
+    fn fill_h_j_wide_writes_milli_into_both_csr_halves() {
+        let graph = IsingGraph::new(
+            vec![0.25, -1.5, 0.0],
+            vec![0.001, -2.0],
+            vec![(0, 1), (1, 2)],
+        );
+        let t = SelfFeedingTopology::build(&graph);
+        let (j, h) = fill_h_j_wide(&t, &graph);
+        assert_eq!(h, vec![250, -1500, 0]);
+        let mut nonzero: Vec<i32> = j.into_iter().filter(|&v| v != 0).collect();
+        nonzero.sort_unstable();
+        assert_eq!(nonzero, vec![-2000, -2000, 1, 1]);
     }
 
     #[test]

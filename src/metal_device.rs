@@ -23,6 +23,13 @@ use thiserror::Error;
 const SA_SRC: &str = include_str!("../kernels/sa.metal");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
 
+/// Prepended to a kernel source to build its wide variant.
+const WIDE_DEFINE: &str = "#define QUIP_WIDE 1\n";
+
+fn wide(source: &str) -> String {
+    format!("{WIDE_DEFINE}{source}")
+}
+
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
@@ -60,11 +67,14 @@ pub struct MetalDevice {
     pub(crate) device: Device,
     pub(crate) queue: metal::CommandQueue,
     pub(crate) sa: ComputePipelineState,
+    pub(crate) sa_wide: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
+    pub(crate) gibbs_wide: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
     pub(crate) gibbs_parallel: ComputePipelineState,
+    pub(crate) gibbs_parallel_wide: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
@@ -115,8 +125,12 @@ impl MetalDevice {
             .ok_or(MetalError::NoDevice(device_index))?;
 
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
+        let sa_wide = compile_pipeline(&device, &wide(SA_SRC), "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
+        let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
+        let gibbs_parallel_wide =
+            compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let queue = device.new_command_queue();
@@ -126,8 +140,11 @@ impl MetalDevice {
             device,
             queue,
             sa,
+            sa_wide,
             gibbs,
+            gibbs_wide,
             gibbs_parallel,
+            gibbs_parallel_wide,
             msa,
             msa_slots,
             topology_cache: crate::sampler::TopologyCache::default(),
@@ -221,6 +238,32 @@ fn compile_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_row_matches_metal_sources() {
+        assert_eq!(crate::wide_tables::WIDE_ROW, 2048);
+        assert!(SA_SRC.contains("#define WIDE_ROW 2048"));
+        assert!(GIBBS_SRC.contains("#define WIDE_ROW 2048"));
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "report GPU pipeline thread maxima")]
+    fn wide_pipelines_compile_and_admit_a_simd_group() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        for (name, pipeline) in [
+            ("sa_wide", &dev.sa_wide),
+            ("gibbs_wide", &dev.gibbs_wide),
+            ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
+        ] {
+            let max = pipeline.max_total_threads_per_threadgroup();
+            eprintln!("{name}: max threads per threadgroup {max}");
+            assert!(max >= 32, "{name} admits only {max} threads");
+        }
+        assert!(dev.gibbs_parallel_wide.max_total_threads_per_threadgroup() >= 128);
+    }
 
     #[test]
     fn device_count_is_consistent() {

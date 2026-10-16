@@ -1,24 +1,20 @@
 //! Launch the v0.2 Metal SA / Gibbs kernels and score with consensus energy.
 //!
-//! Kernels are the original v0.2 Metal sources (`GPU/metal_kernels.metal` /
-//! `GPU/metal_gibbs.metal`, copied verbatim into `kernels/`): int8-quantized
-//! CSR, D-Wave incremental delta-energy SA / color-block Gibbs, bit-packed
-//! thread-local state, one thread per read. The multi-spin kernel computes
+//! SA and Gibbs select int8 or integer-milli CSR by model representation.
+//! Both use D-Wave incremental delta-energy SA or color-block Gibbs, with
+//! bit-packed thread-local state on their sequential paths. The multi-spin kernel computes
 //! energies on the device for whole-unit graphs, with one job in 1,000 audited
 //! on the host. SA, Gibbs, and non-integer graphs are scored on the host with
 //! [`quip_solver_core::quip_protocol::scoring::energy_milli`] (f64 consensus).
 //!
 //! # Batched dispatch (throughput)
 //!
-//! The kernel maps **one threadgroup per problem, one thread per read**
-//! (`thread_id = threadgroup·num_reads + read`, `problem_id = thread_id /
-//! num_reads`). A dispatch of `P` problems is
-//! `dispatchThreadgroups(P, num_reads)` → `P` threadgroups occupy `P` GPU
-//! cores, so a batch of ≈`gpu_cores` problems fills the whole GPU and hides
-//! the kernel's thread-private memory latency. This mirrors v0.2
-//! `metal_sa.py::_dispatch_batch`. Driving `P = 1` (one problem per command
-//! buffer) leaves all but one core idle — a ~`gpu_cores`× slowdown — which is
-//! why the streaming loop batches ([`crate::streaming`]).
+//! Int8 sequential SA and Gibbs use one threadgroup per problem and one thread
+//! per read. Wide sequential SA and Gibbs pack reads into groups sized for the
+//! pipeline, so one problem can occupy several groups. Chromatic Gibbs uses
+//! one group per sample, while multi-spin SA uses one group per 32-read word.
+//! The streaming loop batches problems to keep the GPU busy
+//! ([`crate::streaming`]).
 //!
 //! [`encode_batch`] builds one batch's buffers and encodes the dispatch without
 //! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
@@ -45,7 +41,8 @@ pub enum Kernel {
     Gibbs,
 }
 
-use crate::topology::{fill_h_j, SelfFeedingTopology};
+use crate::representation::{classify, Representation};
+use crate::topology::{fill_h_j, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::BetaSchedule;
@@ -157,6 +154,23 @@ const _: () = assert!(
 /// `max_total_threads_per_threadgroup`. The persistent RNG buffer is sized by
 /// that clamped width, not by this constant.
 pub(crate) const MSA_THREADS: usize = 1024;
+/// Fixed group width for wide node-parallel Gibbs RNG streams.
+pub(crate) const WIDE_GIBBS_GROUP: usize = 128;
+
+/// Wide SA work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-10-11-wide-path.md`.
+const WIDE_SA_COST_FACTOR: f64 = 1.4;
+/// Wide Gibbs work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-10-11-wide-path.md`.
+const WIDE_GIBBS_COST_FACTOR: f64 = 2.0;
+
+/// Fill whole SIMD groups while keeping each wide sequential read's global ID.
+fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
+    if pipeline_max < SIMD_WIDTH {
+        return pipeline_max.max(1);
+    }
+    num_reads.min(pipeline_max / SIMD_WIDTH * SIMD_WIDTH)
+}
 /// Static threadgroup bytes `msa_anneal` declares: 32 atomic lane totals.
 /// `msa_pipeline_compiles_and_admits_at_least_256_threads` checks the compiled figure
 /// against a bound using the literal 144 bytes (16 bytes of alignment headroom),
@@ -341,10 +355,11 @@ fn chunk_plan(
     dims: &BatchDims,
     groups: usize,
     in_flight: usize,
+    cost: f64,
 ) -> Vec<(i32, i32)> {
     let num_betas = dims.num_betas.max(1);
     let per_beta =
-        (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64);
+        (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64) * cost;
     let betas_per_chunk = dispatch_beta_limit(kernel, per_beta, groups, in_flight, num_betas);
 
     let mut plan = Vec::new();
@@ -706,6 +721,7 @@ pub(crate) struct EncodedBatch {
     out: DispatchBuffers,
     dims: BatchDims,
     kstate: KernelEncode,
+    wide_rows: Option<(u64, metal::Buffer)>,
     colors: Vec<metal::Buffer>,
     num_colors: i32,
     groups: usize,
@@ -775,6 +791,9 @@ impl EncodedBatch {
                 bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
                 encoder.set_threadgroup_memory_length(0, *state_bytes);
             }
+        }
+        if let Some((index, rows)) = &self.wide_rows {
+            encoder.set_buffer(*index, Some(rows), 0);
         }
         encoder.dispatch_thread_groups(
             mtl_size_1d(self.groups),
@@ -983,7 +1002,31 @@ fn max_csr_degree(graph: &IsingGraph) -> usize {
     degree.into_iter().max().unwrap_or(0)
 }
 
-/// Validate a batch's shared inputs, returning the establishing graph and `N`.
+/// The one representation every graph in a batch shares, or a capacity
+/// refusal. `BatchKey` keeps representations apart, so a mix is a driver bug.
+fn batch_representation(
+    graphs: &[&IsingGraph],
+    kernel: Kernel,
+) -> Result<Representation, SampleError> {
+    let mut shared = None;
+    for graph in graphs {
+        let rep = if kernel == Kernel::Msa {
+            Representation::Int8
+        } else {
+            classify(graph).map_err(SampleError::TooLarge)?
+        };
+        if shared.is_some_and(|prev| prev != rep) {
+            return Err(SampleError::Driver(
+                "a batch mixes int8 and wide models".into(),
+            ));
+        }
+        shared = Some(rep);
+    }
+    shared.ok_or_else(|| SampleError::Driver("encode_batch needs at least one graph".into()))
+}
+
+/// Validate a batch's shared inputs, returning the establishing graph, `N`,
+/// and coefficient representation.
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device.
@@ -991,7 +1034,7 @@ pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
     kernel: Kernel,
-) -> Result<(&'a IsingGraph, usize), SampleError> {
+) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
         // batch would have indexed `graphs[0]` and panicked the miner.
@@ -1030,7 +1073,8 @@ pub(crate) fn validate_batch<'a>(
             params.num_sweeps
         )));
     }
-    Ok((first, n))
+    let rep = batch_representation(graphs, kernel)?;
+    Ok((first, n, rep))
 }
 
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
@@ -1043,6 +1087,7 @@ fn upload_inputs(
     cached: &CachedTopology,
     graphs: &[&IsingGraph],
     kernel: Kernel,
+    rep: Representation,
 ) -> InputBuffers {
     let topo = &cached.topo;
     let num_problems = graphs.len();
@@ -1066,27 +1111,42 @@ fn upload_inputs(
             device.new_buffer_from_slice(&tile_i32(base_col, num_problems)),
         )
     };
-    let mut all_j = vec![0i8; num_problems * nnz_alloc];
-    let mut all_h = vec![0i8; num_problems * n];
-    for (p, graph) in graphs.iter().enumerate() {
-        let (j_csr, h_i8) = fill_h_j(topo, graph);
-        // `j_csr` has length `topo.nnz`; pad region is the trailing slot when
-        // nnz == 0. `h_i8` has length N.
-        all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
-        all_h[p * n..p * n + h_i8.len()].copy_from_slice(&h_i8);
-    }
     let row_ptr_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * rp_len) as i32).collect();
     let col_ind_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * nnz_alloc) as i32).collect();
-    let (j, h) = if kernel == Kernel::Msa {
-        (
-            pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
-            pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
-        )
-    } else {
-        (
-            device.new_buffer_from_slice(&all_j),
-            device.new_buffer_from_slice(&all_h),
-        )
+    let (j, h) = match rep {
+        Representation::Wide => {
+            let mut all_j = vec![0_i32; num_problems * nnz_alloc];
+            let mut all_h = vec![0_i32; num_problems * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                let (j_csr, h_milli) = fill_h_j_wide(topo, graph);
+                all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
+                all_h[p * n..p * n + h_milli.len()].copy_from_slice(&h_milli);
+            }
+            (
+                device.new_buffer_from_slice(&all_j),
+                device.new_buffer_from_slice(&all_h),
+            )
+        }
+        Representation::Int8 => {
+            let mut all_j = vec![0i8; num_problems * nnz_alloc];
+            let mut all_h = vec![0i8; num_problems * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                let (j_csr, h_i8) = fill_h_j(topo, graph);
+                all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
+                all_h[p * n..p * n + h_i8.len()].copy_from_slice(&h_i8);
+            }
+            if kernel == Kernel::Msa {
+                (
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+                )
+            } else {
+                (
+                    device.new_buffer_from_slice(&all_j),
+                    device.new_buffer_from_slice(&all_h),
+                )
+            }
+        }
     };
 
     InputBuffers {
@@ -1131,10 +1191,11 @@ fn bind_shared_args(
 fn new_sa_persistent(
     device: &crate::metal_device::MetalDevice,
     dims: &BatchDims,
+    delta_bytes: usize,
 ) -> [metal::Buffer; 4] {
     [
         device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64),
-        device.new_zeroed_buffer((dims.num_threads * dims.n.max(1)) as u64),
+        device.new_zeroed_buffer((dims.num_threads * dims.n.max(1) * delta_bytes) as u64),
         device.new_zeroed_buffer((dims.num_threads * 4) as u64), // uint rng
         device.new_zeroed_buffer((dims.num_threads * 4) as u64), // int energy
     ]
@@ -1278,7 +1339,8 @@ fn encode_batch_inner(
     plan_override: Option<&[(i32, i32)]>,
     beta_override: Option<Vec<f32>>,
 ) -> Result<EncodedBatch, SampleError> {
-    let (first, n) = validate_batch(graphs, params, kernel)?;
+    let (first, n, rep) = validate_batch(graphs, params, kernel)?;
+    let wide = rep == Representation::Wide;
 
     let num_problems = graphs.len();
     let num_reads = simd_rounded_reads(params.num_reads);
@@ -1303,14 +1365,34 @@ fn encode_batch_inner(
             params.schedule,
         ),
     };
+    let wide_rows = if wide {
+        if !crate::wide_tables::wide_table_fits(beta.len()) {
+            return Err(SampleError::TooLarge(format!(
+                "{} beta rungs exceed the wide threshold table cap",
+                beta.len()
+            )));
+        }
+        // MSA always has Int8 representation, so only SA and Gibbs enter here.
+        let (index, rows) = match kernel {
+            Kernel::Sa => (22, crate::wide_tables::metropolis_rows(&beta, params.seed)),
+            Kernel::Gibbs => (25, crate::wide_tables::heat_bath_rows(&beta, params.seed)),
+            Kernel::Msa => unreachable!("MSA cannot use the wide representation"),
+        };
+        Some((index, device.new_buffer_from_slice(&rows)))
+    } else {
+        None
+    };
 
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
     let pipeline = match kernel {
+        Kernel::Sa if wide => &device.sa_wide,
         Kernel::Sa => &device.sa,
         Kernel::Msa => &device.msa,
+        Kernel::Gibbs if node_parallel && wide => &device.gibbs_parallel_wide,
         Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
+        Kernel::Gibbs if wide => &device.gibbs_wide,
         Kernel::Gibbs => &device.gibbs,
     };
 
@@ -1334,7 +1416,19 @@ fn encode_batch_inner(
     let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
     let (groups, threads_per_group) = match kernel {
         Kernel::Msa => (num_problems * words, MSA_THREADS.min(max_threads).max(1)),
+        Kernel::Gibbs if node_parallel && wide => {
+            if max_threads < WIDE_GIBBS_GROUP {
+                return Err(SampleError::TooLarge(format!(
+                    "the wide Gibbs kernel needs {WIDE_GIBBS_GROUP} threads per group; this device admits {max_threads}"
+                )));
+            }
+            (num_samples, WIDE_GIBBS_GROUP)
+        }
         Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
+        Kernel::Sa | Kernel::Gibbs if wide => {
+            let group = wide_sa_group(num_reads, max_threads);
+            (num_samples.div_ceil(group), group)
+        }
         Kernel::Sa | Kernel::Gibbs => (num_problems, num_reads),
     };
     if kernel == Kernel::Msa {
@@ -1380,11 +1474,20 @@ fn encode_batch_inner(
         first,
         kernel == Kernel::Msa && msa_four_color(),
     );
-    let inputs = upload_inputs(device, &cached, graphs, kernel);
+    let inputs = upload_inputs(device, &cached, graphs, kernel, rep);
 
+    let cost = if wide {
+        match kernel {
+            Kernel::Sa => WIDE_SA_COST_FACTOR,
+            Kernel::Gibbs => WIDE_GIBBS_COST_FACTOR,
+            Kernel::Msa => 1.0,
+        }
+    } else {
+        1.0
+    };
     let plan = match plan_override {
         Some(p) => p.to_vec(),
-        None => chunk_plan(kernel, &dims, groups, in_flight),
+        None => chunk_plan(kernel, &dims, groups, in_flight, cost),
     };
     let mut pooled = Vec::new();
     let (out, kstate) = match kernel {
@@ -1395,7 +1498,7 @@ fn encode_batch_inner(
                 energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
             },
             KernelEncode::Sa {
-                persist: new_sa_persistent(device, &dims),
+                persist: new_sa_persistent(device, &dims, if wide { 4 } else { 1 }),
             },
         ),
         Kernel::Gibbs => (
@@ -1466,6 +1569,7 @@ fn encode_batch_inner(
         out,
         dims,
         kstate,
+        wide_rows,
         colors,
         num_colors,
         groups,
@@ -1743,6 +1847,7 @@ fn read_i32_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i32>, Sample
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::representation::Representation;
 
     #[test]
     fn packed_decode_preserves_jobs_reads_and_host_scoring() {
@@ -1970,6 +2075,33 @@ mod tests {
     }
 
     #[test]
+    fn wide_gibbs_group_is_a_device_independent_constant() {
+        assert_eq!(WIDE_GIBBS_GROUP, 128);
+        assert_eq!(wide_sa_group(64, 1024), 64);
+        assert_eq!(wide_sa_group(256, 96), 96);
+        assert_eq!(wide_sa_group(256, 40), 32);
+    }
+
+    #[test]
+    fn a_wide_schedule_past_the_table_cap_is_refused() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let graph = IsingGraph::new(vec![0.25, 0.0], vec![1.0], vec![(0, 1)]);
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8193,
+            sweeps_per_beta: 1,
+            ..Default::default()
+        };
+        let err = encode_batch(&dev, &[&graph], &params, Kernel::Sa, 1)
+            .err()
+            .unwrap();
+        assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+    }
+
+    #[test]
     fn beta_schedule_runs_hot_to_cold() {
         let (sched, _) =
             build_beta_schedule(&ring(), 64, 1, Some((0.1, 10.0)), BetaSchedule::Geometric);
@@ -2015,9 +2147,41 @@ mod tests {
     #[test]
     fn validate_batch_accepts_a_normal_job() {
         let g = ring();
-        let (first, n) = validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
+        let (first, n, _) = validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
         assert_eq!(n, 4);
         assert_eq!(first.num_nodes(), 4);
+    }
+
+    #[test]
+    fn validate_batch_refuses_a_non_representable_model_as_capacity() {
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8,
+            ..Default::default()
+        };
+        let graph = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let err = validate_batch(&[&graph], &params, kernel).unwrap_err();
+            assert!(
+                matches!(err, SampleError::TooLarge(_)),
+                "{kernel:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_batch_reports_the_representation() {
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8,
+            ..Default::default()
+        };
+        let pm1 = IsingGraph::new(vec![1.0, -1.0], vec![-1.0], vec![(0, 1)]);
+        let quarter = IsingGraph::new(vec![0.25, 0.0], vec![-0.75], vec![(0, 1)]);
+        let (_, _, rep) = validate_batch(&[&pm1], &params, Kernel::Sa).unwrap();
+        assert_eq!(rep, Representation::Int8);
+        let (_, _, rep) = validate_batch(&[&quarter], &params, Kernel::Sa).unwrap();
+        assert_eq!(rep, Representation::Wide);
     }
 
     #[test]
@@ -2329,8 +2493,8 @@ mod tests {
                 packed_size: 573,
             };
             let groups = cores * 1024;
-            let solo = chunk_plan(kernel, &dims, groups, 1)[0].1;
-            let shared = chunk_plan(kernel, &dims, groups, 2)[0].1;
+            let solo = chunk_plan(kernel, &dims, groups, 1, 1.0)[0].1;
+            let shared = chunk_plan(kernel, &dims, groups, 2, 1.0)[0].1;
             assert_eq!(shared, (solo / 2).max(1), "{kernel:?}");
         }
     }
@@ -2353,7 +2517,7 @@ mod tests {
                     let limit = msa_step_limit(n, groups, slice);
                     assert_eq!(
                         limit,
-                        chunk_plan(Kernel::Msa, &dims, groups, 2)[0].1 as usize
+                        chunk_plan(Kernel::Msa, &dims, groups, 2, 1.0)[0].1 as usize
                     );
                     assert!((1..=slice.min(MAX_SWEEPS)).contains(&limit));
                     let work = limit as f64 * groups as f64 * n as f64;
@@ -2716,7 +2880,7 @@ mod tests {
                 num_reads: 1,
                 packed_size: 0,
             };
-            let plan = chunk_plan(kernel, &dims, groups, in_flight);
+            let plan = chunk_plan(kernel, &dims, groups, in_flight, 1.0);
             let cover = dims.num_betas.max(1);
             prop_assert!(!plan.is_empty());
             let mut cursor = 0i32;
