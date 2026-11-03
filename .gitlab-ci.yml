@@ -2,7 +2,7 @@ stages: [test, build, release]
 
 include:
   - project: quip.network/ci-templates
-    ref: v1.0.0
+    ref: v1.2.0
     file: templates/dependency-gate.yml
 
 variables:
