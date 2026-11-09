@@ -442,23 +442,33 @@ async fn steady_rate(s: &mut Session, warmup: u64, measure: u64) -> f64 {
 async fn lease_throughput() {
     let (topology, _) = aglais();
     let chain = || target(AGLAIS_TARGET_MILLI, 14_336);
+    // Backend TOML for every session, for example `cascade_prefilter = false`.
+    let backend = std::env::var("QUIP_LEASE_BACKEND").unwrap_or_default();
+    let only_one = std::env::var("QUIP_LEASE_ONE").is_ok();
+    let measure: u64 = std::env::var("QUIP_LEASE_MEASURE").map_or(200_000, |v| v.parse().unwrap());
 
-    let mut s = Session::start(&msa(), 8, "").await;
+    let mut s = Session::start(&msa(), 8, &backend).await;
     s.send(coord_msg::Msg::Topology(topology.clone())).await;
     s.send(coord_msg::Msg::SetTarget(chain())).await;
+    // Room for the warmup, the salts already done when the measurement starts,
+    // and the measurement itself.
+    let one_size = 1_000_000.max(2 * measure);
     s.send(coord_msg::Msg::Job(lease(
         b"one",
         3,
         AGLAIS_HASH,
         0,
-        1_000_000,
+        one_size,
     )))
     .await;
-    let one = steady_rate(&mut s, 30_000, 200_000).await;
+    let one = steady_rate(&mut s, 30_000, measure).await;
     eprintln!("one lease: {one:.0} salts/s");
     drop(s);
+    if only_one {
+        return;
+    }
 
-    let mut s = Session::start(&msa(), 8, "").await;
+    let mut s = Session::start(&msa(), 8, &backend).await;
     s.send(coord_msg::Msg::Topology(topology.clone())).await;
     s.send(coord_msg::Msg::SetTarget(chain())).await;
     for (i, id) in [b"four-0", b"four-1", b"four-2", b"four-3"]
@@ -484,7 +494,7 @@ async fn lease_throughput() {
     // Distinct sizes tell the leases apart in the miner's debug log.
     let sizes: Vec<u64> = (0..5).map(|i| PER + i).collect();
     let ids: Vec<Vec<u8>> = (0..5).map(|i| format!("seq-{i}").into_bytes()).collect();
-    let mut s = Session::start(&msa(), 8, "").await;
+    let mut s = Session::start(&msa(), 8, &backend).await;
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(chain())).await;
     s.send(coord_msg::Msg::Job(lease(

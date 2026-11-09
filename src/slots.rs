@@ -209,6 +209,9 @@ pub(crate) struct Checkpoint {
     pub(crate) observe: bool,
     /// Sweeps of the current anneal completed as of this readback.
     pub(crate) position: usize,
+    /// Every read's energy at this readback, for the trace tools.
+    #[cfg(test)]
+    pub(crate) energies: Vec<i32>,
 }
 
 struct ResidentJob {
@@ -256,6 +259,12 @@ pub(crate) struct SlotPool {
     /// Host time of the last commit, for [`StepSpan::committed`].
     committed: f64,
     faulted: bool,
+    /// Sweeps and count of deep steps that ran a whole slice, and the
+    /// seconds and count of intervals between commits with live slots, since
+    /// [`Self::take_progress`].
+    progress: (u64, u64, f64, u64),
+    /// Host time of the last commit, while slots stay live.
+    live_commit: Option<f64>,
     num_reads: usize,
     words: usize,
     threads: usize,
@@ -336,6 +345,8 @@ impl SlotPool {
             span: None,
             committed: 0.0,
             faulted: false,
+            progress: (0, 0, 0.0, 0),
+            live_commit: None,
             num_reads,
             words,
             threads,
@@ -532,13 +543,27 @@ impl SlotPool {
     /// jobs at their final checkpoint before submitting another step. A job
     /// in a fresh leg (see [`SlotJob::fresh_from`]) advances up to
     /// `deep_slice` sweeps, every other job up to `slice`.
+    #[cfg(test)]
     pub(crate) fn commit_step(
         &mut self,
         slice: usize,
         deep_slice: usize,
     ) -> Result<bool, SampleError> {
+        self.commit_step_with(slice, deep_slice, None)
+    }
+
+    /// [`Self::commit_step`], with `screen`'s dispatch in the same compute
+    /// encoder under concurrent dispatch, so the two overlap on the GPU.
+    /// Commits nothing, and returns false, when no slot is live.
+    pub(crate) fn commit_step_with(
+        &mut self,
+        slice: usize,
+        deep_slice: usize,
+        screen: Option<&crate::screen::ScreenBank>,
+    ) -> Result<bool, SampleError> {
         self.idle()?;
         if self.live() == 0 {
+            self.live_commit = None;
             return Ok(false);
         }
         if slice == 0 || deep_slice == 0 {
@@ -548,6 +573,7 @@ impl SlotPool {
         let slice = sampler::msa_step_limit(self.cached.n, groups, slice);
         let deep_slice = sampler::msa_step_limit(self.cached.n, groups, deep_slice);
         self.steps.clear();
+        let mut full = (0u64, 0u64);
         for (slot, resident) in self.slots.iter().enumerate() {
             let Some(r) = resident else {
                 continue;
@@ -581,6 +607,9 @@ impl SlotPool {
                 slice
             };
             let count = limit.min(room);
+            if leg >= r.job.fresh_from && count == limit {
+                full = (full.0 + count as u64, full.1 + 1);
+            }
             let mut flags = if count == checkpoint_room {
                 SLOT_WRITE_OUTPUT
             } else if observe_stop && count == room {
@@ -600,9 +629,15 @@ impl SlotPool {
                 flags,
             });
         }
+        self.progress.0 += full.0;
+        self.progress.1 += full.1;
         self.write(25, 0, &self.steps)?;
         let command = self.queue.new_command_buffer().to_owned();
-        let encoder = command.new_compute_command_encoder();
+        let encoder = if screen.is_some() {
+            command.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        } else {
+            command.new_compute_command_encoder()
+        };
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&self.cached.row), 0);
         encoder.set_buffer(1, Some(&self.cached.col), 0);
@@ -634,11 +669,30 @@ impl SlotPool {
             MTLSize::new((self.steps.len() * self.words) as u64, 1, 1),
             MTLSize::new(self.threads as u64, 1, 1),
         );
+        if let Some(Err(error)) = screen.map(|screen| screen.encode(encoder)) {
+            encoder.end_encoding();
+            return Err(error);
+        }
         encoder.end_encoding();
         self.committed = sampler::host_seconds();
+        if let Some(previous) = self.live_commit.replace(self.committed) {
+            self.progress.2 += self.committed - previous;
+            self.progress.3 += 1;
+        }
         command.commit();
         self.command = Some(command);
         Ok(true)
+    }
+
+    /// Whole-slice deep sweeps and steps, and the seconds and count of
+    /// intervals between live commits, since the last call.
+    pub(crate) fn take_progress(&mut self) -> (u64, u64, f64, u64) {
+        std::mem::take(&mut self.progress)
+    }
+
+    /// The command in flight, if any.
+    pub(crate) fn command(&self) -> Option<metal::CommandBuffer> {
+        self.command.clone()
     }
 
     pub(crate) fn wait(&self) {
@@ -726,6 +780,8 @@ impl SlotPool {
                     best,
                     observe,
                     position: r.position - r.anneal_start(index),
+                    #[cfg(test)]
+                    energies: slot_energies,
                 });
             }
         }
@@ -2038,7 +2094,10 @@ mod tests {
     /// Ignored: needs a Metal device and a problem directory written by
     /// `scripts/testnet/regen`. Every problem must share one topology with
     /// zero fields, so one schedule serves all of them. Writes
-    /// `qblock_id,k,best_<stage>...,best_<sweeps>`.
+    /// `qblock_id,k,best_<stage>...,best_<sweeps>`. An empty
+    /// `QUIP_TRACE_STAGES` runs one standard anneal of `QUIP_TRACE_SWEEPS`.
+    /// `QUIP_TRACE_READ_COUNTS=4,8` adds `best_<stage>_r4` and `best_<stage>_r8`
+    /// after each `best_<stage>`: the best over that many of the reads.
     ///
     /// ```text
     /// QUIP_TRACE_PROBLEMS=dir QUIP_TRACE_OUT=trace.csv QUIP_TRACE_STAGES=8,16,64 \
@@ -2066,8 +2125,17 @@ mod tests {
         let out = std::env::var("QUIP_TRACE_OUT").expect("QUIP_TRACE_OUT");
         let stages: Vec<usize> = var("QUIP_TRACE_STAGES", "8,16,64")
             .split(',')
+            .filter(|s| !s.is_empty())
             .map(|s| s.parse().unwrap())
             .collect();
+        // Best over the first k reads at each checkpoint, for each k listed;
+        // empty keeps the best over all reads only.
+        let read_counts: Vec<usize> = var("QUIP_TRACE_READ_COUNTS", "")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert!(read_counts.iter().all(|&k| (1..=READS).contains(&k)));
         let sweeps: usize = var("QUIP_TRACE_SWEEPS", "256").parse().unwrap();
         let seeds: u64 = var("QUIP_TRACE_SEEDS", "30").parse().unwrap();
         let slice: usize = var("QUIP_TRACE_SLICE", "4096").parse().unwrap();
@@ -2138,7 +2206,11 @@ mod tests {
             pool.wait();
             for checkpoint in pool.take_checkpoints().unwrap() {
                 let key = owner[checkpoint.slot].expect("live slot has an owner");
-                rows.entry(key).or_default().push(checkpoint.best);
+                let row = rows.entry(key).or_default();
+                row.push(checkpoint.best);
+                for &k in &read_counts {
+                    row.push(i64::from(*checkpoint.energies[..k].iter().min().unwrap()));
+                }
                 if checkpoint.last {
                     pool.release(checkpoint.slot).unwrap();
                     owner[checkpoint.slot] = None;
@@ -2153,6 +2225,9 @@ mod tests {
         let mut text = String::from("qblock_id,k");
         for stage in stages.iter().filter(|&&s| s < sweeps).chain([&sweeps]) {
             text.push_str(&format!(",best_{stage}"));
+            for k in &read_counts {
+                text.push_str(&format!(",best_{stage}_r{k}"));
+            }
         }
         text.push('\n');
         for ((qblock, k), bests) in &rows {
@@ -2161,6 +2236,100 @@ mod tests {
         }
         std::fs::write(&out, text).unwrap();
         eprintln!("{total} jobs in {:.0} s", started.elapsed().as_secs_f64());
+    }
+
+    /// Whether a slot step and a screen dispatch in one concurrent encoder
+    /// overlap on the GPU: times each alone and both together.
+    ///
+    /// ```text
+    /// cargo test --release --lib concurrent_dispatch_overlap -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a quiet Metal device; a benchmark"]
+    #[expect(clippy::print_stderr, reason = "the benchmark reports on stderr")]
+    fn concurrent_dispatch_overlap() {
+        use crate::screen::{key_words, Draw, ScreenBank};
+        let device = MetalDevice::open(0).expect("Metal device 0");
+        let full = advantage2_system1(7);
+        let keep: Vec<usize> = (0..full.edges.len())
+            .filter(|&e| full.edges[e].0 != full.edges[e].1)
+            .collect();
+        let graph = IsingGraph::new(
+            vec![0.0; full.num_nodes()],
+            keep.iter().map(|&e| full.j[e]).collect(),
+            keep.iter().map(|&e| full.edges[e]).collect(),
+        );
+        let schedule = |sweeps| {
+            build_beta_schedule(
+                &graph,
+                sweeps,
+                1,
+                None,
+                quip_solver_core::BetaSchedule::Geometric,
+            )
+            .0
+        };
+        let (a, b) = (schedule(16), schedule(128));
+        let draw = Draw {
+            first_word: graph.num_nodes() as u32,
+            allowed_j: vec![-1, 1],
+        };
+        let mut bank = ScreenBank::new(&device, &graph, 640, &[&a, &b], Some(&draw)).unwrap();
+        for w in 0..640u32 {
+            let keys: Vec<Vec<u32>> = (0..8u8)
+                .map(|g| key_words(std::array::from_fn(|i| (w as u8) ^ g ^ (i as u8))))
+                .collect();
+            let rows: Vec<&[u32]> = keys.iter().map(Vec::as_slice).collect();
+            bank.push(usize::from(w >= 608), w + 1, &rows).unwrap();
+        }
+        let deep: Arc<[f32]> = schedule(4_000_000).into();
+        let mut pool = SlotPool::new(&device, &graph, READS, 20, deep.len()).unwrap();
+        for k in 0..4 {
+            pool.admit(SlotJob {
+                graph: graph.clone(),
+                schedule: Arc::clone(&deep),
+                checkpoints: vec![deep.len()],
+                fresh_from: 0,
+                seed: k + 1,
+                observe: false,
+            })
+            .unwrap();
+        }
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 5.0
+        };
+        let alone = time(&mut || {
+            let command = device.queue.new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            bank.encode(encoder).unwrap();
+            encoder.end_encoding();
+            command.commit();
+            command.wait_until_completed();
+        });
+        eprintln!("screen alone (640 words): {alone:.1} ms");
+        for slice in [128, 256, 512] {
+            let slots = time(&mut || {
+                assert!(pool.commit_step(8, slice).unwrap());
+                pool.wait();
+                pool.take_checkpoints().unwrap();
+            });
+            let both = time(&mut || {
+                assert!(pool.commit_step_with(8, slice, Some(&bank)).unwrap());
+                pool.wait();
+                pool.take_checkpoints().unwrap();
+            });
+            eprintln!(
+                "deep slice {slice}: 4 deep slots alone {slots:.1} ms, together {both:.1} ms \
+                 (serial {:.1}, overlapped {:.1})",
+                slots + alone,
+                slots.max(alone)
+            );
+        }
     }
 
     /// Screen throughput against deep-leg speed for several deep step sizes.

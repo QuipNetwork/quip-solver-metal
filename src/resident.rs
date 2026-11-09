@@ -9,6 +9,7 @@ use crate::cascade::{
 };
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, Kernel, SampleError};
+use crate::screen::{self, Screener, Verdict};
 use crate::slots::{Edges, PreparedInputs, SlotPool};
 use crate::streaming::{batch_size_for_reads, scale_budget, GpuGovernor};
 use crate::topology::SelfFeedingTopology;
@@ -143,6 +144,17 @@ pub(crate) enum SaltOutcome {
     },
 }
 
+impl SaltOutcome {
+    pub(crate) fn index(&self) -> u64 {
+        match self {
+            Self::Screened { index, .. }
+            | Self::Survived { index, .. }
+            | Self::Dropped { index }
+            | Self::Failed { index, .. } => *index,
+        }
+    }
+}
+
 pub(crate) struct Salt {
     pub(crate) topology: Arc<TopologyView>,
     pub(crate) nonce: [u8; 32],
@@ -151,6 +163,10 @@ pub(crate) struct Salt {
     /// covers one round at a time.
     pub(crate) round: u64,
     pub(crate) params: SampleParams,
+    /// Zero for the lease's own run of this salt. A near-miss rerun copy
+    /// counts from 1: it skips the screen, takes the deep plan, and gets its
+    /// own seed.
+    pub(crate) rerun: u8,
     /// Set when the issuing lease ends. Its queued and live units then stop
     /// and answer `Dropped`.
     pub(crate) stop: Arc<AtomicBool>,
@@ -262,7 +278,7 @@ fn drawn_job(salt: &Salt, h_milli: &[i32], j_milli: &[i32]) -> StreamJob {
             .collect()
     };
     let mut params = salt.params.clone();
-    params.seed = salt_seed(salt.nonce);
+    params.seed = salt_seed(salt.nonce, salt.rerun);
     StreamJob {
         job_id: salt.index.to_le_bytes().to_vec(),
         graph: IsingGraph::new(
@@ -286,12 +302,15 @@ fn modelless_job(salt: &Salt) -> StreamJob {
     }
 }
 
-/// The nonce is unique to the lease and salt, so concurrent leases never share a seed.
-fn salt_seed(nonce: [u8; 32]) -> u64 {
+/// The nonce is unique to the lease and salt, so concurrent leases never share
+/// a seed, and each rerun copy of a salt gets its own.
+fn salt_seed(nonce: [u8; 32], rerun: u8) -> u64 {
     use std::hash::BuildHasher;
     static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
         std::sync::OnceLock::new();
-    KEYS.get_or_init(Default::default).hash_one(nonce).max(1)
+    KEYS.get_or_init(Default::default)
+        .hash_one((nonce, rerun))
+        .max(1)
 }
 
 /// Most sweeps a slot in a fresh deep leg advances per step. Screening slots
@@ -528,6 +547,64 @@ pub(crate) struct PreparedData {
     pub(crate) inputs: PreparedInputs,
 }
 
+/// The screen stages of one lease topology, shared by its salts.
+pub(crate) struct ScreenPlan {
+    /// The topology with unit couplings, to build the screener's buffers.
+    graph: IsingGraph,
+    /// One standard anneal per [`CHAIN_GATES`] screen stage.
+    schedules: Vec<Vec<f32>>,
+    /// The lease draw the screen runs on the device.
+    draw: screen::Draw,
+}
+
+impl ScreenPlan {
+    /// Each preparation worker builds its own plan; equal plans share a
+    /// screener.
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.graph.edges, &other.graph.edges)
+            && self.schedules == other.schedules
+            && self.draw.first_word == other.draw.first_word
+            && self.draw.allowed_j == other.draw.allowed_j
+    }
+}
+
+/// A salt for the nonce-parallel screen: its ChaCha8 key only.
+pub(crate) struct Candidate {
+    salt: Salt,
+    plan: Arc<ScreenPlan>,
+    key: Vec<u32>,
+}
+
+/// What preparation hands the runner.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "moved once per job through a channel; boxing adds an allocation per job"
+)]
+pub(crate) enum Ready {
+    Unit(Prepared),
+    Screen(Candidate),
+}
+
+#[cfg(test)]
+impl Ready {
+    fn unit(self) -> Prepared {
+        match self {
+            Self::Unit(prepared) => prepared,
+            Self::Screen(_) => panic!("expected a slot unit, got a screen candidate"),
+        }
+    }
+}
+
+/// What [`Preparer::prepare_salt`] made of a salt.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per salt; boxing adds an allocation per salt"
+)]
+enum SaltPrep {
+    Unit(StreamJob, Result<Option<PreparedData>, SampleError>),
+    Screen(Arc<ScreenPlan>, Vec<u32>),
+}
+
 /// The last prepared topology. Workers share it, so every job on one topology
 /// carries the same edge storage and the runner can skip its edge compares.
 struct PreparedTopology {
@@ -547,15 +624,34 @@ struct SaltTopology {
     /// Held, so pointer equality identifies the lease's view.
     view: Arc<TopologyView>,
     prepared: Arc<PreparedTopology>,
-    /// The allowed values in whole device units, when every draw has exact
-    /// device energies and the edges meet
-    /// [`crate::topology::fill_couplings`]'s precondition.
+    /// The allowed values in whole device units, when every draw is a unit
+    /// model (couplings ±1, fields 0 or ±1) with exact device energies and
+    /// the edges meet [`crate::topology::fill_couplings`]'s precondition.
+    /// Slots run the unit kernel only, so any other lease takes
+    /// [`Preparer::prepare`] for every salt.
     units: Option<(Vec<i8>, Vec<i8>)>,
-    /// Every draw has couplings ±1 and fields 0 or ±1.
-    unit: bool,
+    /// Set when every draw has couplings ±1 and zero fields on the chain
+    /// topology, which the screen takes.
+    screen: Option<Arc<ScreenPlan>>,
 }
 
 impl SaltTopology {
+    /// The screen plan for `salt` when the screen takes it.
+    fn screen_for(
+        &self,
+        salt: &Salt,
+        settings: CascadeSettings,
+        screen: bool,
+    ) -> Option<&Arc<ScreenPlan>> {
+        self.screen.as_ref().filter(|_| {
+            screen
+                && settings.screen
+                && !settings.deep
+                && !settings.open_gates
+                && settings.chain_gated(self.prepared.chain, &salt.params)
+        })
+    }
+
     /// `None` when `prepared` is not `view`'s topology.
     fn learn(view: &Arc<TopologyView>, prepared: Arc<PreparedTopology>) -> Option<Self> {
         let n = view.num_nodes;
@@ -581,20 +677,62 @@ impl SaltTopology {
             && whole(&view.allowed_j_milli)
             && units <= sampler::DEVICE_ENERGY_MAX_UNITS;
         let to_units = |values: &[i32]| values.iter().map(|&v| (v / 1000) as i8).collect();
+        let unit_j = view.allowed_j_milli.iter().all(|&j| j.abs() == 1000);
+        let unit = unit_j
+            && view
+                .allowed_h_milli
+                .iter()
+                .all(|&h| h == 0 || h.abs() == 1000);
+        let screen =
+            (exact && unit_j && prepared.chain && view.allowed_h_milli == [0]).then(|| {
+                let graph = IsingGraph {
+                    h: vec![0.0; n],
+                    j: vec![1.0; view.edges.len()],
+                    edges: Arc::clone(&prepared.edges),
+                };
+                let range = crate::cascade::unit_beta_range(
+                    std::iter::repeat_n(false, n),
+                    &prepared.degrees,
+                );
+                let schedules = CHAIN_GATES
+                    .screen
+                    .iter()
+                    .map(|&(sweeps, _)| {
+                        let params = SampleParams {
+                            num_reads: CHAIN_GATES.min_reads,
+                            num_sweeps: sweeps,
+                            sweeps_per_beta: 1,
+                            schedule: quip_solver_core::BetaSchedule::Geometric,
+                            beta_range: Some(range),
+                            seed: 1,
+                        };
+                        crate::cascade::segment_schedule(&graph, &params, &[]).0
+                    })
+                    .collect();
+                let draw = screen::Draw {
+                    first_word: n as u32,
+                    allowed_j: view
+                        .allowed_j_milli
+                        .iter()
+                        .map(|&j| (j / 1000) as i8)
+                        .collect(),
+                };
+                Arc::new(ScreenPlan {
+                    graph,
+                    schedules,
+                    draw,
+                })
+            });
         Some(Self {
             view: Arc::clone(view),
             prepared,
-            units: exact.then(|| {
+            units: (exact && unit).then(|| {
                 (
                     to_units(&view.allowed_h_milli),
                     to_units(&view.allowed_j_milli),
                 )
             }),
-            unit: view.allowed_j_milli.iter().all(|&j| j.abs() == 1000)
-                && view
-                    .allowed_h_milli
-                    .iter()
-                    .all(|&h| h == 0 || h.abs() == 1000),
+            screen,
         })
     }
 }
@@ -617,7 +755,11 @@ impl Preparer {
             return Ok(None);
         }
         validate(job)?;
-        if job.params.num_sweeps == 0 || !sampler::device_energy_exact(&job.graph) {
+        // Slots run the unit kernel only. Weighted models, and refusals,
+        // take the batch path, which classifies them again.
+        let unit = crate::representation::classify_msa(&job.graph)
+            == Ok(crate::representation::Representation::Int8);
+        if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
         }
@@ -681,7 +823,7 @@ impl Preparer {
         let gated = screen && settings.chain_gated(prepared.chain, &job.params);
         // Open gates measure the budget the job asked for.
         if gated && !settings.open_gates {
-            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+            job.params.num_sweeps = CHAIN_GATES.final_sweeps(settings.long);
         }
         // `inputs` verified the job's edges against `prepared.edges`, edge by
         // edge, so the cached degrees are this job's.
@@ -700,12 +842,7 @@ impl Preparer {
     /// runner can answer it. The first salt of a lease draws milli values,
     /// takes [`Self::prepare`], and teaches this worker the topology. Later
     /// salts draw straight into device units and share the lease's edges.
-    fn prepare_salt(
-        &mut self,
-        salt: &Salt,
-        settings: CascadeSettings,
-        screen: bool,
-    ) -> (StreamJob, Result<Option<PreparedData>, SampleError>) {
+    fn prepare_salt(&mut self, salt: &Salt, settings: CascadeSettings, screen: bool) -> SaltPrep {
         let view = &salt.topology;
         let known = self
             .salt
@@ -718,7 +855,7 @@ impl Preparer {
                 Ok(drawn) => drawn,
                 Err(error) => {
                     let error = SampleError::Driver(format!("lease draw: {error}"));
-                    return (modelless_job(salt), Err(error));
+                    return SaltPrep::Unit(modelless_job(salt), Err(error));
                 }
             };
             let mut job = drawn_job(salt, &h_milli, &j_milli);
@@ -736,9 +873,19 @@ impl Preparer {
                     .clone();
                 self.salt = cached.and_then(|prepared| SaltTopology::learn(view, prepared));
             }
-            return (job, data);
+            // The worker's first salt of a lease teaches it the topology;
+            // screen it too, so a lease never mixes plans.
+            let learned = self.salt.as_ref().filter(|k| Arc::ptr_eq(&k.view, view));
+            if let Some(plan) = learned.and_then(|k| k.screen_for(salt, settings, screen)) {
+                return SaltPrep::Screen(Arc::clone(plan), screen::key_words(salt.nonce));
+            }
+            return SaltPrep::Unit(job, data);
         };
         let prepared = &known.prepared;
+        // The screen draws the model on the device from the nonce.
+        if let Some(plan) = known.screen_for(salt, settings, screen) {
+            return SaltPrep::Screen(Arc::clone(plan), screen::key_words(salt.nonce));
+        }
         let (fields, j_units) = match crate::draw::draw_units(
             salt.nonce,
             view.num_nodes,
@@ -749,12 +896,12 @@ impl Preparer {
             Ok(drawn) => drawn,
             Err(error) => {
                 let error = SampleError::Driver(format!("lease draw: {error}"));
-                return (modelless_job(salt), Err(error));
+                return SaltPrep::Unit(modelless_job(salt), Err(error));
             }
         };
         let to_f64 = |values: &[i8]| values.iter().map(|&v| f64::from(v)).collect();
         let mut params = salt.params.clone();
-        params.seed = salt_seed(salt.nonce);
+        params.seed = salt_seed(salt.nonce, salt.rerun);
         let mut job = StreamJob {
             job_id: salt.index.to_le_bytes().to_vec(),
             graph: IsingGraph {
@@ -766,18 +913,14 @@ impl Preparer {
             watermark: None,
         };
         if let Err(error) = validate(&job) {
-            return (job, Err(error));
+            return SaltPrep::Unit(job, Err(error));
         }
         let gated = screen && settings.chain_gated(prepared.chain, &job.params);
         if gated && !settings.open_gates {
-            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+            job.params.num_sweeps = CHAIN_GATES.final_sweeps(settings.long);
         }
         let beta_range = job.params.beta_range.is_none().then(|| {
-            if known.unit {
-                crate::cascade::unit_beta_range(fields.iter().map(|&h| h != 0), &prepared.degrees)
-            } else {
-                crate::cascade::resident_beta_range_from(&job.graph, &prepared.degrees)
-            }
+            crate::cascade::unit_beta_range(fields.iter().map(|&h| h != 0), &prepared.degrees)
         });
         let inputs =
             PreparedInputs::from_units(&prepared.topology, &prepared.edges, fields, &j_units);
@@ -785,7 +928,7 @@ impl Preparer {
             .schedules
             .prepare(&job, settings, gated, screen, beta_range)
             .map(|schedule| Some(PreparedData { schedule, inputs }));
-        (job, data)
+        SaltPrep::Unit(job, data)
     }
 }
 
@@ -793,7 +936,7 @@ struct Work {
     source: Source,
     settings: CascadeSettings,
     screen: bool,
-    reply: mpsc::SyncSender<Prepared>,
+    reply: mpsc::SyncSender<Ready>,
 }
 
 // Warm Advantage2 preparation measured 251 us/job on one M4 Max host thread
@@ -913,6 +1056,18 @@ impl Utilization {
 /// 60 percent busy; eight keep it waiting on the GPU instead.
 pub(crate) const PREP_WORKERS: usize = 8;
 pub(crate) const PREP_BOUND: usize = 40;
+/// Outstanding preparations while salts go to the screen. A candidate holds
+/// 5 KB of sign bits, not a model, and the screen takes up to 2,560 per turn.
+pub(crate) const SCREEN_PREP_BOUND: usize = 8_192;
+/// Models the runner keeps queued in the screen before it stops taking more.
+const SCREEN_QUEUE: usize = 2 * screen::BANK_WORDS * screen::GROUPS;
+/// Microseconds per sweep of one deep slot's threadgroup on an M4 Max core
+/// (measured 89 to 94 for the multi-spin kernels), rounded up.
+const DEEP_SWEEP_US: f64 = 100.0;
+/// Bounds on the sweeps a deep slot advances per step beside a screen
+/// dispatch. Each step sizes it to the last command's GPU time, so deep
+/// slots run as long as the screen words and do not hold the command open.
+const SCREEN_DEEP_SLICES: (usize, usize) = (DEEP_SLICE, 4_096);
 
 /// Run one preparation, turning a panic into an error so the worker still
 /// returns its job to the runner exactly once.
@@ -926,8 +1081,10 @@ fn unwind_safe(
 pub(crate) struct Preparation {
     requests: Vec<mpsc::SyncSender<Work>>,
     next_worker: usize,
-    ready: VecDeque<mpsc::Receiver<Prepared>>,
+    ready: VecDeque<mpsc::Receiver<Ready>>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// [`PREP_BOUND`], or [`SCREEN_PREP_BOUND`] while salts go to the screen.
+    bound: usize,
 }
 
 impl Preparation {
@@ -937,13 +1094,14 @@ impl Preparation {
             next_worker: 0,
             ready: VecDeque::new(),
             workers: Vec::new(),
+            bound: PREP_BOUND,
         };
         let schedules = ScheduleCache::default();
         let topology = SharedTopology::default();
         for index in 0..PREP_WORKERS {
             // Each receiver has one owner. No worker holds a shared lock while
             // waiting for work. PREP_BOUND still bounds all outstanding replies.
-            let (tx, rx) = mpsc::sync_channel::<Work>(PREP_BOUND);
+            let (tx, rx) = mpsc::sync_channel::<Work>(SCREEN_PREP_BOUND);
             let schedules = schedules.clone();
             let topology = Arc::clone(&topology);
             let worker = std::thread::Builder::new()
@@ -967,38 +1125,50 @@ impl Preparation {
                         };
                         // Keep ownership of the job outside unwinding so a failed
                         // worker still returns it to the runner exactly once.
-                        let (job, origin, data) = match source {
+                        let ready = match source {
                             Source::Job(mut job) => {
                                 let data = unwind_safe(|| {
                                     preparer.prepare(&mut job, settings, work_screen)
                                 });
-                                (job, Origin::Stream, data)
+                                Ready::Unit(Prepared {
+                                    job,
+                                    origin: Origin::Stream,
+                                    data,
+                                })
                             }
                             Source::Salt(salt) => {
-                                let origin = Origin::Salt {
-                                    index: salt.index,
-                                    round: salt.round,
-                                    target: salt.target.clone(),
-                                    top10: salt.top10.clone(),
-                                    stop: Arc::clone(&salt.stop),
-                                    reply: salt.reply.clone(),
-                                };
-                                let (job, data) =
+                                let made =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         preparer.prepare_salt(&salt, settings, work_screen)
                                     }))
                                     .unwrap_or_else(|_| {
-                                        (
+                                        SaltPrep::Unit(
                                             modelless_job(&salt),
                                             Err(SampleError::Driver(
                                                 "job preparation panicked".into(),
                                             )),
                                         )
                                     });
-                                (job, origin, data)
+                                match made {
+                                    SaltPrep::Screen(plan, key) => {
+                                        Ready::Screen(Candidate { salt, plan, key })
+                                    }
+                                    SaltPrep::Unit(job, data) => Ready::Unit(Prepared {
+                                        job,
+                                        origin: Origin::Salt {
+                                            index: salt.index,
+                                            round: salt.round,
+                                            target: salt.target,
+                                            top10: salt.top10,
+                                            stop: salt.stop,
+                                            reply: salt.reply,
+                                        },
+                                        data,
+                                    }),
+                                }
                             }
                         };
-                        let _ = reply.send(Prepared { job, origin, data });
+                        let _ = reply.send(ready);
                     }
                 })
                 .map_err(|error| {
@@ -1022,7 +1192,7 @@ impl Preparation {
         eof: &mut bool,
         prefer_salt: &mut bool,
     ) {
-        while self.len() < PREP_BOUND {
+        while self.len() < self.bound {
             let source = if *prefer_salt {
                 salts.try_recv().ok().map(Source::Salt).or_else(|| {
                     if *eof {
@@ -1059,12 +1229,23 @@ impl Preparation {
         }
     }
 
+    /// A rerun copy of a salt goes straight to the long deep plan.
     pub(crate) fn submit(&mut self, source: Source, settings: CascadeSettings) {
-        let screen = match &source {
-            Source::Job(_) => false,
-            Source::Salt(_) => true,
+        let (screen, rerun) = match &source {
+            Source::Job(_) => (false, false),
+            Source::Salt(salt) => (true, salt.rerun > 0),
         };
+        let settings = CascadeSettings {
+            deep: settings.deep || rerun,
+            long: rerun,
+            ..settings
+        };
+        self.submit_with(source, settings, screen);
+    }
 
+    /// [`Self::submit`] with an explicit screen flag. Screen survivors come
+    /// back through here with [`CascadeSettings::deep`] set.
+    fn submit_with(&mut self, source: Source, settings: CascadeSettings, screen: bool) {
         let (reply, result) = mpsc::sync_channel(1);
         let work = Work {
             source,
@@ -1079,11 +1260,11 @@ impl Preparation {
         if let Err(mpsc::SendError(work)) = tx.send(work) {
             match work.source {
                 Source::Job(job) => {
-                    let _ = work.reply.send(Prepared {
+                    let _ = work.reply.send(Ready::Unit(Prepared {
                         job,
                         origin: Origin::Stream,
                         data: Err(SampleError::Driver("preparation workers stopped".into())),
-                    });
+                    }));
                 }
                 Source::Salt(salt) => {
                     refuse_salt(
@@ -1096,7 +1277,7 @@ impl Preparation {
         self.ready.push_back(result);
     }
 
-    pub(crate) fn next(&mut self) -> Option<Prepared> {
+    pub(crate) fn next(&mut self) -> Option<Ready> {
         self.ready.pop_front().and_then(|result| result.recv().ok())
     }
 }
@@ -1127,8 +1308,23 @@ fn reject_or_cancel(
     let _ = answer(out, origin, job, outcome, 0);
 }
 
+/// Answer a prepared item that will not run.
+fn reject_ready(
+    out: &Sender<StreamResult>,
+    ready: Ready,
+    error: &SampleError,
+    cancel: &CancelToken,
+) {
+    match ready {
+        Ready::Unit(prepared) => {
+            reject_or_cancel(out, prepared.origin, prepared.job, error, cancel)
+        }
+        Ready::Screen(candidate) => refuse_salt(candidate.salt, error),
+    }
+}
+
 fn reject_tail(
-    pending: Option<Prepared>,
+    pending: Option<Ready>,
     jobs: &mut Receiver<StreamJob>,
     salts: &mpsc::Receiver<Salt>,
     out: &Sender<StreamResult>,
@@ -1136,8 +1332,8 @@ fn reject_tail(
     cancel: &CancelToken,
 ) {
     jobs.close();
-    if let Some(prepared) = pending {
-        reject_or_cancel(out, prepared.origin, prepared.job, error, cancel);
+    if let Some(ready) = pending {
+        reject_ready(out, ready, error, cancel);
     }
     // close() revokes new reservations, but existing permits may still send.
     // None means both buffered jobs and outstanding permits have drained.
@@ -1164,7 +1360,7 @@ fn refuse_salt(salt: Salt, error: &SampleError) {
 
 fn reject_preparation(
     preparation: &mut Preparation,
-    pending: Option<Prepared>,
+    pending: Option<Ready>,
     jobs: &mut Receiver<StreamJob>,
     salts: &mpsc::Receiver<Salt>,
     out: &Sender<StreamResult>,
@@ -1172,8 +1368,8 @@ fn reject_preparation(
     cancel: &CancelToken,
 ) {
     jobs.close();
-    while let Some(prepared) = preparation.next() {
-        reject_or_cancel(out, prepared.origin, prepared.job, error, cancel);
+    while let Some(ready) = preparation.next() {
+        reject_ready(out, ready, error, cancel);
     }
     reject_tail(pending, jobs, salts, out, error, cancel);
 }
@@ -1233,6 +1429,305 @@ fn run_fallback(
     }
 }
 
+/// Answer or advance one screened salt. Survivors, and failures below the
+/// live target, go back to preparation for the deep plan.
+fn screen_verdict(
+    verdict: Verdict<Salt>,
+    controller: &mut Controller,
+    preparation: &mut Preparation,
+    config: CascadeSettings,
+) {
+    let last = CHAIN_GATES.screen.len() - 1;
+    let (salt, best, passed) = match verdict {
+        Verdict::Kept { stage } => {
+            controller.screened(stage, true);
+            return;
+        }
+        Verdict::Failed {
+            item,
+            stage,
+            best,
+            reads,
+        } => {
+            controller.screened(stage, false);
+            if let Some(reads) = reads {
+                controller.screen_finished(item.round, best);
+                let _ = item.reply.send(SaltOutcome::Survived {
+                    index: item.index,
+                    reads,
+                });
+                return;
+            }
+            (item, best, false)
+        }
+        Verdict::Passed { item, best } => {
+            controller.screened(last, true);
+            (item, best, true)
+        }
+    };
+    if salt.stop.load(Ordering::Acquire) {
+        let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
+        return;
+    }
+    let wanted = passed || salt.target.get().is_some_and(|target| best < target);
+    if wanted {
+        let settings = CascadeSettings {
+            deep: true,
+            ..config
+        };
+        preparation.submit_with(Source::Salt(salt), settings, true);
+        return;
+    }
+    controller.screen_finished(salt.round, best);
+    let _ = salt.reply.send(SaltOutcome::Screened {
+        index: salt.index,
+        energy_milli: best,
+    });
+}
+
+/// Harvest screen bank `bank` and act on its verdicts. Returns the GPU time
+/// of a command that held only the screen.
+fn harvest_screen(
+    screen: &mut Screener<Salt>,
+    bank: usize,
+    controller: &mut Controller,
+    preparation: &mut Preparation,
+    config: CascadeSettings,
+) -> Result<u64, SampleError> {
+    // A screen failure that enters its lease's running top-N is pushed with
+    // its screen reads, as a gate-screened slot unit is.
+    let enters =
+        |salt: &Salt, best: i64| !salt.stop.load(Ordering::Acquire) && salt.top10.offer(best);
+    let (verdicts, busy) = screen.harvest(bank, enters)?;
+    for verdict in verdicts {
+        screen_verdict(verdict, controller, preparation, config);
+    }
+    Ok(busy)
+}
+
+/// The outcome of [`admit_unit`].
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per slot unit; boxing adds an allocation per unit"
+)]
+enum UnitAdmission {
+    /// Admitted, answered, or rejected.
+    Done,
+    /// Waits until the slot pools are empty.
+    Held(Prepared),
+    Fault(SampleError),
+}
+
+/// Admit one prepared slot unit to `pools[turn]`, which must be idle and
+/// have room.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner's device services and per-turn state"
+)]
+fn admit_unit(
+    prepared: Prepared,
+    pools: &mut Option<[Pool; 2]>,
+    turn: usize,
+    controller: &mut Controller,
+    device: &MetalDevice,
+    out: &Sender<StreamResult>,
+    gov: &dyn GpuGovernor,
+    cancel: &CancelToken,
+    window: &mut Instant,
+) -> UnitAdmission {
+    let empty = pools
+        .as_ref()
+        .is_none_or(|ps| ps.iter().all(|p| p.slots.live() == 0));
+    let Prepared {
+        mut job,
+        origin,
+        data,
+    } = prepared;
+    if abandoned(cancel, &job, &origin) {
+        let _ = answer(out, origin, job, Answer::Cancelled, 0);
+        return UnitAdmission::Done;
+    }
+    let mut data = match data {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            if job.graph.num_nodes() == 0 {
+                let reads = (0..job.params.num_reads.max(1))
+                    .map(|_| SamplerResult {
+                        spins: Vec::new(),
+                        energy_milli: 0,
+                    })
+                    .collect();
+                let _ = answer(out, origin, job, Answer::Reads(reads), 0);
+                return UnitAdmission::Done;
+            }
+            // Run on the Metal-owning runner only after live slots drain,
+            // so a rare full-budget fallback cannot stall slot stepping.
+            if !empty {
+                return UnitAdmission::Held(Prepared {
+                    job,
+                    origin,
+                    data: Ok(None),
+                });
+            }
+            let started = Instant::now();
+            let result = run_fallback(device, job, origin, out, gov, cancel);
+            // Fallback time belongs to the governor, not cascade load.
+            *window += started.elapsed();
+            if let Err(error) = result {
+                return UnitAdmission::Fault(error);
+            }
+            return UnitAdmission::Done;
+        }
+        Err(error) => {
+            reject_or_cancel(out, origin, job, &error, cancel);
+            return UnitAdmission::Done;
+        }
+    };
+    let edges = Arc::clone(data.inputs.edges());
+    let schedule_len = data.schedule.betas.len();
+    if pools
+        .as_mut()
+        .is_none_or(|ps| !ps[turn].fits(&job, &edges, schedule_len))
+    {
+        if !empty {
+            return UnitAdmission::Held(Prepared {
+                job,
+                origin,
+                data: Ok(Some(data)),
+            });
+        }
+        let capacity = batch_size_for_reads(
+            Kernel::Msa,
+            job.params.num_reads.clamp(1, sampler::MAX_READS),
+        );
+        // Room for a long rerun copy beside short gated units, so a copy
+        // never waits for the pools to drain.
+        let stride = if job.params.num_sweeps == CHAIN_GATES.short_sweeps {
+            schedule_len.max(CHAIN_GATES.long_schedule_len())
+        } else {
+            schedule_len
+        };
+        // Both pools are empty, so changing storage cannot discard work.
+        let rebuilt = Pool::new(device, &job, capacity, stride)
+            .and_then(|a| Pool::new(device, &job, capacity, stride).map(|b| [a, b]));
+        match rebuilt {
+            Ok(rebuilt) => {
+                *pools = Some(rebuilt);
+            }
+            Err(error) => {
+                reject_or_cancel(out, origin, job, &error, cancel);
+                return UnitAdmission::Done;
+            }
+        }
+    }
+    let Some(pools) = pools.as_mut() else {
+        return UnitAdmission::Done;
+    };
+    let pool = &mut pools[turn];
+    // Plain jobs have no target and leave the yield check alone.
+    let initial_target_milli = if let Origin::Salt { target, round, .. } = &origin {
+        controller.enter_round(*round);
+        let target_milli = target.get();
+        controller.set_yield_target(target_milli);
+        target_milli
+    } else {
+        None
+    };
+    let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            reject_or_cancel(out, origin, job, &error, cancel);
+            return UnitAdmission::Done;
+        }
+    };
+    // Only salts carry a live target, so only they can finish early
+    // at an observe point. Stream jobs never get observe points.
+    let observe = matches!(origin, Origin::Salt { .. });
+    // The slot keeps the graph for the device energy audit; the live
+    // entry needs only the job's identity and parameters.
+    let graph = std::mem::replace(
+        &mut job.graph,
+        IsingGraph::new(Vec::new(), Vec::new(), Vec::new()),
+    );
+    let admitted =
+        pool.slots
+            .admit_prepared(data.inputs, graph, data.schedule, job.params.seed, observe);
+    match admitted {
+        Ok(slot) => {
+            pool.live[slot] = Some(Live {
+                job,
+                origin,
+                ticket,
+                accounted_us: 0,
+                admitted: Instant::now(),
+                last_target_milli: initial_target_milli,
+            })
+        }
+        Err(error) => {
+            controller.finish(&ticket, None, false);
+            reject_or_cancel(out, origin, job, &error, cancel);
+        }
+    }
+    UnitAdmission::Done
+}
+
+/// Screen intake over a report window.
+struct ScreenWindow {
+    started: Instant,
+    offered: u64,
+    dispatches: u64,
+    words: u64,
+}
+
+impl ScreenWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            offered: 0,
+            dispatches: 0,
+            words: 0,
+        }
+    }
+
+    /// Log and restart once [`REPORT_PERIOD`] has passed.
+    /// `progress` reads the slot pools' whole-slice deep sweeps and steps,
+    /// and the seconds and count of intervals between live commits, when
+    /// the window closes.
+    fn report(
+        &mut self,
+        queued: usize,
+        preparing: usize,
+        parked: usize,
+        deep_slice: usize,
+        progress: impl FnOnce() -> (u64, u64, f64, u64),
+    ) {
+        let secs = self.started.elapsed().as_secs_f64();
+        if secs < REPORT_PERIOD.as_secs_f64() {
+            return;
+        }
+        let (sweeps, steps, live_s, intervals) = progress();
+        // A deep slot in a long leg steps a whole slice in every command, so
+        // its pace is the mean slice over the mean interval between commits.
+        let per_slot = if steps == 0 || intervals == 0 || live_s <= 0.0 {
+            0.0
+        } else {
+            sweeps as f64 / steps as f64 * intervals as f64 / live_s
+        };
+        tracing::info!(
+            salts_per_s = (self.offered as f64 / secs).round() as u64,
+            dispatches_per_s = (self.dispatches as f64 / secs).round() as u64,
+            words_per_dispatch = self.words / self.dispatches.max(1),
+            queued,
+            preparing,
+            parked,
+            deep_slice,
+            deep_sweeps_per_slot_s = per_slot.round() as u64,
+            "screen report"
+        );
+        *self = Self::new();
+    }
+}
+
 /// Run on the sampler's blocking thread; no Metal object leaves this thread.
 #[expect(
     clippy::too_many_arguments,
@@ -1265,7 +1760,14 @@ pub(crate) fn run(
         }
     };
     let mut pools: Option<[Pool; 2]> = None;
-    let mut pending = None;
+    // The screen of the current lease topology, created by its first candidate.
+    let mut screener: Option<(Arc<ScreenPlan>, Screener<Salt>)> = None;
+    let mut pending: Option<Ready> = None;
+    // Slot units that found the pool full while the screen runs. They wait
+    // here so screen candidates behind them keep flowing.
+    let mut parked: VecDeque<Prepared> = VecDeque::new();
+    let mut screen_window = ScreenWindow::new();
+    let mut screen_deep_slice = SCREEN_DEEP_SLICES.0;
     let mut eof = false;
     let mut prefer_salt = true;
     let mut turn = 0;
@@ -1279,19 +1781,25 @@ pub(crate) fn run(
             break;
         }
         preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
+        // While the screen runs, one pool holds every slot unit and steps in
+        // every command, beside the screen dispatch; the two screen banks
+        // alternate. Pool 1 drains in the alternating mode first.
+        let pipeline =
+            screener.is_some() && pools.as_ref().is_none_or(|ps| ps[1].slots.live() == 0);
+        let slot_turn = if pipeline { 0 } else { turn };
         if let Some(pools) = &mut pools {
             let waited = Instant::now();
-            pools[turn].slots.wait();
+            pools[slot_turn].slots.wait();
             let waited = waited.elapsed();
             second.wait += waited;
             minute.wait += waited;
-            let capacity = pools[turn].slots.capacity();
-            match pools[turn].harvest(&mut controller, out, cancel, gov) {
+            let capacity = pools[slot_turn].slots.capacity();
+            match pools[slot_turn].harvest(&mut controller, out, cancel, gov) {
                 Ok(us) => {
                     busy_us = busy_us.saturating_add(us);
-                    if let Some(span) = pools[turn].slots.take_span() {
+                    if let Some(span) = pools[slot_turn].slots.take_span() {
                         tracing::trace!(
-                            pool = turn,
+                            pool = slot_turn,
                             committed = span.committed,
                             start = span.start,
                             end = span.end,
@@ -1300,6 +1808,9 @@ pub(crate) fn run(
                         );
                         second.record(span, capacity);
                         minute.record(span, capacity);
+                        let fit = (span.end - span.start) * 1e6 / DEEP_SWEEP_US;
+                        screen_deep_slice =
+                            (fit as usize).clamp(SCREEN_DEEP_SLICES.0, SCREEN_DEEP_SLICES.1);
                     }
                 }
                 Err(error) => {
@@ -1329,156 +1840,237 @@ pub(crate) fn run(
             }
         }
 
+        if pipeline {
+            // Pool 0 is idle: admit the units that waited, then commit the
+            // next command at once with the bank loaded last turn, so host
+            // work below overlaps it on the GPU.
+            while let Some(prepared) = parked.pop_front() {
+                let full = pools.as_ref().is_some_and(|ps| {
+                    ps[0].slots.live() >= scale_budget(ps[0].slots.capacity(), gov.budget_scale())
+                });
+                if full {
+                    parked.push_front(prepared);
+                    break;
+                }
+                match admit_unit(
+                    prepared,
+                    &mut pools,
+                    0,
+                    &mut controller,
+                    device,
+                    out,
+                    gov,
+                    cancel,
+                    &mut window,
+                ) {
+                    UnitAdmission::Done => {}
+                    UnitAdmission::Held(prepared) => {
+                        parked.push_front(prepared);
+                        break;
+                    }
+                    UnitAdmission::Fault(error) => {
+                        fault = Some(error);
+                        break 'run;
+                    }
+                }
+            }
+            if let Some((_, screen)) = &mut screener {
+                // A bank left in flight by the alternating mode.
+                if screen.in_flight(turn) {
+                    match harvest_screen(screen, turn, &mut controller, &mut preparation, config) {
+                        Ok(busy) => {
+                            gov.record_gpu_busy_us(busy);
+                            busy_us = busy_us.saturating_add(busy);
+                        }
+                        Err(error) => {
+                            fault = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            if gov.should_throttle() {
+                if let Some(pools) = &pools {
+                    pools[0].slots.wait();
+                }
+                crate::streaming::yield_gate(out, gov);
+            }
+            let words = screener
+                .as_ref()
+                .filter(|(_, screen)| !screen.in_flight(turn))
+                .map_or(0, |(_, screen)| screen.bank(turn).len());
+            let committed = match &mut pools {
+                Some(ps) => {
+                    let bank = screener
+                        .as_ref()
+                        .filter(|_| words > 0)
+                        .map(|(_, screen)| screen.bank(turn));
+                    match ps[0].slots.commit_step_with(
+                        config.stages[0].max(1),
+                        screen_deep_slice,
+                        bank,
+                    ) {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            fault = Some(error);
+                            break;
+                        }
+                    }
+                }
+                None => false,
+            };
+            if words > 0 {
+                screen_window.dispatches += 1;
+                screen_window.words += words as u64;
+                if let Some((_, screen)) = &mut screener {
+                    let command = pools
+                        .as_ref()
+                        .filter(|_| committed)
+                        .and_then(|ps| ps[0].slots.command());
+                    match command {
+                        Some(command) => screen.attach(turn, command),
+                        None => {
+                            if let Err(error) = screen.commit(turn, &device.queue) {
+                                fault = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The pipeline harvests the bank the last command carried.
+        let harvest_bank = if pipeline { turn ^ 1 } else { turn };
+        if let Some((_, screen)) = &mut screener {
+            match harvest_screen(
+                screen,
+                harvest_bank,
+                &mut controller,
+                &mut preparation,
+                config,
+            ) {
+                Ok(busy) => {
+                    gov.record_gpu_busy_us(busy);
+                    busy_us = busy_us.saturating_add(busy);
+                }
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            }
+        }
+
         loop {
             if out.is_closed() {
                 break 'run;
             }
-            let empty = pools
+            // The pipeline's pool is in flight now; its units wait in `parked`.
+            let full = pipeline
+                || pools.as_ref().is_some_and(|ps| {
+                    let pool = &ps[turn];
+                    pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
+                });
+            let screen_full = screener
                 .as_ref()
-                .is_none_or(|ps| ps.iter().all(|p| p.slots.live() == 0));
+                .is_some_and(|(_, screen)| screen.queued() >= SCREEN_QUEUE);
+            if pending.is_none() && !full {
+                pending = parked.pop_front().map(Ready::Unit);
+            }
             if pending.is_none() {
                 // Refill as admissions consume replies. The preparation bound
                 // must not cap slot occupancy for small read counts or a larger
                 // configured threadgroup budget.
                 preparation.fill(&mut jobs, salts, config, &mut eof, &mut prefer_salt);
-                let full = pools.as_ref().is_some_and(|ps| {
-                    let pool = &ps[turn];
-                    pool.slots.live() >= scale_budget(pool.slots.capacity(), gov.budget_scale())
-                });
-                if full {
+                if full && (screen_full || screener.is_none()) {
                     break;
                 }
                 pending = preparation.next();
             }
-            let Some(prepared) = pending.take() else {
-                break;
-            };
-            let Prepared {
-                mut job,
-                origin,
-                data,
-            } = prepared;
-            if abandoned(cancel, &job, &origin) {
-                let _ = answer(out, origin, job, Answer::Cancelled, 0);
-                continue;
-            }
-            let mut data = match data {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    if job.graph.num_nodes() == 0 {
-                        let reads = (0..job.params.num_reads.max(1))
-                            .map(|_| SamplerResult {
-                                spins: Vec::new(),
-                                energy_milli: 0,
-                            })
-                            .collect();
-                        let _ = answer(out, origin, job, Answer::Reads(reads), 0);
-                        continue;
+            let prepared = match pending.take() {
+                None => break,
+                Some(Ready::Screen(candidate)) => {
+                    let stale = screener
+                        .as_ref()
+                        .is_none_or(|(plan, _)| !plan.same(&candidate.plan));
+                    if stale {
+                        if screener
+                            .as_ref()
+                            .is_some_and(|(_, screen)| !screen.is_empty())
+                        {
+                            // A new topology waits for the old screen to empty.
+                            pending = Some(Ready::Screen(candidate));
+                            break;
+                        }
+                        let plan = Arc::clone(&candidate.plan);
+                        let schedules: Vec<&[f32]> =
+                            plan.schedules.iter().map(Vec::as_slice).collect();
+                        let gates: Vec<i64> = CHAIN_GATES.screen.iter().map(|&(_, g)| g).collect();
+                        match Screener::new(
+                            device,
+                            &plan.graph,
+                            &schedules,
+                            &gates,
+                            Some(&plan.draw),
+                        ) {
+                            Ok(screen) => screener = Some((plan, screen)),
+                            Err(error) => {
+                                screener = None;
+                                refuse_salt(candidate.salt, &error);
+                                continue;
+                            }
+                        }
                     }
-                    // Run on the Metal-owning runner only after live slots drain,
-                    // so a rare full-budget fallback cannot stall slot stepping.
-                    if !empty {
-                        pending = Some(Prepared {
-                            job,
-                            origin,
-                            data: Ok(None),
-                        });
+                    let Some((_, screen)) = &mut screener else {
+                        continue;
+                    };
+                    if screen.queued() >= SCREEN_QUEUE {
+                        pending = Some(Ready::Screen(candidate));
                         break;
                     }
-                    let started = Instant::now();
-                    let result = run_fallback(device, job, origin, out, gov, cancel);
-                    // Fallback time belongs to the governor, not cascade load.
-                    window += started.elapsed();
-                    if let Err(error) = result {
-                        fault = Some(error);
-                        break 'run;
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    reject_or_cancel(out, origin, job, &error, cancel);
-                    continue;
-                }
-            };
-            let edges = Arc::clone(data.inputs.edges());
-            let schedule_len = data.schedule.betas.len();
-            if pools
-                .as_mut()
-                .is_none_or(|ps| !ps[turn].fits(&job, &edges, schedule_len))
-            {
-                if !empty {
-                    pending = Some(Prepared {
-                        job,
-                        origin,
-                        data: Ok(Some(data)),
-                    });
-                    break;
-                }
-                let capacity = batch_size_for_reads(
-                    Kernel::Msa,
-                    job.params.num_reads.clamp(1, sampler::MAX_READS),
-                );
-                // Both pools are empty, so changing storage cannot discard work.
-                let rebuilt = Pool::new(device, &job, capacity, schedule_len)
-                    .and_then(|a| Pool::new(device, &job, capacity, schedule_len).map(|b| [a, b]));
-                match rebuilt {
-                    Ok(rebuilt) => {
-                        pools = Some(rebuilt);
-                    }
-                    Err(error) => {
-                        reject_or_cancel(out, origin, job, &error, cancel);
+                    if candidate.salt.stop.load(Ordering::Acquire) || !screen.fits(&candidate.key) {
+                        refuse_salt(
+                            candidate.salt,
+                            &SampleError::Driver("screen candidate does not fit".into()),
+                        );
                         continue;
                     }
-                }
-            }
-            let Some(pools) = &mut pools else { continue };
-            let pool = &mut pools[turn];
-            // Plain jobs have no target and leave the yield check alone.
-            let initial_target_milli = if let Origin::Salt { target, round, .. } = &origin {
-                controller.enter_round(*round);
-                let target_milli = target.get();
-                controller.set_yield_target(target_milli);
-                target_milli
-            } else {
-                None
-            };
-            let ticket = match controller.admit_prepared(&job, &mut data.schedule, &edges) {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    reject_or_cancel(out, origin, job, &error, cancel);
+                    preparation.bound = SCREEN_PREP_BOUND;
+                    screen_window.offered += 1;
+                    screen.offer(candidate.salt, candidate.key);
                     continue;
                 }
-            };
-            // Only salts carry a live target, so only they can finish early
-            // at an observe point. Stream jobs never get observe points.
-            let observe = matches!(origin, Origin::Salt { .. });
-            // The slot keeps the graph for the device energy audit; the live
-            // entry needs only the job's identity and parameters.
-            let graph = std::mem::replace(
-                &mut job.graph,
-                IsingGraph::new(Vec::new(), Vec::new(), Vec::new()),
-            );
-            let admitted = pool.slots.admit_prepared(
-                data.inputs,
-                graph,
-                data.schedule,
-                job.params.seed,
-                observe,
-            );
-            match admitted {
-                Ok(slot) => {
-                    pool.live[slot] = Some(Live {
-                        job,
-                        origin,
-                        ticket,
-                        accounted_us: 0,
-                        admitted: Instant::now(),
-                        last_target_milli: initial_target_milli,
-                    })
+                Some(Ready::Unit(prepared)) => {
+                    if full && screener.is_some() {
+                        parked.push_back(prepared);
+                        continue;
+                    }
+                    if full {
+                        pending = Some(Ready::Unit(prepared));
+                        break;
+                    }
+                    prepared
                 }
-                Err(error) => {
-                    controller.finish(&ticket, None, false);
-                    reject_or_cancel(out, origin, job, &error, cancel);
+            };
+            match admit_unit(
+                prepared,
+                &mut pools,
+                turn,
+                &mut controller,
+                device,
+                out,
+                gov,
+                cancel,
+                &mut window,
+            ) {
+                UnitAdmission::Done => {}
+                UnitAdmission::Held(prepared) => {
+                    pending = Some(Ready::Unit(prepared));
+                    break;
+                }
+                UnitAdmission::Fault(error) => {
+                    fault = Some(error);
+                    break 'run;
                 }
             }
         }
@@ -1486,10 +2078,51 @@ pub(crate) fn run(
         let empty = pools
             .as_ref()
             .is_none_or(|ps| ps.iter().all(|p| p.slots.live() == 0));
-        if empty && eof && pending.is_none() && preparation.len() == 0 {
+        let screen_idle = screener
+            .as_ref()
+            .is_none_or(|(_, screen)| screen.is_empty());
+        if empty
+            && screen_idle
+            && eof
+            && pending.is_none()
+            && parked.is_empty()
+            && preparation.len() == 0
+        {
             break;
         }
-        if let Some(pools) = &mut pools {
+        // Flush partial screen words when no more salts are on the way.
+        let flush = preparation.len() == 0 && pending.is_none();
+        let load_bank = if pipeline { turn ^ 1 } else { turn };
+        let words = match &mut screener {
+            Some((_, screen)) => match screen.load(load_bank, flush) {
+                Ok(words) => words,
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            },
+            None => 0,
+        };
+        if words > 0 && !pipeline {
+            screen_window.dispatches += 1;
+            screen_window.words += words as u64;
+        }
+        if let Some((_, screen)) = &screener {
+            screen_window.report(
+                screen.queued(),
+                preparation.len(),
+                parked.len(),
+                screen_deep_slice,
+                || {
+                    pools.as_mut().map_or((0, 0, 0.0, 0), |ps| {
+                        let (a, b) = (ps[0].slots.take_progress(), ps[1].slots.take_progress());
+                        (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+                    })
+                },
+            );
+        }
+        let mut shared = false;
+        if let Some(pools) = pools.as_mut().filter(|_| !pipeline) {
             if gov.should_throttle() {
                 // Drain submitted work before the pause so it frees GPU time.
                 for pool in pools.iter() {
@@ -1500,16 +2133,43 @@ pub(crate) fn run(
             if out.is_closed() {
                 break;
             }
-            if let Err(error) = pools[turn]
+            let bank = screener
+                .as_ref()
+                .filter(|_| words > 0)
+                .map(|(_, screen)| screen.bank(turn));
+            let deep_slice = if screener.is_some() {
+                screen_deep_slice
+            } else {
+                DEEP_SLICE
+            };
+            match pools[turn]
                 .slots
-                .commit_step(config.stages[0].max(1), DEEP_SLICE)
+                .commit_step_with(config.stages[0].max(1), deep_slice, bank)
             {
-                fault = Some(error);
-                break;
+                Ok(committed) => shared = committed && words > 0,
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            }
+            if shared {
+                if let (Some((_, screen)), Some(command)) =
+                    (&mut screener, pools[turn].slots.command())
+                {
+                    screen.attach(turn, command);
+                }
+            }
+        }
+        if words > 0 && !shared && !pipeline {
+            if let Some((_, screen)) = &mut screener {
+                if let Err(error) = screen.commit(turn, &device.queue) {
+                    fault = Some(error);
+                    break;
+                }
             }
         }
         turn ^= 1;
-        if empty && pending.is_none() {
+        if empty && screen_idle && pending.is_none() {
             // blocking_recv cannot wake when only the output channel closes.
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1535,6 +2195,16 @@ pub(crate) fn run(
             }
         }
     }
+    if let Some((_, screen)) = &mut screener {
+        for salt in screen.drain() {
+            match &fault {
+                Some(error) => refuse_salt(salt, error),
+                None => {
+                    let _ = salt.reply.send(SaltOutcome::Dropped { index: salt.index });
+                }
+            }
+        }
+    }
     if let Some(error) = &fault {
         tracing::error!(%error, "resident stream failed");
     }
@@ -1543,6 +2213,9 @@ pub(crate) fn run(
     // one terminal send attempt, and workers never send stream results.
     let error =
         fault.unwrap_or_else(|| SampleError::Driver("resident result receiver closed".into()));
+    for prepared in parked {
+        reject_or_cancel(out, prepared.origin, prepared.job, &error, cancel);
+    }
     reject_preparation(
         &mut preparation,
         pending,
@@ -1601,6 +2274,7 @@ mod tests {
                     nonce: [0; 32],
                     index,
                     round: 0,
+                    rerun: 0,
                     params: SampleParams {
                         num_reads: 4,
                         num_sweeps: 16,
@@ -1699,6 +2373,7 @@ mod tests {
                 nonce: [0; 32],
                 index: 0,
                 round: 0,
+                rerun: 0,
                 params: SampleParams {
                     num_reads: 4,
                     num_sweeps: 16,
@@ -2234,6 +2909,7 @@ mod tests {
             nonce: [0; 32],
             index,
             round: 0,
+            rerun: 0,
             params: SampleParams {
                 num_reads: 4,
                 num_sweeps: 16,
@@ -2256,6 +2932,21 @@ mod tests {
             drawn_job(&first, &[0, 0], &[-1000]).params.seed,
             drawn_job(&second, &[0, 0], &[-1000]).params.seed
         );
+    }
+
+    #[test]
+    fn each_rerun_copy_of_a_salt_gets_its_own_seed() {
+        let (reply, _outcomes) = mpsc::channel();
+        let seeds: Vec<u64> = (0..=3)
+            .map(|copy| {
+                let mut copy_salt = salt(3, &reply);
+                copy_salt.rerun = copy;
+                drawn_job(&copy_salt, &[0, 0], &[-1000]).params.seed
+            })
+            .collect();
+        for (i, a) in seeds.iter().enumerate() {
+            assert!(seeds[i + 1..].iter().all(|b| a != b), "{seeds:?}");
+        }
     }
 
     #[test]
@@ -2293,11 +2984,11 @@ mod tests {
             jobs.close();
             let (_salts_tx, salts) = mpsc::channel();
             reject_tail(
-                Some(Prepared {
+                Some(Ready::Unit(Prepared {
                     job: job(0, 32),
                     origin: Origin::Stream,
                     data: Ok(None),
-                }),
+                })),
                 &mut jobs,
                 &salts,
                 &out,
@@ -2352,18 +3043,40 @@ mod tests {
             .prepare(&mut chain, CascadeSettings::default(), true)
             .unwrap()
             .unwrap();
-        assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
+        assert_eq!(chain.params.num_sweeps, CHAIN_GATES.short_sweeps);
         assert_eq!(
             data.schedule.checkpoints.last(),
             Some(
                 &(CHAIN_GATES
                     .stages
                     .iter()
-                    .filter(|&&s| s > crate::cascade::REHEAT_THROUGH)
+                    .filter(|&&s| {
+                        s > crate::cascade::REHEAT_THROUGH && s < CHAIN_GATES.short_sweeps
+                    })
                     .sum::<usize>()
                     + crate::cascade::REHEAT_THROUGH
-                    + CHAIN_GATES.full_sweeps)
+                    + CHAIN_GATES.short_sweeps)
             )
+        );
+        let mut long = StreamJob {
+            job_id: chain.job_id.clone(),
+            graph: chain.graph.clone(),
+            params: chain.params.clone(),
+            watermark: None,
+        };
+        long.params.num_sweeps = 14_336;
+        let long_settings = CascadeSettings {
+            long: true,
+            ..CascadeSettings::default()
+        };
+        let data = preparer
+            .prepare(&mut long, long_settings, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(long.params.num_sweeps, CHAIN_GATES.full_sweeps);
+        assert_eq!(
+            data.schedule.checkpoints.last(),
+            Some(&CHAIN_GATES.long_schedule_len())
         );
         let open = CascadeSettings {
             open_gates: true,
@@ -2446,7 +3159,7 @@ mod tests {
                 );
                 submitted += 1;
             }
-            let Some(prepared) = preparation.next() else {
+            let Some(prepared) = preparation.next().map(Ready::unit) else {
                 break;
             };
             assert_eq!(prepared.job.job_id, completed.to_le_bytes());
@@ -2492,6 +3205,7 @@ mod tests {
             nonce,
             index,
             round: 0,
+            rerun: 0,
             params: SampleParams {
                 num_reads: 64,
                 num_sweeps: CHAIN_GATES.full_sweeps,
@@ -2504,19 +3218,415 @@ mod tests {
         }
     }
 
+    /// Feed `total` Aglais salts sharing `top10` and `stop`, run the resident
+    /// runner on them, and return it on a thread with the outcome receiver.
+    fn run_aglais_salts(
+        total: u64,
+        top10: &LeaseTopK,
+        stop: &Arc<AtomicBool>,
+    ) -> (std::thread::JoinHandle<()>, mpsc::Receiver<SaltOutcome>) {
+        run_aglais_salts_at(total, top10, stop, None)
+    }
+
+    /// [`run_aglais_salts`] with a live target for every salt.
+    fn run_aglais_salts_at(
+        total: u64,
+        top10: &LeaseTopK,
+        stop: &Arc<AtomicBool>,
+        target_milli: Option<i64>,
+    ) -> (std::thread::JoinHandle<()>, mpsc::Receiver<SaltOutcome>) {
+        let topology = aglais_view();
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(total as usize);
+        for index in 0..total {
+            let mut salt = aglais_salt(&topology, index, &reply);
+            salt.top10 = top10.clone();
+            salt.stop = Arc::clone(stop);
+            salt.target = LiveTarget::new(target_milli);
+            salts_tx.send(salt).unwrap();
+        }
+        let runner = std::thread::spawn(move || {
+            let device = MetalDevice::open(0).unwrap();
+            let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+            let (tx, jobs) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            let (out, _results) = tokio::sync::mpsc::channel(1);
+            run(
+                &device,
+                &Mutex::new(CascadeSettings::default()),
+                &Mutex::new(None),
+                jobs,
+                &salts,
+                &out,
+                &gov,
+                &CancelToken::default(),
+            );
+        });
+        (runner, outcomes)
+    }
+
+    /// A lease top-N that no screened salt can enter.
+    fn full_top10() -> LeaseTopK {
+        let top10 = LeaseTopK::new();
+        for _ in 0..LEASE_TOP_N {
+            top10.offer(i64::MIN);
+        }
+        top10
+    }
+
+    /// Every chain salt goes through the nonce-parallel screen and gets
+    /// exactly one answer; a rejected salt answers with its screen best.
+    #[test]
+    fn screen_answers_every_salt_once() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let total = 1_000;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (runner, outcomes) = run_aglais_salts(total, &full_top10(), &stop);
+        let mut seen = vec![false; total as usize];
+        let (mut screened, mut second_stage) = (0, 0);
+        for _ in 0..total {
+            let outcome = outcomes
+                .recv_timeout(Duration::from_secs(600))
+                .expect("every salt answers");
+            let index = match outcome {
+                SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                } => {
+                    // 16 sweeps reach about -13,500; 128 about -14,060.
+                    assert!(
+                        (-14_600_000..-13_000_000).contains(&energy_milli),
+                        "salt {index}: {energy_milli}"
+                    );
+                    screened += 1;
+                    // Only the 128-sweep stage reaches this deep.
+                    second_stage += usize::from(energy_milli <= -13_800_000);
+                    index
+                }
+                SaltOutcome::Survived { index, reads } => {
+                    assert_eq!(reads.len(), 64);
+                    index
+                }
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("salt {index}: {error}"),
+            };
+            assert!(
+                !std::mem::replace(&mut seen[index as usize], true),
+                "salt {index} twice"
+            );
+        }
+        assert!(screened >= total - 2, "{screened} of {total} screened");
+        // About 5 percent of salts pass the 16-sweep stage.
+        assert!(
+            (20..=100).contains(&second_stage),
+            "{second_stage} second-stage screens"
+        );
+        runner.join().unwrap();
+        assert!(outcomes.try_recv().is_err());
+    }
+
+    /// With an empty lease top-N, screen failures that enter it are pushed
+    /// with their four screen reads and never run the deep plan; the rest
+    /// are screened.
+    #[test]
+    fn screen_pushes_top_n_entrants_with_their_screen_reads() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let total = 1_000;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (runner, outcomes) = run_aglais_salts(total, &LeaseTopK::new(), &stop);
+        let mut entrants = 0;
+        for _ in 0..total {
+            match outcomes
+                .recv_timeout(Duration::from_secs(600))
+                .expect("every salt answers")
+            {
+                SaltOutcome::Survived { reads, .. } if reads.len() == screen::READS => {
+                    for read in &reads {
+                        assert_eq!(read.spins.len(), 4577);
+                    }
+                    entrants += 1;
+                }
+                SaltOutcome::Survived { reads, .. } => assert_eq!(reads.len(), 64),
+                SaltOutcome::Screened { .. } => {}
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("salt {index}: {error}"),
+            }
+        }
+        runner.join().unwrap();
+        // About k + k ln(n / k) = 56 running top-10 entrants in 1,000 salts.
+        assert!(
+            (LEASE_TOP_N..=150).contains(&entrants),
+            "{entrants} entrants"
+        );
+    }
+
+    /// Screen failures below the live target run the deep plan in the one
+    /// pool beside the screen and finish there on a target hit with all
+    /// their reads; every salt answers once.
+    #[test]
+    fn screen_survivors_run_deep_beside_the_screen() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let total = 1_000;
+        let stop = Arc::new(AtomicBool::new(false));
+        // Above every 128-sweep best, below every 16-sweep one: each salt
+        // that reaches the second stage goes deep and hits at 512 sweeps.
+        let (runner, outcomes) =
+            run_aglais_salts_at(total, &full_top10(), &stop, Some(-13_900_000));
+        let (mut deep, mut screened) = (0, 0);
+        for _ in 0..total {
+            match outcomes
+                .recv_timeout(Duration::from_secs(600))
+                .expect("every salt answers")
+            {
+                SaltOutcome::Survived { reads, .. } => {
+                    assert_eq!(reads.len(), 64);
+                    assert!(reads.iter().any(|r| r.energy_milli < -13_900_000));
+                    deep += 1;
+                }
+                SaltOutcome::Screened { .. } => screened += 1,
+                SaltOutcome::Dropped { index } => panic!("salt {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("salt {index}: {error}"),
+            }
+        }
+        runner.join().unwrap();
+        assert!(
+            (20..=100).contains(&deep),
+            "{deep} deep, {screened} screened"
+        );
+    }
+
+    /// End-to-end screen rate on Aglais salts: preparation, screen and
+    /// answers, with no coordinator. Reports salts per second between 10 and
+    /// 90 percent of `QUIP_BENCH_SALTS` answers, then stops the lease so
+    /// deep survivors drop.
+    ///
+    /// ```text
+    /// cargo test --release --lib screen_runner_rate -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Metal device; a benchmark"]
+    #[expect(clippy::print_stderr, reason = "the benchmark reports on stderr")]
+    fn screen_runner_rate() {
+        let total: u64 = std::env::var("QUIP_BENCH_SALTS").map_or(200_000, |v| v.parse().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (runner, outcomes) = run_aglais_salts(total, &full_top10(), &stop);
+        let (mut answered, mut survived) = (0u64, 0u64);
+        let (mut first, mut last) = (None, None);
+        let started = Instant::now();
+        while answered < total {
+            let Ok(outcome) = outcomes.recv_timeout(Duration::from_secs(600)) else {
+                break;
+            };
+            answered += 1;
+            if answered.is_multiple_of(total / 20) {
+                eprintln!(
+                    "{answered} answered at {:.1} s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            if matches!(outcome, SaltOutcome::Survived { .. }) {
+                survived += 1;
+            }
+            if answered == total / 10 {
+                first = Some(Instant::now());
+            }
+            if answered == total * 9 / 10 {
+                last = Some(Instant::now());
+                stop.store(true, Ordering::Release);
+            }
+        }
+        while outcomes.recv_timeout(Duration::from_secs(60)).is_ok() {}
+        runner.join().unwrap();
+        let (first, last) = (first.unwrap(), last.unwrap());
+        eprintln!(
+            "{total} Aglais salts: {:.0} salts/s, {survived} survived before the stop",
+            (total * 8 / 10) as f64 / (last - first).as_secs_f64()
+        );
+    }
+
+    /// Replay won qblocks through the live plan: each winning nonce, with the
+    /// target its block cleared, runs the screen and the deep cascade beside
+    /// a full top 10, as a lease salt does. Writes one CSV row per block to
+    /// `QUIP_REPLAY_OUT`. `QUIP_REPLAY` is `scripts/testnet/fetch_qblocks.py`
+    /// output and `QUIP_REPLAY_PROBLEMS` its `regen` directory, which pins
+    /// the nonce byte order against the chain's draw.
+    ///
+    /// ```text
+    /// QUIP_REPLAY=qblocks.json QUIP_REPLAY_PROBLEMS=problems QUIP_REPLAY_OUT=replay.csv \
+    ///   cargo test --release --lib won_qblocks_replay -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Metal device and fetched qblocks"]
+    #[expect(clippy::print_stderr, reason = "the replay reports on stderr")]
+    fn won_qblocks_replay() {
+        #[derive(serde::Deserialize)]
+        struct Difficulty {
+            max_energy_milli: i64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Block {
+            qblock_id: u64,
+            nonce_seed: String,
+            energy_milli: i64,
+            difficulty: Difficulty,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fetched {
+            blocks: Vec<Block>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Problem {
+            edges: Vec<(usize, usize)>,
+            j: Vec<f64>,
+        }
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        let fetched: Fetched =
+            serde_json::from_str(&std::fs::read_to_string(var("QUIP_REPLAY")).unwrap()).unwrap();
+        let blocks = fetched.blocks;
+        let nonce = |block: &Block| -> [u8; 32] {
+            std::array::from_fn(|i| {
+                u8::from_str_radix(&block.nonce_seed[2 * i..2 * i + 2], 16).unwrap()
+            })
+        };
+        let topology = aglais_view();
+        let first = &blocks[0];
+        let problem: Problem = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/problem-{}.json",
+                var("QUIP_REPLAY_PROBLEMS"),
+                first.qblock_id
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let (_, j) = crate::draw::draw_units(
+            nonce(first),
+            topology.num_nodes,
+            topology.edges.len(),
+            &[0],
+            &[-1, 1],
+        )
+        .unwrap();
+        let chain: std::collections::HashMap<(usize, usize), f64> =
+            problem.edges.into_iter().zip(problem.j).collect();
+        for (edge, &value) in topology.edges.iter().zip(&j) {
+            assert_eq!(chain[edge], f64::from(value), "edge {edge:?}");
+        }
+        // Stage F runs in the lease feeder, before these salts would reach
+        // the runner; score each winner as it would.
+        let cycles = crate::frustration::Cycles::new(topology.num_nodes, &topology.edges);
+        let prefiltered: Vec<bool> = blocks
+            .iter()
+            .map(|block| {
+                let (_, j) = crate::draw::draw_units(
+                    nonce(block),
+                    topology.num_nodes,
+                    topology.edges.len(),
+                    &[0],
+                    &[-1, 1],
+                )
+                .unwrap();
+                crate::frustration::passes(&cycles, &j)
+            })
+            .collect();
+
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(blocks.len());
+        let top10 = full_top10();
+        for (index, block) in blocks.iter().enumerate() {
+            let mut salt = aglais_salt(&topology, index as u64, &reply);
+            salt.nonce = nonce(block);
+            salt.top10 = top10.clone();
+            salt.target = LiveTarget::new(Some(block.difficulty.max_energy_milli));
+            salts_tx.send(salt).unwrap();
+        }
+        drop((reply, salts_tx));
+        let runner = std::thread::spawn(move || {
+            let device = MetalDevice::open(0).unwrap();
+            let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+            let (tx, jobs) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            let (out, _results) = tokio::sync::mpsc::channel(1);
+            run(
+                &device,
+                &Mutex::new(CascadeSettings::default()),
+                &Mutex::new(None),
+                jobs,
+                &salts,
+                &out,
+                &gov,
+                &CancelToken::default(),
+            );
+        });
+        let started = Instant::now();
+        let mut rows = vec![String::new(); blocks.len()];
+        for _ in 0..blocks.len() {
+            let outcome = outcomes
+                .recv_timeout(Duration::from_secs(3600))
+                .expect("every block answers");
+            let (index, kind, energy) = match outcome {
+                SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                } => (index, "cut", energy_milli),
+                SaltOutcome::Survived { index, reads } => (
+                    index,
+                    "finished",
+                    reads.iter().map(|r| r.energy_milli).min().unwrap(),
+                ),
+                SaltOutcome::Dropped { index } => panic!("block {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("block {index}: {error}"),
+            };
+            let block = &blocks[index as usize];
+            let target = block.difficulty.max_energy_milli;
+            let kept = prefiltered[index as usize];
+            let row = format!(
+                "{},{target},{},{kept},{kind},{energy},{},{:.0}",
+                block.qblock_id,
+                block.energy_milli,
+                kept && energy <= target,
+                started.elapsed().as_secs_f64()
+            );
+            eprintln!("{row}");
+            rows[index as usize] = row;
+        }
+        runner.join().unwrap();
+        let wins = rows
+            .iter()
+            .filter(|row| row.split(',').nth(6) == Some("true"))
+            .count();
+        eprintln!("{wins} of {} blocks reach their target", blocks.len());
+        std::fs::write(
+            var("QUIP_REPLAY_OUT"),
+            format!(
+                "qblock_id,target_milli,winner_milli,prefilter,outcome,energy_milli,wins,secs\n{}\n",
+                rows.join("\n")
+            ),
+        )
+        .unwrap();
+    }
+
     /// Prepare `salt` the way a worker does.
     fn prepare_drawn(
         preparer: &mut Preparer,
         salt: &Salt,
         settings: CascadeSettings,
     ) -> (StreamJob, Option<PreparedData>) {
-        let (job, data) = preparer.prepare_salt(salt, settings, true);
+        let SaltPrep::Unit(job, data) = preparer.prepare_salt(salt, settings, true) else {
+            panic!("expected a slot unit, got a screen candidate");
+        };
         (job, data.unwrap())
     }
 
     /// The device-unit fast path gives the generic path's coefficients,
-    /// schedule, parameters and graph, on unit, non-unit and inexact
-    /// topologies.
+    /// schedule, parameters and graph on unit topologies. Non-unit and
+    /// inexact topologies leave the slots on both paths.
     #[test]
     fn salt_fast_path_matches_generic_preparation() {
         let (reply, _outcomes) = mpsc::channel();
@@ -2532,7 +3642,8 @@ mod tests {
         for (view, fast) in [
             (aglais_view(), true),
             (ring(vec![-1000, 0, 1000], vec![-1000, 1000]), true),
-            (ring(vec![-2000, 3000], vec![-2000, 1000, 5000]), true),
+            // Whole units, but not unit: the weighted batch path runs them.
+            (ring(vec![-2000, 3000], vec![-2000, 1000, 5000]), false),
             (ring(vec![0], vec![-1500, 1000]), false),
         ] {
             let mut fast_worker = Preparer::default();
@@ -2548,7 +3659,7 @@ mod tests {
                 if !fast {
                     assert!(
                         expected.is_none() && data.is_none(),
-                        "an inexact draw falls back"
+                        "a non-unit or inexact draw falls back"
                     );
                     continue;
                 }
@@ -2590,7 +3701,6 @@ mod tests {
             settings,
         );
         let known = preparer.salt.as_ref().unwrap();
-        assert!(known.unit);
         let (allowed_h, allowed_j) = known.units.clone().unwrap();
         let cached = Arc::clone(&known.prepared);
 
@@ -2695,10 +3805,12 @@ mod tests {
                 );
                 submitted += 1;
             }
-            let Some(prepared) = preparation.next() else {
+            let Some(ready) = preparation.next() else {
                 break;
             };
-            std::hint::black_box(prepared.data.unwrap());
+            if let Ready::Unit(prepared) = ready {
+                std::hint::black_box(prepared.data.unwrap());
+            }
             completed += 1;
         }
         assert_eq!(completed, total);
@@ -2774,7 +3886,7 @@ mod tests {
         assert_eq!(preparation.len(), PREP_BOUND);
         assert_eq!(jobs.len(), count - PREP_BOUND);
         for id in 0..count {
-            let prepared = preparation.next().unwrap();
+            let prepared = preparation.next().unwrap().unit();
             assert_eq!(prepared.job.job_id, id.to_le_bytes());
             preparation.fill(
                 &mut jobs,
@@ -2844,7 +3956,7 @@ mod tests {
         }
         assert_eq!(preparation.len(), PREP_BOUND);
         for id in 0..PREP_BOUND {
-            let prepared = preparation.next().unwrap();
+            let prepared = preparation.next().unwrap().unit();
             assert_eq!(prepared.job.job_id, id.to_le_bytes());
             if id % 3 == 0 {
                 assert!(matches!(prepared.data, Err(SampleError::TooLarge(_))));
@@ -2888,11 +4000,11 @@ mod tests {
         tx.try_send(job(PREP_BOUND + 1, 64)).unwrap();
         tx.try_send(job(PREP_BOUND + 2, 64)).unwrap();
         let error = SampleError::Driver("injected device fault".into());
-        let pending = Prepared {
+        let pending = Ready::Unit(Prepared {
             job: job(PREP_BOUND, 64),
             origin: Origin::Stream,
             data: Err(SampleError::TooLarge("invalid pending job".into())),
-        };
+        });
         let (_salts_tx, salts) = mpsc::channel();
         reject_preparation(
             &mut preparation,
@@ -2925,11 +4037,11 @@ mod tests {
         let mut preparation = Preparation::new().unwrap();
         preparation.submit(Source::Job(non_exact(0, 1)), CascadeSettings::default());
         preparation.submit(Source::Job(non_exact(1, 2)), CascadeSettings::default());
-        let pending = Prepared {
+        let pending = Ready::Unit(Prepared {
             job: non_exact(2, 1),
             origin: Origin::Stream,
             data: Ok(None),
-        };
+        });
         let (tx, mut jobs) = tokio::sync::mpsc::channel(2);
         tx.try_send(non_exact(3, 1)).unwrap();
         tx.try_send(non_exact(4, 2)).unwrap();
@@ -2967,11 +4079,11 @@ mod tests {
         let error = SampleError::Driver("injected fault".into());
         let (_salts_tx, salts) = mpsc::channel();
         reject_tail(
-            Some(Prepared {
+            Some(Ready::Unit(Prepared {
                 job: job(0, 8),
                 origin: Origin::Stream,
                 data: Ok(None),
-            }),
+            })),
             &mut rx,
             &salts,
             &out,

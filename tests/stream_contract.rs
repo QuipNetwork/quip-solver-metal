@@ -14,6 +14,7 @@ use quip_solver_core::{
 };
 use quip_solver_metal::iokit_gov::UtilGovernor;
 use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::sampler::sample_ising;
 use quip_solver_metal::{GibbsTag, Kernel, MetalSampler, MsaTag, SaTag, TaggedSampler};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -211,6 +212,64 @@ fn every_read_is_valid_and_scored_exactly() {
             );
         }
     });
+}
+
+#[test]
+fn alternating_int8_and_wide_jobs_keep_exact_scores_and_wide_samples() {
+    let Some(dev) = (MetalDevice::device_count() > 0).then(|| MetalDevice::open(0).unwrap()) else {
+        return;
+    };
+    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        let Some(sampler) = open(kernel) else { return };
+        let graphs: Vec<_> = (0..8)
+            .map(|i| {
+                let mut graph = ring(16);
+                if i % 2 == 1 {
+                    graph.h[0] = 0.125;
+                    graph.j[0] = -0.5;
+                }
+                graph
+            })
+            .collect();
+        let jobs = graphs
+            .iter()
+            .enumerate()
+            .map(|(i, graph)| {
+                job(
+                    &format!("job-{i}"),
+                    graph.clone(),
+                    params(8, 64, i as u64 + 17),
+                    None,
+                )
+            })
+            .collect();
+        let results = stream(&sampler, jobs, &CancelToken::default(), || {});
+        assert_eq!(results.len(), graphs.len(), "{kernel:?}");
+        let mut seen = [false; 8];
+        for result in results {
+            let id = id_of(&result);
+            let i: usize = id.strip_prefix("job-").unwrap().parse().unwrap();
+            assert!(!seen[i], "{kernel:?}: duplicate {id}");
+            seen[i] = true;
+            let StreamOutcome::Completed(Ok(reads)) = result.outcome else {
+                panic!("{kernel:?}: {id} did not complete with reads");
+            };
+            assert_eq!(reads.len(), 8, "{kernel:?}: {id}");
+            for read in &reads {
+                assert_eq!(
+                    read.energy_milli,
+                    energy_milli(&read.spins, &graphs[i].h, &graphs[i].j, &graphs[i].edges),
+                    "{kernel:?}: {id}"
+                );
+            }
+            if i % 2 == 1 {
+                let direct =
+                    sample_ising(&dev, &graphs[i], &params(8, 64, i as u64 + 17), kernel).unwrap();
+                assert_eq!(reads, direct, "{kernel:?}: {id}");
+            }
+        }
+        assert!(seen.into_iter().all(|present| present), "{kernel:?}");
+    }
 }
 
 #[test]

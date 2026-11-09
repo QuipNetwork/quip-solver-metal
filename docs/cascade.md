@@ -10,8 +10,8 @@ Metal MSA streams always use the resident runner. No key turns it off. An old
 Gibbs binaries do not run the cascade. The Apple Neural Engine sampler runs
 full-budget jobs on a separate path.
 
-Jobs whose coefficients have no exact device-energy form use the batch path.
-Fractional coefficients are one example. The runner
+Jobs that are not unit models (couplings and fields other than −1, 0, and 1)
+use the batch path, on the weighted MSA kernel. The runner
 drains live slots, then runs each such job once at full budget. The batch path
 rescores its reads on the host and returns one result. It does not screen
 these jobs.
@@ -80,6 +80,9 @@ report](perf/2026-09-23-cascade-calibration.md) explains the defaults.
 | `cascade_keep_max` | `30000` | unsigned 32-bit integer, subject to group rule | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | unsigned 32-bit integer, at least 2 | audit lane denominator |
 | `cascade_yield_per_million` | none | finite and greater than 0 | expected nonces per million below target |
+| `cascade_screen` | `true` | boolean | screen chain-gated lease salts eight models to a word |
+| `cascade_prefilter` | `true` | boolean | reject chain lease salts on the frustration score (stage F) before the screen |
+| `cascade_open_gates` | `false` | boolean | keep every job at every checkpoint, for gate measurement only |
 
 The keep values pass as one group when `2 <= cascade_keep_min <= cascade_keep
 <= cascade_keep_max`. If this check fails, the whole group keeps its old

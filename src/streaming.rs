@@ -245,6 +245,7 @@ pub fn stream_width(_device: &MetalDevice, kernel: Kernel) -> usize {
 struct BatchKey<'a> {
     watermark: Option<u64>,
     n: usize,
+    representation: Option<crate::representation::Representation>,
     edges: &'a [(usize, usize)],
     num_reads: usize,
     num_sweeps: usize,
@@ -253,11 +254,24 @@ struct BatchKey<'a> {
     schedule: quip_solver_core::BetaSchedule,
 }
 
+/// The coefficient path `kernel` runs `job` on, or `None` when it refuses it.
+fn representation(
+    job: &StreamJob,
+    kernel: Kernel,
+) -> Option<crate::representation::Representation> {
+    if kernel == Kernel::Msa {
+        crate::representation::classify_msa(&job.graph).ok()
+    } else {
+        crate::representation::classify(&job.graph).ok()
+    }
+}
+
 impl<'a> BatchKey<'a> {
-    fn from_job(job: &'a StreamJob) -> Self {
+    fn from_job(job: &'a StreamJob, kernel: Kernel) -> Self {
         Self {
             watermark: job.watermark,
             n: job.graph.h.len(),
+            representation: representation(job, kernel),
             edges: &job.graph.edges,
             num_reads: job.params.num_reads.clamp(1, sampler::MAX_READS),
             num_sweeps: job.params.num_sweeps,
@@ -267,7 +281,7 @@ impl<'a> BatchKey<'a> {
         }
     }
 
-    fn matches(&self, job: &StreamJob) -> bool {
+    fn matches(&self, job: &StreamJob, kernel: Kernel) -> bool {
         self.watermark == job.watermark
             && self.n == job.graph.h.len()
             && self.num_reads == job.params.num_reads.clamp(1, sampler::MAX_READS)
@@ -275,6 +289,7 @@ impl<'a> BatchKey<'a> {
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
             && self.schedule == job.params.schedule
+            && self.representation == representation(job, kernel)
             && self.edges == &*job.graph.edges
     }
 }
@@ -478,7 +493,7 @@ fn fill_batch(
             Ok(job) if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) => {
                 send_reject(ctx.out, job, SampleError::Capacity)
             }
-            Ok(job) if key.matches(&job) => {
+            Ok(job) if key.matches(&job, ctx.kernel) => {
                 matches.push(job);
                 last_arrival = Instant::now();
             }
@@ -607,7 +622,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         // matches into a side vec, then assemble the full batch.
         let mut matches = Vec::with_capacity(cap.saturating_sub(1));
         {
-            let key = BatchKey::from_job(&seed_job);
+            let key = BatchKey::from_job(&seed_job, ctx.kernel);
             fill_batch(ctx, &key, &mut matches, 1, cap);
         }
         let mut batch = Vec::with_capacity(matches.len() + 1);
@@ -803,9 +818,9 @@ mod tests {
         let graph = IsingGraph::new(vec![0.0], vec![], vec![]);
         let first = job(b"first", graph.clone(), 32, 4, 1);
         let mut second = job(b"second", graph, 32, 4, 1);
-        assert!(BatchKey::from_job(&first).matches(&second));
+        assert!(BatchKey::from_job(&first, Kernel::Msa).matches(&second, Kernel::Msa));
         second.params.schedule = quip_solver_core::BetaSchedule::Linear;
-        assert!(!BatchKey::from_job(&first).matches(&second));
+        assert!(!BatchKey::from_job(&first, Kernel::Msa).matches(&second, Kernel::Msa));
     }
 
     #[test]
@@ -815,11 +830,11 @@ mod tests {
         first.watermark = Some(1);
         let mut second = job(b"second", graph, 32, 4, 1);
         second.watermark = Some(2);
-        assert!(!BatchKey::from_job(&first).matches(&second));
+        assert!(!BatchKey::from_job(&first, Kernel::Sa).matches(&second, Kernel::Sa));
         second.watermark = None;
-        assert!(!BatchKey::from_job(&first).matches(&second));
+        assert!(!BatchKey::from_job(&first, Kernel::Sa).matches(&second, Kernel::Sa));
         second.watermark = Some(1);
-        assert!(BatchKey::from_job(&first).matches(&second));
+        assert!(BatchKey::from_job(&first, Kernel::Sa).matches(&second, Kernel::Sa));
     }
 
     #[test]
@@ -1014,23 +1029,65 @@ mod tests {
     #[test]
     fn batch_key_matches_identical_job() {
         let j = job(b"a", ring4(), 16, 64, 1);
-        let key = BatchKey::from_job(&j);
-        assert!(key.matches(&j));
+        let key = BatchKey::from_job(&j, Kernel::Sa);
+        assert!(key.matches(&j, Kernel::Sa));
     }
 
     #[test]
     fn batch_key_rejects_different_edges() {
         let j = job(b"a", ring4(), 16, 64, 1);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         let mut other = job(b"b", ring4(), 16, 64, 1);
         other.graph.edges = vec![(0, 1), (1, 2), (2, 3)].into(); // drop one edge
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, Kernel::Sa));
+    }
+
+    #[test]
+    fn batch_key_separates_representations() {
+        let ring = |scale: f64| {
+            IsingGraph::new(
+                vec![0.0; 4],
+                vec![-scale; 4],
+                vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+            )
+        };
+        let mut int8 = job(b"int8", ring(1.0), 16, 64, 1);
+        let mut wide = job(b"wide", ring(0.5), 16, 64, 1);
+        int8.watermark = None;
+        wide.watermark = None;
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            assert!(!BatchKey::from_job(&int8, kernel).matches(&wide, kernel));
+            assert!(BatchKey::from_job(&int8, kernel)
+                .matches(&job(b"same", ring(1.0), 16, 64, 1), kernel));
+        }
+    }
+
+    #[test]
+    fn batch_key_groups_msa_jobs_by_path_not_by_coefficients() {
+        let ring = |j: f64| {
+            IsingGraph::new(
+                vec![0.0; 4],
+                vec![j; 4],
+                vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+            )
+        };
+        let unit = |name: &[u8], j: f64| job(name, ring(j), 16, 64, 1);
+        fn key(j: &StreamJob) -> BatchKey<'_> {
+            BatchKey::from_job(j, Kernel::Msa)
+        }
+        // Unit jobs of different signs share the unit kernel, and weighted
+        // jobs of different weights share the weighted one.
+        assert!(key(&unit(b"a", 1.0)).matches(&unit(b"b", -1.0), Kernel::Msa));
+        assert!(key(&unit(b"c", 0.5)).matches(&unit(b"d", 2.0), Kernel::Msa));
+        // A whole-unit weight of 2 is int8 for SA but weighted for MSA.
+        assert!(!key(&unit(b"e", 1.0)).matches(&unit(b"f", 2.0), Kernel::Msa));
+        assert!(!key(&unit(b"g", 1.0)).matches(&unit(b"h", 0.5), Kernel::Msa));
     }
 
     #[test]
     fn batch_key_rejects_different_n() {
         let j = job(b"a", ring4(), 16, 64, 1);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         let other = job(
             b"b",
             IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]),
@@ -1038,15 +1095,15 @@ mod tests {
             64,
             1,
         );
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, Kernel::Sa));
     }
 
     #[test]
     fn batch_key_rejects_different_num_sweeps() {
         let j = job(b"a", ring4(), 16, 64, 1);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         let other = job(b"b", ring4(), 16, 128, 1);
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, Kernel::Sa));
     }
 
     #[test]
@@ -1055,30 +1112,30 @@ mod tests {
         let over = sampler::MAX_READS + 10;
         let more = sampler::MAX_READS + 50;
         let j = job(b"a", ring4(), over, 64, 1);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         assert_eq!(key.num_reads, sampler::MAX_READS);
         let other = job(b"b", ring4(), more, 64, 1);
-        assert!(key.matches(&other));
+        assert!(key.matches(&other, Kernel::Sa));
     }
 
     #[test]
     fn batch_key_matches_zero_num_reads_via_clamp() {
         // 0 and 1 both clamp to 1.
         let j = job(b"a", ring4(), 0, 64, 1);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         assert_eq!(key.num_reads, 1);
         let other = job(b"b", ring4(), 1, 64, 1);
-        assert!(key.matches(&other));
+        assert!(key.matches(&other, Kernel::Sa));
     }
 
     #[test]
     fn batch_key_matches_zero_sweeps_per_beta_via_max() {
         // 0 and 1 both become 1 via max(1).
         let j = job(b"a", ring4(), 16, 64, 0);
-        let key = BatchKey::from_job(&j);
+        let key = BatchKey::from_job(&j, Kernel::Sa);
         assert_eq!(key.sweeps_per_beta, 1);
         let other = job(b"b", ring4(), 16, 64, 1);
-        assert!(key.matches(&other));
+        assert!(key.matches(&other, Kernel::Sa));
     }
 
     #[test]

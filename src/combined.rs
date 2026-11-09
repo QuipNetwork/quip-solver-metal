@@ -354,6 +354,11 @@ fn eligibility(
         && n <= crate::sampler::kernel_max_nodes(kernel)
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
+    metal &= if kernel == Kernel::Msa {
+        crate::representation::classify_msa(graph).is_ok()
+    } else {
+        crate::representation::classify(graph).is_ok()
+    };
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa
         && n <= 16_384
@@ -1288,6 +1293,12 @@ mod tests {
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
+        // Off the milli grid: neither engine represents it.
+        j.graph.j[0] = 0.0005;
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [false, false]
+        );
         j.graph.j[0] = 1.0;
         j.params.num_reads = 129;
         assert_eq!(
@@ -1319,9 +1330,31 @@ mod tests {
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, true]
         );
+        // An endpoint past the nodes: no MSA path represents it.
         j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 2)]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn the_metal_engine_is_ineligible_for_models_it_cannot_run_exactly() {
+        let cfg = config(true, false);
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        assert_eq!(
+            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
+            [false, false]
+        );
+        let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
+        assert_eq!(
+            eligibility(Kernel::Sa, &pm1, &params, cfg, &mut facts),
             [true, false]
         );
     }
@@ -1344,11 +1377,12 @@ mod tests {
             [true, false]
         );
         j.graph.j.pop();
+        // Every Metal kernel refuses self-loops, like the ANE.
         j.graph.edges = [&original[..], &[(u, u)]].concat().into();
         j.graph.j.push(0.0);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [true, false]
+            [false, false]
         );
         j.graph.edges = original;
         j.graph.j.pop();

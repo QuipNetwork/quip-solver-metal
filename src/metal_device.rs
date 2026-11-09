@@ -23,6 +23,13 @@ use thiserror::Error;
 const SA_SRC: &str = include_str!("../kernels/sa.metal");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
 
+/// Prepended to a kernel source to build its wide variant.
+const WIDE_DEFINE: &str = "#define QUIP_WIDE 1\n";
+
+fn wide(source: &str) -> String {
+    format!("{WIDE_DEFINE}{source}")
+}
+
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
@@ -60,17 +67,29 @@ pub struct MetalDevice {
     pub(crate) device: Device,
     pub(crate) queue: metal::CommandQueue,
     pub(crate) sa: ComputePipelineState,
+    pub(crate) sa_wide: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
+    pub(crate) gibbs_wide: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
     pub(crate) gibbs_parallel: ComputePipelineState,
+    pub(crate) gibbs_parallel_wide: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
     pub(crate) msa: ComputePipelineState,
+    /// `msa` for weighted models: milli `int` coefficients and host-built
+    /// Metropolis threshold rows at slot 25.
+    pub(crate) msa_weighted: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
+    /// Nonce-parallel screen: eight models of four reads per word.
+    pub(crate) msa_screen: ComputePipelineState,
+    /// Lease draw of 32 models per threadgroup into bit-sliced edge signs.
+    pub(crate) msa_frustration_draw: ComputePipelineState,
+    /// Frustrated-cycle counts of each drawn 32-model group.
+    pub(crate) msa_frustration_count: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,
     /// Multi-spin batch buffers returned after their command buffers retire.
@@ -115,10 +134,18 @@ impl MetalDevice {
             .ok_or(MetalError::NoDevice(device_index))?;
 
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
+        let sa_wide = compile_pipeline(&device, &wide(SA_SRC), "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
+        let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
+        let gibbs_parallel_wide =
+            compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
+        let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
+        let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
+        let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
+        let msa_frustration_count = compile_pipeline(&device, MSA_SRC, "msa_frustration_count")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -126,10 +153,17 @@ impl MetalDevice {
             device,
             queue,
             sa,
+            sa_wide,
             gibbs,
+            gibbs_wide,
             gibbs_parallel,
+            gibbs_parallel_wide,
             msa,
+            msa_weighted,
             msa_slots,
+            msa_screen,
+            msa_frustration_draw,
+            msa_frustration_count,
             topology_cache: crate::sampler::TopologyCache::default(),
             buffer_pool: std::sync::Arc::new(crate::sampler::BufferPool::default()),
         })
@@ -223,6 +257,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_row_matches_metal_sources() {
+        assert_eq!(crate::wide_tables::WIDE_ROW, 2048);
+        assert!(SA_SRC.contains("#define WIDE_ROW 2048"));
+        assert!(GIBBS_SRC.contains("#define WIDE_ROW 2048"));
+        assert!(MSA_SRC.contains("#define WIDE_ROW       2048"));
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "report GPU pipeline thread maxima")]
+    fn wide_pipelines_compile_and_admit_a_simd_group() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        for (name, pipeline) in [
+            ("sa_wide", &dev.sa_wide),
+            ("gibbs_wide", &dev.gibbs_wide),
+            ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
+            ("msa_weighted", &dev.msa_weighted),
+        ] {
+            let max = pipeline.max_total_threads_per_threadgroup();
+            eprintln!("{name}: max threads per threadgroup {max}");
+            assert!(max >= 32, "{name} admits only {max} threads");
+        }
+        assert!(dev.gibbs_parallel_wide.max_total_threads_per_threadgroup() >= 128);
+    }
+
+    #[test]
     fn device_count_is_consistent() {
         // Enumeration cannot fail; two back-to-back reads must agree.
         let a = MetalDevice::device_count();
@@ -262,7 +324,7 @@ mod tests {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
-        for pipeline in [&dev.msa, &dev.msa_slots] {
+        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
             assert!(pipeline.static_threadgroup_memory_length() as usize <= 32 * 4 + 16);
         }
     }
@@ -275,7 +337,7 @@ mod tests {
         let dev = MetalDevice::open(0).unwrap();
         // The host requests 1,024 threads per multi-spin threadgroup and clamps
         // to the pipeline maximum. Require support for at least 256 threads.
-        for pipeline in [&dev.msa, &dev.msa_slots] {
+        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
             assert!(pipeline.max_total_threads_per_threadgroup() >= 256);
             // Static threadgroup lane totals must leave room for the
             // largest advertised N at 4 bytes per spin under the 32 KB cap.
