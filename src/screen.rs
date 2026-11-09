@@ -57,11 +57,27 @@ pub(crate) fn key_words(nonce: [u8; 32]) -> Vec<u32> {
 /// Matches `ScreenDraw` in `kernels/msa.metal`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct ScreenDraw {
+pub(crate) struct ScreenDraw {
     mode: u32,
     first_word: u32,
     allowed_len: u32,
     neg_table: u32,
+}
+
+impl Draw {
+    /// The device draw descriptor.
+    pub(crate) fn device(&self) -> ScreenDraw {
+        ScreenDraw {
+            mode: 1,
+            first_word: self.first_word,
+            allowed_len: self.allowed_j.len() as u32,
+            neg_table: self
+                .allowed_j
+                .iter()
+                .enumerate()
+                .fold(0, |table, (k, &j)| table | (u32::from(j < 0) << k)),
+        }
+    }
 }
 
 #[repr(C)]
@@ -128,16 +144,7 @@ impl ScreenBank {
         } else {
             edges.div_ceil(32)
         };
-        let draw = draw.map_or(ScreenDraw::default(), |d| ScreenDraw {
-            mode: 1,
-            first_word: d.first_word,
-            allowed_len: d.allowed_j.len() as u32,
-            neg_table: d
-                .allowed_j
-                .iter()
-                .enumerate()
-                .fold(0, |table, (k, &j)| table | (u32::from(j < 0) << k)),
-        });
+        let draw = draw.map_or(ScreenDraw::default(), Draw::device);
         let sched_len: usize = schedules.iter().map(|s| s.len()).sum();
         let region = |factors: &[usize]| -> Result<u64, SampleError> {
             factors

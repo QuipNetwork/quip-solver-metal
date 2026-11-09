@@ -820,8 +820,17 @@ struct ScreenDraw {
     uint neg_table;    // bit k set where allowed_j[k] < 0
 };
 
+// Whether keystream word `w` draws a negative coupling. A power-of-two
+// value count selects with a mask instead of an integer division.
+inline bool draw_negative(constant ScreenDraw& draw, uint w) {
+    uint len = draw.allowed_len;
+    uint k = (len & (len - 1u)) == 0u ? (w & (len - 1u)) : (w % len);
+    return ((draw.neg_table >> k) & 1u) != 0u;
+}
+
 // One ChaCha8 block (four double rounds) at block `counter`, stream 0.
-inline void chacha8_block(device const uint* key, uint counter, thread uint* out) {
+template <typename Key>
+inline void chacha8_block(Key key, uint counter, thread uint* out) {
     uint s[16] = {0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
                   key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
                   counter, 0u, 0u, 0u};
@@ -901,7 +910,7 @@ kernel void msa_screen(
                 uint block[16];
                 chacha8_block(&my_rows[g * uint(row_words)], b, block);
                 for (int i = 0; i < 16; ++i) {
-                    bytes[i] |= ((draw.neg_table >> (block[i] % draw.allowed_len)) & 1u) << g;
+                    bytes[i] |= uint(draw_negative(draw, block[i])) << g;
                 }
             }
             for (uint i = 0; i < 16u; ++i) {
@@ -936,5 +945,266 @@ kernel void msa_screen(
              color_block_starts, color_block_counts, color_node_indices,
              N, MSA_LANES, num_colors, 1, 0, word.num_betas, init_seed, true, false,
              true, true, 0, tid, gsz, state, lane_total);
+}
+
+// Frustration counts of 32 lease models per threadgroup: how many triangles
+// and 4-cycles of each model have an odd number of negative couplings. Each
+// SIMD group draws keystream blocks with one lane per model, and a ballot
+// turns each edge's 32 signs into one word of `signs`, bit m set where model
+// m's coupling is negative. Every thread then XORs the words of its share of
+// the cycles, so bit m of the result marks a frustrated cycle of model m, and
+// counts the marks per model in bit-sliced planes.
+#define FRUSTRATION_PLANES 13
+#define FRUSTRATION_MAX_PATHS 16
+// Diagonals of at least this many paths count by product; 5 count planes
+// hold up to 31 paths.
+#define FRUSTRATION_PRODUCT_PATHS 7
+#define FRUSTRATION_COUNT_PLANES 5
+#define FRUSTRATION_TRI_PLANES 11
+// Groups of 32 models a count threadgroup takes together. `signs` holds
+// their words side by side, so each load serves every group.
+#define FRUSTRATION_WIDTH 4
+#if FRUSTRATION_WIDTH == 1
+typedef uint fword;
+#elif FRUSTRATION_WIDTH == 2
+typedef uint2 fword;
+#else
+typedef uint4 fword;
+#endif
+
+inline bool marked(fword marks) {
+    return any(marks != fword(0u));
+}
+
+inline uint lane_word(fword marks, int c) {
+#if FRUSTRATION_WIDTH == 1
+    return marks;
+#else
+    return marks[c];
+#endif
+}
+
+// A bit-sliced counter of 32 models' marks. Plane k holds bit k of each
+// model's count. Each level keeps one pending input, so a carry-save add
+// combines it with the plane and a second input in five operations, and only
+// half of the inputs carry to the next level.
+struct MarkCounter {
+    fword planes[FRUSTRATION_PLANES];
+    fword pending[FRUSTRATION_PLANES];
+    uint held;  // bit k set while level k holds a pending input
+
+    void clear() {
+        for (int k = 0; k < FRUSTRATION_PLANES; ++k) {
+            planes[k] = fword(0u);
+            pending[k] = fword(0u);
+        }
+        held = 0u;
+    }
+
+    void add(fword marks) {
+        add_at(0, marks);
+    }
+
+    // Add each marked model's 2^level.
+    void add_at(int level, fword marks) {
+        for (int k = level; k < FRUSTRATION_PLANES; ++k) {
+            uint bit = 1u << k;
+            if ((held & bit) == 0u) {
+                pending[k] = marks;
+                held |= bit;
+                return;
+            }
+            held &= ~bit;
+            fword a = planes[k], b = pending[k];
+            fword ab = a ^ b;
+            planes[k] = ab ^ marks;
+            marks = (a & b) | (marks & ab);
+        }
+    }
+
+    // Fold the pending inputs into the planes.
+    void settle() {
+        for (int k = 0; k < FRUSTRATION_PLANES; ++k) {
+            if ((held & (1u << k)) != 0u) {
+                fword marks = pending[k];
+                for (int j = k; j < FRUSTRATION_PLANES && marked(marks); ++j) {
+                    fword carry = planes[j] & marks;
+                    planes[j] ^= marks;
+                    marks = carry;
+                }
+            }
+        }
+        held = 0u;
+    }
+};
+
+// Sum one counter per model over the threadgroup into `total`.
+inline void counter_total(thread MarkCounter& counter, uint lane,
+                          threadgroup atomic_uint* total) {
+    counter.settle();
+    for (int c = 0; c < FRUSTRATION_WIDTH; ++c) {
+        for (uint m = 0; m < 32u; ++m) {
+            uint count = 0u;
+            for (int k = 0; k < FRUSTRATION_PLANES; ++k) {
+                count |= ((lane_word(counter.planes[k], c) >> m) & 1u) << k;
+            }
+            count = simd_sum(count);
+            if (lane == 0u) {
+                atomic_fetch_add_explicit(&total[uint(c) * 32u + m], count, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// Draw 32 models a threadgroup into `signs`: word e of a group holds edge
+// e's sign for each of its models, bit m set where model m's coupling is
+// negative.
+kernel void msa_frustration_draw(
+    device const uint* keys [[buffer(0)]],               // [groups * 32 * 8]
+    device uint* signs [[buffer(1)]],                    // [groups * num_edges]
+    constant ScreenDraw& draw [[buffer(7)]],
+    constant uint& num_edges [[buffer(10)]],
+    constant uint& num_groups [[buffer(11)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]]
+) {
+    if (group >= num_groups) {
+        return;
+    }
+    // Word e of group g sits at component g % WIDTH of its block's word e.
+    uint block_of = group / uint(FRUSTRATION_WIDTH);
+    uint component = group % uint(FRUSTRATION_WIDTH);
+    device uint* my_signs = &signs[block_of * num_edges * uint(FRUSTRATION_WIDTH) + component];
+    uint key[8];
+    for (int i = 0; i < 8; ++i) {
+        key[i] = keys[(group * 32u + lane) * 8u + uint(i)];
+    }
+    uint first = draw.first_word;
+    uint end = first + num_edges;
+    for (uint b = first / 16u + simd; b * 16u < end; b += simds) {
+        uint block[16];
+        chacha8_block((thread const uint*)key, b, block);
+        // Lane i keeps word i's ballot, so the block takes one store.
+        uint mine = 0u;
+        for (uint i = 0; i < 16u; ++i) {
+            uint marks = uint(uint64_t(simd_ballot(draw_negative(draw, block[i]))));
+            mine = lane == i ? marks : mine;
+        }
+        uint w = b * 16u + lane;
+        if (lane < 16u && w >= first && w < end) {
+            my_signs[(w - first) * uint(FRUSTRATION_WIDTH)] = mine;
+        }
+    }
+}
+
+// Count the frustrated cycles of the drawn models of each group.
+kernel void msa_frustration_count(
+    device const fword* signs [[buffer(1)]],             // [blocks * num_edges]
+    constant uint& num_diagonals [[buffer(2)]],
+    constant uint& num_triangles [[buffer(3)]],
+    device const uint* diagonal_starts [[buffer(4)]],    // [diagonals + 1] into paths
+    device const ushort2* paths [[buffer(5)]],           // (ab, bc) edges of each path
+    device const ushort4* triangles [[buffer(6)]],       // edges, w unused
+    device uint2* counts [[buffer(8)]],                  // [groups * 32] (triangles, quads)
+    constant uint& num_edges [[buffer(10)]],
+    constant uint& num_groups [[buffer(11)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup atomic_uint tri_total[32 * FRUSTRATION_WIDTH];
+    threadgroup atomic_uint quad_total[32 * FRUSTRATION_WIDTH];
+    if (group * uint(FRUSTRATION_WIDTH) >= num_groups) {
+        return;
+    }
+    if (tid < 32u * uint(FRUSTRATION_WIDTH)) {
+        atomic_store_explicit(&tri_total[tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&quad_total[tid], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const fword* my_signs = &signs[group * num_edges];
+
+    MarkCounter quads;
+    quads.clear();
+    for (uint d = tid; d < num_diagonals; d += threads) {
+        uint start = diagonal_starts[d];
+        uint k = diagonal_starts[d + 1] - start;
+        if (k < FRUSTRATION_PRODUCT_PATHS) {
+            for (uint i = 0; i + 1u < k; ++i) {
+                ushort2 a = paths[start + i];
+                fword parity = my_signs[a.x] ^ my_signs[a.y];
+                for (uint j = i + 1u; j < k; ++j) {
+                    ushort2 b = paths[start + j];
+                    quads.add(parity ^ my_signs[b.x] ^ my_signs[b.y]);
+                }
+            }
+            continue;
+        }
+        // p odd paths of k close p * (k - p) frustrated 4-cycles: count p
+        // bit-sliced, subtract it from k, and add the product plane by plane.
+        int planes = 32 - int(clz(k));
+        fword odd[FRUSTRATION_COUNT_PLANES];
+        for (int b = 0; b < FRUSTRATION_COUNT_PLANES; ++b) {
+            odd[b] = fword(0u);
+        }
+        for (uint i = 0; i < k; ++i) {
+            ushort2 a = paths[start + i];
+            fword carry = my_signs[a.x] ^ my_signs[a.y];
+            for (int b = 0; b < planes; ++b) {
+                fword next = odd[b] & carry;
+                odd[b] ^= carry;
+                carry = next;
+            }
+        }
+        fword even[FRUSTRATION_COUNT_PLANES];
+        fword borrow = fword(0u);
+        for (int b = 0; b < planes; ++b) {
+            fword kb = fword(((k >> uint(b)) & 1u) != 0u ? ~0u : 0u);
+            even[b] = kb ^ odd[b] ^ borrow;
+            borrow = (~kb & (odd[b] | borrow)) | (odd[b] & borrow);
+        }
+        for (int i = 0; i < planes; ++i) {
+            for (int j = 0; j < planes; ++j) {
+                fword marks = odd[i] & even[j];
+                if (marked(marks)) {
+                    quads.add_at(i + j, marks);
+                }
+            }
+        }
+    }
+    counter_total(quads, lane, quad_total);
+    fword tri_planes[FRUSTRATION_TRI_PLANES];
+    for (int k = 0; k < FRUSTRATION_TRI_PLANES; ++k) {
+        tri_planes[k] = fword(0u);
+    }
+    for (uint r = tid; r < num_triangles; r += threads) {
+        ushort4 e = triangles[r];
+        fword marks = my_signs[e.x] ^ my_signs[e.y] ^ my_signs[e.z];
+        for (int k = 0; k < FRUSTRATION_TRI_PLANES && marked(marks); ++k) {
+            fword carry = tri_planes[k] & marks;
+            tri_planes[k] ^= marks;
+            marks = carry;
+        }
+    }
+    for (int c = 0; c < FRUSTRATION_WIDTH; ++c) {
+        for (uint m = 0; m < 32u; ++m) {
+            uint count = 0u;
+            for (int k = 0; k < FRUSTRATION_TRI_PLANES; ++k) {
+                count |= ((lane_word(tri_planes[k], c) >> m) & 1u) << k;
+            }
+            count = simd_sum(count);
+            if (lane == 0u) {
+                atomic_fetch_add_explicit(&tri_total[uint(c) * 32u + m], count, memory_order_relaxed);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32u * uint(FRUSTRATION_WIDTH)) {
+        counts[group * 32u * uint(FRUSTRATION_WIDTH) + tid] = uint2(atomic_load_explicit(&tri_total[tid], memory_order_relaxed),
+                                          atomic_load_explicit(&quad_total[tid], memory_order_relaxed));
+    }
 }
 #endif

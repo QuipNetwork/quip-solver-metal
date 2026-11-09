@@ -86,6 +86,10 @@ pub struct MetalDevice {
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
     pub(crate) msa_screen: ComputePipelineState,
+    /// Lease draw of 32 models per threadgroup into bit-sliced edge signs.
+    pub(crate) msa_frustration_draw: ComputePipelineState,
+    /// Frustrated-cycle counts of each drawn 32-model group.
+    pub(crate) msa_frustration_count: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,
     /// Multi-spin batch buffers returned after their command buffers retire.
@@ -140,6 +144,8 @@ impl MetalDevice {
         let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
+        let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
+        let msa_frustration_count = compile_pipeline(&device, MSA_SRC, "msa_frustration_count")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -156,6 +162,8 @@ impl MetalDevice {
             msa_weighted,
             msa_slots,
             msa_screen,
+            msa_frustration_draw,
+            msa_frustration_count,
             topology_cache: crate::sampler::TopologyCache::default(),
             buffer_pool: std::sync::Arc::new(crate::sampler::BufferPool::default()),
         })

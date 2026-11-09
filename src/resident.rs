@@ -144,6 +144,17 @@ pub(crate) enum SaltOutcome {
     },
 }
 
+impl SaltOutcome {
+    pub(crate) fn index(&self) -> u64 {
+        match self {
+            Self::Screened { index, .. }
+            | Self::Survived { index, .. }
+            | Self::Dropped { index }
+            | Self::Failed { index, .. } => *index,
+        }
+    }
+}
+
 pub(crate) struct Salt {
     pub(crate) topology: Arc<TopologyView>,
     pub(crate) nonce: [u8; 32],
@@ -152,6 +163,10 @@ pub(crate) struct Salt {
     /// covers one round at a time.
     pub(crate) round: u64,
     pub(crate) params: SampleParams,
+    /// Zero for the lease's own run of this salt. A near-miss rerun copy
+    /// counts from 1: it skips the screen, takes the deep plan, and gets its
+    /// own seed.
+    pub(crate) rerun: u8,
     /// Set when the issuing lease ends. Its queued and live units then stop
     /// and answer `Dropped`.
     pub(crate) stop: Arc<AtomicBool>,
@@ -263,7 +278,7 @@ fn drawn_job(salt: &Salt, h_milli: &[i32], j_milli: &[i32]) -> StreamJob {
             .collect()
     };
     let mut params = salt.params.clone();
-    params.seed = salt_seed(salt.nonce);
+    params.seed = salt_seed(salt.nonce, salt.rerun);
     StreamJob {
         job_id: salt.index.to_le_bytes().to_vec(),
         graph: IsingGraph::new(
@@ -287,12 +302,15 @@ fn modelless_job(salt: &Salt) -> StreamJob {
     }
 }
 
-/// The nonce is unique to the lease and salt, so concurrent leases never share a seed.
-fn salt_seed(nonce: [u8; 32]) -> u64 {
+/// The nonce is unique to the lease and salt, so concurrent leases never share
+/// a seed, and each rerun copy of a salt gets its own.
+fn salt_seed(nonce: [u8; 32], rerun: u8) -> u64 {
     use std::hash::BuildHasher;
     static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
         std::sync::OnceLock::new();
-    KEYS.get_or_init(Default::default).hash_one(nonce).max(1)
+    KEYS.get_or_init(Default::default)
+        .hash_one((nonce, rerun))
+        .max(1)
 }
 
 /// Most sweeps a slot in a fresh deep leg advances per step. Screening slots
@@ -805,7 +823,7 @@ impl Preparer {
         let gated = screen && settings.chain_gated(prepared.chain, &job.params);
         // Open gates measure the budget the job asked for.
         if gated && !settings.open_gates {
-            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+            job.params.num_sweeps = CHAIN_GATES.final_sweeps(settings.long);
         }
         // `inputs` verified the job's edges against `prepared.edges`, edge by
         // edge, so the cached degrees are this job's.
@@ -883,7 +901,7 @@ impl Preparer {
         };
         let to_f64 = |values: &[i8]| values.iter().map(|&v| f64::from(v)).collect();
         let mut params = salt.params.clone();
-        params.seed = salt_seed(salt.nonce);
+        params.seed = salt_seed(salt.nonce, salt.rerun);
         let mut job = StreamJob {
             job_id: salt.index.to_le_bytes().to_vec(),
             graph: IsingGraph {
@@ -899,7 +917,7 @@ impl Preparer {
         }
         let gated = screen && settings.chain_gated(prepared.chain, &job.params);
         if gated && !settings.open_gates {
-            job.params.num_sweeps = CHAIN_GATES.full_sweeps;
+            job.params.num_sweeps = CHAIN_GATES.final_sweeps(settings.long);
         }
         let beta_range = job.params.beta_range.is_none().then(|| {
             crate::cascade::unit_beta_range(fields.iter().map(|&h| h != 0), &prepared.degrees)
@@ -1211,10 +1229,16 @@ impl Preparation {
         }
     }
 
+    /// A rerun copy of a salt goes straight to the long deep plan.
     pub(crate) fn submit(&mut self, source: Source, settings: CascadeSettings) {
-        let screen = match &source {
-            Source::Job(_) => false,
-            Source::Salt(_) => true,
+        let (screen, rerun) = match &source {
+            Source::Job(_) => (false, false),
+            Source::Salt(salt) => (true, salt.rerun > 0),
+        };
+        let settings = CascadeSettings {
+            deep: settings.deep || rerun,
+            long: rerun,
+            ..settings
         };
         self.submit_with(source, settings, screen);
     }
@@ -1576,9 +1600,16 @@ fn admit_unit(
             Kernel::Msa,
             job.params.num_reads.clamp(1, sampler::MAX_READS),
         );
+        // Room for a long rerun copy beside short gated units, so a copy
+        // never waits for the pools to drain.
+        let stride = if job.params.num_sweeps == CHAIN_GATES.short_sweeps {
+            schedule_len.max(CHAIN_GATES.long_schedule_len())
+        } else {
+            schedule_len
+        };
         // Both pools are empty, so changing storage cannot discard work.
-        let rebuilt = Pool::new(device, &job, capacity, schedule_len)
-            .and_then(|a| Pool::new(device, &job, capacity, schedule_len).map(|b| [a, b]));
+        let rebuilt = Pool::new(device, &job, capacity, stride)
+            .and_then(|a| Pool::new(device, &job, capacity, stride).map(|b| [a, b]));
         match rebuilt {
             Ok(rebuilt) => {
                 *pools = Some(rebuilt);
@@ -2243,6 +2274,7 @@ mod tests {
                     nonce: [0; 32],
                     index,
                     round: 0,
+                    rerun: 0,
                     params: SampleParams {
                         num_reads: 4,
                         num_sweeps: 16,
@@ -2341,6 +2373,7 @@ mod tests {
                 nonce: [0; 32],
                 index: 0,
                 round: 0,
+                rerun: 0,
                 params: SampleParams {
                     num_reads: 4,
                     num_sweeps: 16,
@@ -2876,6 +2909,7 @@ mod tests {
             nonce: [0; 32],
             index,
             round: 0,
+            rerun: 0,
             params: SampleParams {
                 num_reads: 4,
                 num_sweeps: 16,
@@ -2898,6 +2932,21 @@ mod tests {
             drawn_job(&first, &[0, 0], &[-1000]).params.seed,
             drawn_job(&second, &[0, 0], &[-1000]).params.seed
         );
+    }
+
+    #[test]
+    fn each_rerun_copy_of_a_salt_gets_its_own_seed() {
+        let (reply, _outcomes) = mpsc::channel();
+        let seeds: Vec<u64> = (0..=3)
+            .map(|copy| {
+                let mut copy_salt = salt(3, &reply);
+                copy_salt.rerun = copy;
+                drawn_job(&copy_salt, &[0, 0], &[-1000]).params.seed
+            })
+            .collect();
+        for (i, a) in seeds.iter().enumerate() {
+            assert!(seeds[i + 1..].iter().all(|b| a != b), "{seeds:?}");
+        }
     }
 
     #[test]
@@ -2994,18 +3043,40 @@ mod tests {
             .prepare(&mut chain, CascadeSettings::default(), true)
             .unwrap()
             .unwrap();
-        assert_eq!(chain.params.num_sweeps, CHAIN_GATES.full_sweeps);
+        assert_eq!(chain.params.num_sweeps, CHAIN_GATES.short_sweeps);
         assert_eq!(
             data.schedule.checkpoints.last(),
             Some(
                 &(CHAIN_GATES
                     .stages
                     .iter()
-                    .filter(|&&s| s > crate::cascade::REHEAT_THROUGH)
+                    .filter(|&&s| {
+                        s > crate::cascade::REHEAT_THROUGH && s < CHAIN_GATES.short_sweeps
+                    })
                     .sum::<usize>()
                     + crate::cascade::REHEAT_THROUGH
-                    + CHAIN_GATES.full_sweeps)
+                    + CHAIN_GATES.short_sweeps)
             )
+        );
+        let mut long = StreamJob {
+            job_id: chain.job_id.clone(),
+            graph: chain.graph.clone(),
+            params: chain.params.clone(),
+            watermark: None,
+        };
+        long.params.num_sweeps = 14_336;
+        let long_settings = CascadeSettings {
+            long: true,
+            ..CascadeSettings::default()
+        };
+        let data = preparer
+            .prepare(&mut long, long_settings, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(long.params.num_sweeps, CHAIN_GATES.full_sweeps);
+        assert_eq!(
+            data.schedule.checkpoints.last(),
+            Some(&CHAIN_GATES.long_schedule_len())
         );
         let open = CascadeSettings {
             open_gates: true,
@@ -3134,6 +3205,7 @@ mod tests {
             nonce,
             index,
             round: 0,
+            rerun: 0,
             params: SampleParams {
                 num_reads: 64,
                 num_sweeps: CHAIN_GATES.full_sweeps,
@@ -3376,6 +3448,168 @@ mod tests {
             "{total} Aglais salts: {:.0} salts/s, {survived} survived before the stop",
             (total * 8 / 10) as f64 / (last - first).as_secs_f64()
         );
+    }
+
+    /// Replay won qblocks through the live plan: each winning nonce, with the
+    /// target its block cleared, runs the screen and the deep cascade beside
+    /// a full top 10, as a lease salt does. Writes one CSV row per block to
+    /// `QUIP_REPLAY_OUT`. `QUIP_REPLAY` is `scripts/testnet/fetch_qblocks.py`
+    /// output and `QUIP_REPLAY_PROBLEMS` its `regen` directory, which pins
+    /// the nonce byte order against the chain's draw.
+    ///
+    /// ```text
+    /// QUIP_REPLAY=qblocks.json QUIP_REPLAY_PROBLEMS=problems QUIP_REPLAY_OUT=replay.csv \
+    ///   cargo test --release --lib won_qblocks_replay -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a Metal device and fetched qblocks"]
+    #[expect(clippy::print_stderr, reason = "the replay reports on stderr")]
+    fn won_qblocks_replay() {
+        #[derive(serde::Deserialize)]
+        struct Difficulty {
+            max_energy_milli: i64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Block {
+            qblock_id: u64,
+            nonce_seed: String,
+            energy_milli: i64,
+            difficulty: Difficulty,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fetched {
+            blocks: Vec<Block>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Problem {
+            edges: Vec<(usize, usize)>,
+            j: Vec<f64>,
+        }
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        let fetched: Fetched =
+            serde_json::from_str(&std::fs::read_to_string(var("QUIP_REPLAY")).unwrap()).unwrap();
+        let blocks = fetched.blocks;
+        let nonce = |block: &Block| -> [u8; 32] {
+            std::array::from_fn(|i| {
+                u8::from_str_radix(&block.nonce_seed[2 * i..2 * i + 2], 16).unwrap()
+            })
+        };
+        let topology = aglais_view();
+        let first = &blocks[0];
+        let problem: Problem = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/problem-{}.json",
+                var("QUIP_REPLAY_PROBLEMS"),
+                first.qblock_id
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let (_, j) = crate::draw::draw_units(
+            nonce(first),
+            topology.num_nodes,
+            topology.edges.len(),
+            &[0],
+            &[-1, 1],
+        )
+        .unwrap();
+        let chain: std::collections::HashMap<(usize, usize), f64> =
+            problem.edges.into_iter().zip(problem.j).collect();
+        for (edge, &value) in topology.edges.iter().zip(&j) {
+            assert_eq!(chain[edge], f64::from(value), "edge {edge:?}");
+        }
+        // Stage F runs in the lease feeder, before these salts would reach
+        // the runner; score each winner as it would.
+        let cycles = crate::frustration::Cycles::new(topology.num_nodes, &topology.edges);
+        let prefiltered: Vec<bool> = blocks
+            .iter()
+            .map(|block| {
+                let (_, j) = crate::draw::draw_units(
+                    nonce(block),
+                    topology.num_nodes,
+                    topology.edges.len(),
+                    &[0],
+                    &[-1, 1],
+                )
+                .unwrap();
+                crate::frustration::passes(&cycles, &j)
+            })
+            .collect();
+
+        let (reply, outcomes) = mpsc::channel();
+        let (salts_tx, salts) = mpsc::sync_channel(blocks.len());
+        let top10 = full_top10();
+        for (index, block) in blocks.iter().enumerate() {
+            let mut salt = aglais_salt(&topology, index as u64, &reply);
+            salt.nonce = nonce(block);
+            salt.top10 = top10.clone();
+            salt.target = LiveTarget::new(Some(block.difficulty.max_energy_milli));
+            salts_tx.send(salt).unwrap();
+        }
+        drop((reply, salts_tx));
+        let runner = std::thread::spawn(move || {
+            let device = MetalDevice::open(0).unwrap();
+            let gov = crate::iokit_gov::UtilGovernor::start(0, 100, false);
+            let (tx, jobs) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            let (out, _results) = tokio::sync::mpsc::channel(1);
+            run(
+                &device,
+                &Mutex::new(CascadeSettings::default()),
+                &Mutex::new(None),
+                jobs,
+                &salts,
+                &out,
+                &gov,
+                &CancelToken::default(),
+            );
+        });
+        let started = Instant::now();
+        let mut rows = vec![String::new(); blocks.len()];
+        for _ in 0..blocks.len() {
+            let outcome = outcomes
+                .recv_timeout(Duration::from_secs(3600))
+                .expect("every block answers");
+            let (index, kind, energy) = match outcome {
+                SaltOutcome::Screened {
+                    index,
+                    energy_milli,
+                } => (index, "cut", energy_milli),
+                SaltOutcome::Survived { index, reads } => (
+                    index,
+                    "finished",
+                    reads.iter().map(|r| r.energy_milli).min().unwrap(),
+                ),
+                SaltOutcome::Dropped { index } => panic!("block {index} dropped"),
+                SaltOutcome::Failed { index, error } => panic!("block {index}: {error}"),
+            };
+            let block = &blocks[index as usize];
+            let target = block.difficulty.max_energy_milli;
+            let kept = prefiltered[index as usize];
+            let row = format!(
+                "{},{target},{},{kept},{kind},{energy},{},{:.0}",
+                block.qblock_id,
+                block.energy_milli,
+                kept && energy <= target,
+                started.elapsed().as_secs_f64()
+            );
+            eprintln!("{row}");
+            rows[index as usize] = row;
+        }
+        runner.join().unwrap();
+        let wins = rows
+            .iter()
+            .filter(|row| row.split(',').nth(6) == Some("true"))
+            .count();
+        eprintln!("{wins} of {} blocks reach their target", blocks.len());
+        std::fs::write(
+            var("QUIP_REPLAY_OUT"),
+            format!(
+                "qblock_id,target_milli,winner_milli,prefilter,outcome,energy_milli,wins,secs\n{}\n",
+                rows.join("\n")
+            ),
+        )
+        .unwrap();
     }
 
     /// Prepare `salt` the way a worker does.

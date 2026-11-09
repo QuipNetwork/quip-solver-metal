@@ -52,6 +52,7 @@ mod cascade;
 mod combined;
 mod cutoff;
 mod draw;
+mod frustration;
 mod lease_turn;
 mod model_checks;
 mod representation;
@@ -296,6 +297,8 @@ pub struct MetalSampler {
     /// still holds its place in `lease_turns`, so every lease that feeds after
     /// a reseed reads the new value.
     lease_round: std::sync::atomic::AtomicU64,
+    /// Stage F for chain-topology leases, built by the first such lease.
+    prefilter: std::sync::Mutex<Option<frustration::Prefilter>>,
 }
 
 /// Stores a value into a flag when dropped, on every exit path.
@@ -374,11 +377,18 @@ impl MetalSampler {
             runner_live: std::sync::atomic::AtomicBool::new(true),
             lease_turns: lease_turn::LeaseTurns::default(),
             lease_round: std::sync::atomic::AtomicU64::new(0),
+            prefilter: std::sync::Mutex::new(None),
         }
     }
 
     /// Report a lease's outcomes until every queued salt has one, the
     /// feeder has stopped, or the lease stops.
+    ///
+    /// A salt that finishes within [`RERUN_MARGIN_MILLI`] above the live
+    /// target is held, and `rerun` queues [`RERUN_COPIES`] more deep runs of
+    /// it. The sink takes one push per salt, so the salt is pushed once: on
+    /// the first copy below the target, or with the best read set once every
+    /// copy has answered.
     fn report_lease(
         &self,
         sink: &quip_solver_core::LeaseSink,
@@ -386,14 +396,20 @@ impl MetalSampler {
         live_target: &resident::LiveTarget,
         fed: &std::sync::atomic::AtomicU64,
         feeding: &std::sync::atomic::AtomicBool,
+        rerun: &dyn Fn(u64, u8) -> bool,
     ) -> Result<(), quip_solver_core::SampleError> {
         use std::sync::atomic::Ordering;
         let mut reported = 0u64;
+        // Rerun copies queued; each answers once, like a fed salt.
+        let mut copies = 0u64;
+        let mut held = std::collections::HashMap::<u64, Held>::new();
         while !sink.is_stopped() {
             self.require_runner()?;
-            live_target.set(sink.target_energy_milli());
+            let target = sink.target_energy_milli();
+            live_target.set(target);
             // `feeding` is cleared after the last increment of `fed`.
-            if !feeding.load(Ordering::Acquire) && reported == fed.load(Ordering::Acquire) {
+            if !feeding.load(Ordering::Acquire) && reported == fed.load(Ordering::Acquire) + copies
+            {
                 break;
             }
             let Ok(first) = outcomes.recv_timeout(std::time::Duration::from_millis(1)) else {
@@ -402,19 +418,81 @@ impl MetalSampler {
             for outcome in std::iter::once(first).chain(outcomes.try_iter()) {
                 reported += 1;
                 let sent = match outcome {
-                    resident::SaltOutcome::Screened {
-                        index,
-                        energy_milli,
-                    } => sink.screen(index, energy_milli),
-                    resident::SaltOutcome::Survived { index, reads } => sink.push(index, reads),
-                    resident::SaltOutcome::Dropped { index } => {
-                        tracing::debug!(index, "lease salt dropped before reporting");
-                        Ok(())
-                    }
                     resident::SaltOutcome::Failed { index, error } => {
                         return Err(quip_solver_core::SampleError::DeviceFault(format!(
                             "lease salt {index}: {error}"
                         )));
+                    }
+                    outcome if held.contains_key(&outcome.index()) => {
+                        let index = outcome.index();
+                        let Some(entry) = held.get_mut(&index) else {
+                            continue;
+                        };
+                        entry.waiting -= 1;
+                        if let resident::SaltOutcome::Survived { reads, .. } = outcome {
+                            let best = best_energy(&reads);
+                            if best < entry.best {
+                                entry.best = best;
+                                entry.reads = reads;
+                            }
+                        }
+                        let hit = target.is_some_and(|target| entry.best < target);
+                        let sent = if !entry.pushed && (hit || entry.waiting == 0) {
+                            entry.pushed = true;
+                            tracing::info!(
+                                index,
+                                first = entry.first,
+                                best = entry.best,
+                                ?target,
+                                hit,
+                                "near-miss rerun finished"
+                            );
+                            sink.push(index, std::mem::take(&mut entry.reads))
+                        } else {
+                            Ok(())
+                        };
+                        if entry.waiting == 0 {
+                            held.remove(&index);
+                        }
+                        sent
+                    }
+                    resident::SaltOutcome::Survived { index, reads } => {
+                        let best = best_energy(&reads);
+                        let near = target.is_some_and(|target| {
+                            best >= target && best - target <= RERUN_MARGIN_MILLI
+                        });
+                        let queued = if near {
+                            (1..=RERUN_COPIES)
+                                .take_while(|&copy| rerun(index, copy))
+                                .count()
+                        } else {
+                            0
+                        };
+                        if queued == 0 {
+                            sink.push(index, reads)
+                        } else {
+                            tracing::info!(index, best, ?target, queued, "near-miss rerun");
+                            copies += queued as u64;
+                            held.insert(
+                                index,
+                                Held {
+                                    reads,
+                                    best,
+                                    first: best,
+                                    waiting: queued,
+                                    pushed: false,
+                                },
+                            );
+                            Ok(())
+                        }
+                    }
+                    resident::SaltOutcome::Screened {
+                        index,
+                        energy_milli,
+                    } => sink.screen(index, energy_milli),
+                    resident::SaltOutcome::Dropped { index } => {
+                        tracing::debug!(index, "lease salt dropped before reporting");
+                        Ok(())
                     }
                 };
                 if sent.is_err() {
@@ -423,6 +501,39 @@ impl MetalSampler {
             }
         }
         Ok(())
+    }
+
+    /// The stage F prefilter when this lease's salts take it, built on first
+    /// use. The guard holds it for the lease's feed; lease turns feed one
+    /// lease at a time.
+    fn prefilter_for(
+        &self,
+        topology: &quip_solver_core::quip_protocol::lease::TopologyView,
+        params: &SampleParams,
+    ) -> Option<std::sync::MutexGuard<'_, Option<frustration::Prefilter>>> {
+        let settings = *self
+            .cascade
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let chain = cascade::topology_fingerprint(topology.num_nodes, &topology.edges)
+            == cascade::CHAIN_GATES.fingerprint;
+        if !(settings.screen && settings.prefilter && settings.chain_gated(chain, params)) {
+            return None;
+        }
+        let mut guard = self
+            .prefilter
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            match frustration::Prefilter::for_view(&self.device, topology)? {
+                Ok(prefilter) => *guard = Some(prefilter),
+                Err(error) => {
+                    tracing::error!(%error, "prefilter unavailable");
+                    return None;
+                }
+            }
+        }
+        Some(guard)
     }
 
     fn require_runner(&self) -> Result<(), quip_solver_core::SampleError> {
@@ -441,6 +552,34 @@ impl MetalSampler {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = settings;
     }
+}
+
+/// Rerun copies of a near-miss salt, each a 64-read deep run to
+/// [`cascade::ChainGates::full_sweeps`] with its own seed.
+const RERUN_COPIES: u8 = 3;
+
+/// A salt whose short deep run finishes at most this far above the live
+/// target takes the long rerun copies.
+const RERUN_MARGIN_MILLI: i64 = 40_000;
+
+/// A near-miss salt waiting on its rerun copies.
+struct Held {
+    /// The best read set so far.
+    reads: Vec<SamplerResult>,
+    best: i64,
+    /// The salt's own best, before any copy.
+    first: i64,
+    /// Copies that have not answered.
+    waiting: usize,
+    pushed: bool,
+}
+
+fn best_energy(reads: &[SamplerResult]) -> i64 {
+    reads
+        .iter()
+        .map(|read| read.energy_milli)
+        .min()
+        .unwrap_or(i64::MAX)
 }
 
 impl quip_solver_core::Sampler for MetalSampler {
@@ -492,24 +631,27 @@ impl quip_solver_core::Sampler for MetalSampler {
             // The feeder only queues salts, blocking while the intake channel
             // is full, so the runner never waits on this lease's reporting.
             // It hands the turn to the next lease once its last salt is queued.
+            let (rerun_topology, rerun_top10) = (std::sync::Arc::clone(&topology), top10.clone());
             let (fed, feeding, stop) = (&fed, &feeding, &stop);
             let (target, top10, unit_reply) = (live_target.clone(), top10.clone(), reply.clone());
             let topology = std::sync::Arc::clone(&topology);
             scope.spawn(move || {
                 let _done = StoreOnDrop(feeding, false);
-                for index in 0..lease.salt_count() {
-                    if sink.is_stopped() || stop.load(Ordering::Acquire) {
-                        if sink.is_stopped() {
-                            // Still holding the turn; see `lease_round`.
-                            self.lease_round.fetch_add(1, Ordering::AcqRel);
-                        }
-                        return;
+                let stopped = || {
+                    if sink.is_stopped() {
+                        // Still holding the turn; see `lease_round`.
+                        self.lease_round.fetch_add(1, Ordering::AcqRel);
+                        return true;
                     }
+                    stop.load(Ordering::Acquire)
+                };
+                let feed = |index: u64, nonce: [u8; 32]| {
                     let salt = resident::Salt {
                         topology: std::sync::Arc::clone(&topology),
-                        nonce: lease.nonce(index),
+                        nonce,
                         index,
                         round,
+                        rerun: 0,
                         params: params.clone(),
                         stop: std::sync::Arc::clone(stop),
                         target: target.clone(),
@@ -517,15 +659,66 @@ impl quip_solver_core::Sampler for MetalSampler {
                         reply: unit_reply.clone(),
                     };
                     if self.salts_tx.send(salt).is_err() {
-                        return;
+                        return false;
                     }
                     fed.fetch_add(1, Ordering::Release);
+                    true
+                };
+                let mut prefilter = self.prefilter_for(&topology, params);
+                if let Some(prefilter) = prefilter.as_mut().and_then(|guard| guard.as_mut()) {
+                    // A rejected salt answers straight to the sink: it never
+                    // reaches the runner, so it is not counted as fed.
+                    let mut fed_all = true;
+                    let ran = prefilter.run(
+                        0..lease.salt_count(),
+                        |i| lease.nonce(i),
+                        |index, kept| {
+                            fed_all = !stopped()
+                                && if kept {
+                                    feed(index, lease.nonce(index))
+                                } else {
+                                    sink.screen(index, i64::MAX).is_ok()
+                                };
+                            fed_all
+                        },
+                    );
+                    if let Err(error) = ran {
+                        tracing::error!(%error, "prefilter failed; feeding the rest unfiltered");
+                    } else if !fed_all {
+                        return;
+                    } else {
+                        turn.release();
+                        tracing::debug!(turn = turn.id(), "lease fed");
+                        return;
+                    }
+                }
+                drop(prefilter);
+                for index in 0..lease.salt_count() {
+                    if stopped() || !feed(index, lease.nonce(index)) {
+                        return;
+                    }
                 }
                 turn.release();
                 tracing::debug!(turn = turn.id(), "lease fed");
             });
-            drop(reply);
-            let reported = self.report_lease(sink, &outcomes, &live_target, fed, feeding);
+            // A near-miss rerun copy goes straight to the runner: the
+            // prefilter and screen already passed this salt.
+            let rerun = |index: u64, copy: u8| {
+                let salt = resident::Salt {
+                    topology: std::sync::Arc::clone(&rerun_topology),
+                    nonce: lease.nonce(index),
+                    index,
+                    round,
+                    rerun: copy,
+                    params: params.clone(),
+                    stop: std::sync::Arc::clone(stop),
+                    target: live_target.clone(),
+                    top10: rerun_top10.clone(),
+                    reply: reply.clone(),
+                };
+                !stop.load(Ordering::Acquire) && self.salts_tx.send(salt).is_ok()
+            };
+            let reported = self.report_lease(sink, &outcomes, &live_target, fed, feeding, &rerun);
             // Stop the feeder before the scope joins it: queued salts of a
             // stopped lease drain without running.
             stop.store(true, Ordering::Release);

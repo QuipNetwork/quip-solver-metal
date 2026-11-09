@@ -82,9 +82,9 @@ Four workers prepare jobs before admission. The sampler saves controller
 state between streams for the process lifetime.
 
 No configuration turns the cascade off. A leftover `cascade` key logs the
-unknown-field warning. Jobs whose coefficients have no exact device-energy
-form run once at full budget through the batch path after live slots drain.
-Fractional coefficients are one example.
+unknown-field warning. Jobs that are not unit models (couplings and fields
+other than −1, 0, and 1) run once at full budget through the batch path after
+live slots drain. The batch path runs them on the weighted MSA kernel.
 Other kernels and the Apple Neural Engine use separate paths.
 
 | key | default | purpose |
@@ -95,6 +95,9 @@ Other kernels and the Apple Neural Engine use separate paths.
 | `cascade_keep_max` | `30000` | ceiling for the probe-to-full keep |
 | `cascade_audit` | `200` | audit lane denominator |
 | `cascade_yield_per_million` | none | expected nonces per million below target |
+| `cascade_screen` | `true` | screen chain-gated lease salts eight models to a word |
+| `cascade_prefilter` | `true` | reject chain lease salts on the frustration score (stage F) before the screen |
+| `cascade_open_gates` | `false` | keep every job at every checkpoint, for gate measurement only |
 
 These keys enter through `backend_toml`.
 The target energy comes from the session target, not from a key.
@@ -122,13 +125,13 @@ per spin exceeds for Advantage2's 4577 spins, so this port uses 32-bit
 words. See `docs/metal-msa-design.md` for the
 full comparison.
 
-The MSA kernel computes on-device energies for whole coefficients. The host
-rescores 1 job in 1,000 with `energy_milli` to check those energies. Other
-kernels and graphs with fractional coefficients use host rescoring.
-Couplings must be in
-`{-1, 1}` and fields in `{-1, 0, 1}`, which v0.3 problems meet. The CSR
-degree must be at most 20. The miner rejects denser graphs as over capacity
-so the coordinator routes them elsewhere.
+Unit models, with couplings and fields in `{-1, 0, 1}`, run on the unit MSA
+kernel. It computes on-device energies, and the host rescores 1 job in 1,000
+with `energy_milli` to check them. Other models whose coefficients are whole
+milli values run on the weighted MSA kernel, and the host scores every read.
+The weighted kernel holds a local field of at most 268,435,000 milli. The CSR
+degree must be at most 20. The miner rejects any other model as over capacity
+so the coordinator routes it elsewhere.
 
 The 2026-09-15 runs used Apple M4 Max with 40 GPU cores and
 `tests/fixtures/advantage2-system1.edges`, the Advantage2 System 1 working

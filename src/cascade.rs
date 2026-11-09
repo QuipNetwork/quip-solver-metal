@@ -94,10 +94,16 @@ pub(crate) struct CascadeSettings {
     /// Screen chain-gated salts with unit couplings and zero fields through
     /// [`ChainGates::screen`] before their slot stages.
     pub(crate) screen: bool,
+    /// Reject screened lease salts on [`ChainGates::frustration`] first.
+    pub(crate) prefilter: bool,
     /// The job passed the screen: its gated plan starts at
     /// [`ChainGates::deep_from`]. Set per job by preparation, never by
     /// configuration.
     pub(crate) deep: bool,
+    /// The job is a near-miss rerun copy: its final leg takes
+    /// [`ChainGates::full_sweeps`] instead of [`ChainGates::short_sweeps`].
+    /// Set per job by preparation, never by configuration.
+    pub(crate) long: bool,
 }
 
 impl Default for CascadeSettings {
@@ -112,7 +118,9 @@ impl Default for CascadeSettings {
             audit: 200,
             yield_per_million: None,
             screen: true,
+            prefilter: true,
             deep: false,
+            long: false,
         }
     }
 }
@@ -131,21 +139,46 @@ impl Default for CascadeSettings {
 /// nonce-parallel screen takes (`crate::screen`). Each is a new standard
 /// anneal of 4 reads, gated on their best. Measured on the same problems with
 /// `screen::tests::screen_trace` (10 seeds) against 3,000 fresh problems
-/// (2 seeds): the pair keeps 99.1 percent of winner runs and passes 2 of
-/// 6,000 fresh runs.
+/// (2 seeds): the first two keep 99.1 percent of winner runs and pass 2 of
+/// 6,000 fresh runs. The third, at 256 sweeps, is the early bail before a
+/// survivor takes 64 deep reads: its gate keeps 99.4 percent of winner runs
+/// and no fresh run reaches it, for 1/32 of a deep entry's 512 sweeps.
+/// Gates 20 higher keep 99.66 percent of runs on the 529 qblocks won at or
+/// below -14,750, against 98.6 percent, but cut the live salt rate by a fifth
+/// and found fewer results at or below -14,700 per salt in a live A/B.
 pub(crate) struct ChainGates {
     pub(crate) fingerprint: u64,
     pub(crate) stages: &'static [usize],
     pub(crate) gates: &'static [i64],
     pub(crate) min_reads: usize,
-    /// Final budget for a gated job, whatever the job asked for. Few models
-    /// survive the last gate, so a deep final stage costs little.
+    /// Final budget of a gated near-miss rerun copy
+    /// ([`CascadeSettings::long`]), whatever the job asked for. At 1,048,576
+    /// the copies took 240 to 319 s against a median 100 s left in the
+    /// round, and 13 of 16 near-misses on 2026-10-21 ended unfinished.
     pub(crate) full_sweeps: usize,
+    /// Final budget of every other gated job. The plan keeps the gates below
+    /// it. A unit still running when its round ends is dropped, so a final
+    /// pays for its length in rounds it does not finish. On the 510 deep
+    /// traces against each instance's own target, weighted by the chance a
+    /// unit at 8,000 sweeps a second finishes inside qblocks 600 to 705's
+    /// rounds, a 262,144-sweep final expects 155 hits, against 108 at 65,536,
+    /// 153 at 524,288 and 120 at 1,048,576.
+    pub(crate) short_sweeps: usize,
     /// `(sweeps, gate)` of each screen stage.
     pub(crate) screen: &'static [(usize, i64)],
     /// First slot stage of a job that passed the screen.
     pub(crate) deep_from: usize,
+    /// Stage F gate on [`crate::frustration::score`]: a lease salt scoring
+    /// above it is rejected before the screen. Set at the 1st percentile of
+    /// 100,000 random lease models, where it rejects 3 of the 529 qblocks
+    /// won at or below -14,750 (highest winner score 20,050.14). The 0.5th
+    /// percentile, 20,038.02, ran 7.5 percent more salts per second in a live
+    /// A/B but found no more results at or below -14,650 per hour.
+    pub(crate) frustration: f64,
 }
+
+/// Screen stages of [`CHAIN_GATES`].
+pub(crate) const SCREEN_STAGES: usize = CHAIN_GATES.screen.len();
 
 pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
     fingerprint: 0x38cd_e7d7_931d_f32f,
@@ -171,10 +204,35 @@ pub(crate) const CHAIN_GATES: ChainGates = ChainGates {
         -14_704_000,
     ],
     min_reads: 64,
-    full_sweeps: 1_048_576,
-    screen: &[(16, -13_614_000), (128, -14_274_000)],
+    full_sweeps: 262_144,
+    short_sweeps: 262_144,
+    screen: &[(16, -13_614_000), (128, -14_274_000), (256, -14_390_000)],
     deep_from: 4,
+    frustration: 20_045.33,
 };
+
+impl ChainGates {
+    /// The final budget of a gated job.
+    pub(crate) fn final_sweeps(&self, long: bool) -> usize {
+        if long {
+            self.full_sweeps
+        } else {
+            self.short_sweeps
+        }
+    }
+
+    /// Schedule length of the longest gated plan, a long job from stage 0:
+    /// the continuing legs through [`REHEAT_THROUGH`], each fresh gated leg
+    /// below [`Self::full_sweeps`], and the final leg.
+    pub(crate) fn long_schedule_len(&self) -> usize {
+        self.stages
+            .iter()
+            .filter(|&&s| s > REHEAT_THROUGH && s < self.full_sweeps)
+            .sum::<usize>()
+            + REHEAT_THROUGH
+            + self.full_sweeps
+    }
+}
 
 /// FNV-1a over the node count and the sorted, normalized edge list, so edge
 /// order and orientation do not change the result.
@@ -235,6 +293,7 @@ pub(crate) struct CascadeToml {
     pub(crate) cascade_audit: Option<u32>,
     pub(crate) cascade_yield_per_million: Option<f64>,
     pub(crate) cascade_screen: Option<bool>,
+    pub(crate) cascade_prefilter: Option<bool>,
 }
 
 impl CascadeSettings {
@@ -259,6 +318,9 @@ impl CascadeSettings {
         }
         if let Some(screen) = cfg.cascade_screen {
             self.screen = screen;
+        }
+        if let Some(prefilter) = cfg.cascade_prefilter {
+            self.prefilter = prefilter;
         }
         let keep = cfg.cascade_keep.map_or(self.keep, f64::from);
         let min = cfg.cascade_keep_min.map_or(self.keep_min, f64::from);
@@ -375,7 +437,7 @@ pub(crate) struct Stats {
     pub(crate) models: u64,
     pub(crate) levels: [Option<LevelStats>; MAX_STAGES],
     /// Screen stages, reported before the slot checkpoints.
-    pub(crate) screen: [Option<LevelStats>; 2],
+    pub(crate) screen: [Option<LevelStats>; SCREEN_STAGES],
 }
 
 impl Stats {
@@ -384,7 +446,7 @@ impl Stats {
             started: now,
             models: 0,
             levels: [None; MAX_STAGES],
-            screen: [None; 2],
+            screen: [None; SCREEN_STAGES],
         }
     }
 
