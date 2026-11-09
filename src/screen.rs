@@ -741,7 +741,11 @@ mod tests {
             let mut bank =
                 ScreenBank::new(&device, &topology, 2, &[&schedule], Some(&draw)).unwrap();
             let nonces: Vec<[u8; 32]> = (0..11u8)
-                .map(|k| std::array::from_fn(|i| k.wrapping_mul(37).wrapping_add(i as u8 * 11)))
+                .map(|k| {
+                    std::array::from_fn(|i| {
+                        k.wrapping_mul(37).wrapping_add((i as u8).wrapping_mul(11))
+                    })
+                })
                 .collect();
             let keys: Vec<Vec<u32>> = nonces.iter().map(|&nonce| key_words(nonce)).collect();
             let rows: Vec<&[u32]> = keys.iter().map(Vec::as_slice).collect();
