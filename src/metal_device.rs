@@ -79,6 +79,9 @@ pub struct MetalDevice {
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
     pub(crate) msa: ComputePipelineState,
+    /// `msa` for weighted models: milli `int` coefficients and host-built
+    /// Metropolis threshold rows at slot 25.
+    pub(crate) msa_weighted: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -134,6 +137,7 @@ impl MetalDevice {
         let gibbs_parallel_wide =
             compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
+        let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let queue = device.new_command_queue();
@@ -149,6 +153,7 @@ impl MetalDevice {
             gibbs_parallel,
             gibbs_parallel_wide,
             msa,
+            msa_weighted,
             msa_slots,
             msa_screen,
             topology_cache: crate::sampler::TopologyCache::default(),
@@ -248,6 +253,7 @@ mod tests {
         assert_eq!(crate::wide_tables::WIDE_ROW, 2048);
         assert!(SA_SRC.contains("#define WIDE_ROW 2048"));
         assert!(GIBBS_SRC.contains("#define WIDE_ROW 2048"));
+        assert!(MSA_SRC.contains("#define WIDE_ROW       2048"));
     }
 
     #[test]
@@ -261,6 +267,7 @@ mod tests {
             ("sa_wide", &dev.sa_wide),
             ("gibbs_wide", &dev.gibbs_wide),
             ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
+            ("msa_weighted", &dev.msa_weighted),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");

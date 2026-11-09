@@ -24,9 +24,10 @@ pub(crate) const WIDE_MAX_FIELD_MILLI: u32 = 268_435_000;
 /// The coefficient representation a model needs for exact execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Representation {
-    /// Today's `int8_t` kernels, whole units.
+    /// Today's `int8_t` kernels, whole units. For MSA, the unit kernel.
     Int8,
-    /// Reserved for the `QUIP_WIDE` kernels, `int` milli units.
+    /// `int` milli units: the `QUIP_WIDE` SA and Gibbs builds, or
+    /// `msa_anneal_weighted`.
     Wide,
 }
 
@@ -90,6 +91,31 @@ pub(crate) fn classify(graph: &IsingGraph) -> Result<Representation, String> {
     }
     let whole_units = graph.h.iter().chain(&graph.j).all(|v| v.fract() == 0.0);
     if whole_units && max_field <= i64::from(INT8_MAX_FIELD_MILLI) {
+        Ok(Representation::Int8)
+    } else {
+        Ok(Representation::Wide)
+    }
+}
+
+/// Sort `graph` onto an MSA path, or say why neither runs it exactly.
+///
+/// [`Representation::Int8`] selects the unit kernel, which reads every `h`
+/// and `J` by sign and never sees its magnitude. [`Representation::Wide`]
+/// selects `msa_anneal_weighted`, which holds milli `int` coefficients under
+/// the same local-field bound as the wide SA kernel. The degree bound is
+/// checked separately, on the CSR, by `sampler::validate_batch`.
+///
+/// # Errors
+///
+/// The same refusals as [`classify`]: a self-loop, a coupling count that
+/// differs from the edge count, a value off the milli grid, or a local
+/// field past [`WIDE_MAX_FIELD_MILLI`].
+pub(crate) fn classify_msa(graph: &IsingGraph) -> Result<Representation, String> {
+    // The generic refusals come first; its Int8/Wide split is SA's, not MSA's.
+    classify(graph)?;
+    // `-0.0 == 0.0`, so a negative zero is unit like any zero.
+    let unit = |v: &f64| *v == -1.0 || *v == 0.0 || *v == 1.0;
+    if graph.h.iter().chain(&graph.j).all(unit) {
         Ok(Representation::Int8)
     } else {
         Ok(Representation::Wide)
@@ -179,6 +205,60 @@ mod tests {
     fn self_loop_is_refused_before_coefficient_conversion() {
         let graph = IsingGraph::new(vec![0.0], vec![0.0005], vec![(0, 0)]);
         let err = classify(&graph).unwrap_err();
+        assert!(err.contains("self-loop"), "{err}");
+    }
+
+    #[test]
+    fn msa_runs_unit_models_on_the_unit_kernel() {
+        assert_eq!(
+            classify_msa(&pair([1.0, -1.0], -1.0)),
+            Ok(Representation::Int8)
+        );
+        assert_eq!(
+            classify_msa(&pair([0.0, 0.0], 1.0)),
+            Ok(Representation::Int8)
+        );
+        // A zero coupling is no bond, which the unit kernel skips exactly.
+        assert_eq!(
+            classify_msa(&pair([1.0, 0.0], 0.0)),
+            Ok(Representation::Int8)
+        );
+        assert_eq!(
+            classify_msa(&pair([-0.0, 0.0], -1.0)),
+            Ok(Representation::Int8)
+        );
+    }
+
+    #[test]
+    fn msa_runs_other_whole_and_milli_models_weighted() {
+        // Whole units the int8 SA path takes, but not unit: the unit kernel
+        // would anneal them by sign.
+        assert_eq!(
+            classify_msa(&pair([0.0, 0.0], 2.0)),
+            Ok(Representation::Wide)
+        );
+        assert_eq!(
+            classify_msa(&pair([3.0, 0.0], 1.0)),
+            Ok(Representation::Wide)
+        );
+        assert_eq!(
+            classify_msa(&pair([0.25, -0.5], 0.001)),
+            Ok(Representation::Wide)
+        );
+        assert_eq!(
+            classify_msa(&pair([0.0, 0.0], 1000.0)),
+            Ok(Representation::Wide)
+        );
+    }
+
+    #[test]
+    fn msa_refuses_what_no_path_represents() {
+        classify_msa(&pair([0.0005, 0.0], 1.0)).unwrap_err();
+        classify_msa(&pair([f64::NAN, 0.0], 1.0)).unwrap_err();
+        let limit_units = f64::from(WIDE_MAX_FIELD_MILLI) / 1000.0;
+        classify_msa(&pair([limit_units, 0.0], 1.0)).unwrap_err();
+        let looped = IsingGraph::new(vec![0.0], vec![1.0], vec![(0, 0)]);
+        let err = classify_msa(&looped).unwrap_err();
         assert!(err.contains("self-loop"), "{err}");
     }
 }

@@ -148,23 +148,13 @@ const _: () = assert!(
 );
 
 /// Features every kernel advertises: a real `sample_stream` override, the
-/// IOKit governor, and a host-built ladder that honours
-/// `SampleParams::schedule`.
-const FEATURES: &[&str] = &[
-    "streaming",
-    "governor",
-    quip_solver_core::LINEAR_SCHEDULE_FEATURE,
-];
-
-/// One unit, in milli. MSA truncates each coefficient to an `int8` of whole
-/// units (`topology::quantize_i8`), so only whole units are exact.
-const UNIT_MILLI: u32 = 1000;
-
-/// Features SA and Gibbs advertise: [`FEATURES`] plus the exact coefficient
-/// refusal. Each model runs on the int8 or the wide integer kernel, whichever
-/// represents it exactly (`representation::classify`), and any other model is
+/// IOKit governor, a host-built ladder that honours `SampleParams::schedule`,
+/// and the exact coefficient refusal. Each SA or Gibbs model runs on the int8
+/// or the wide integer kernel, whichever represents it exactly
+/// (`representation::classify`); each MSA model runs on the unit or the
+/// weighted kernel (`representation::classify_msa`). Any other model is
 /// refused.
-const EXACT_FEATURES: &[&str] = &[
+const FEATURES: &[&str] = &[
     "streaming",
     "governor",
     quip_solver_core::LINEAR_SCHEDULE_FEATURE,
@@ -182,18 +172,14 @@ pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::Mod
 /// Gibbs's model limits, the same wide bound as [`METAL_SA_LIMITS`].
 pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = METAL_SA_LIMITS;
 
-/// MSA's model limits, on the GPU and the ANE alike. Both unroll
-/// `sampler::MSA_MAX_DEG` neighbours, which caps the degree, and the field
-/// limit is one unit per neighbour plus one for the bias. Like every
-/// `ModelLimits`, these are checked on the model as received. Both MSA engines
-/// anneal on signs only, so a model inside these limits with a coefficient
-/// above one unit in magnitude runs as its sign model, with only its energies
-/// rescored. `ModelLimits` cannot state a ±1-only contract yet (QUI-1832);
-/// refusing such a model is QUI-1642.
+/// MSA's model limits. Both GPU kernels and the ANE unroll
+/// `sampler::MSA_MAX_DEG` neighbours, which caps the degree. Unit models run
+/// on the unit kernel (or the ANE); any other milli-exact model runs on the
+/// weighted kernel, whose field bound is the wide SA path's.
 pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
     max_degree: Some(crate::sampler::MSA_MAX_DEG as u32),
-    max_local_field_milli: Some((crate::sampler::MSA_MAX_DEG as u32 + 1) * UNIT_MILLI),
-    exact_resolution_milli: Some(UNIT_MILLI),
+    max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
+    exact_resolution_milli: Some(1),
 };
 
 /// Backend identity for `quip-metal-sa`.
@@ -218,7 +204,7 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    features: EXACT_FEATURES,
+    features: FEATURES,
     adapt: METAL_ADAPT,
     limits: METAL_SA_LIMITS,
 };
@@ -242,7 +228,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
     max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,
-    features: EXACT_FEATURES,
+    features: FEATURES,
     adapt: METAL_ADAPT,
     limits: METAL_GIBBS_LIMITS,
 };
@@ -843,7 +829,7 @@ mod tests {
     }
 
     /// Every identity lists `linear-schedule` and states its node cap and
-    /// model limits, and only SA and Gibbs claim exact coefficients.
+    /// model limits, and claims exact coefficients.
     /// Device-free, like `--capabilities`.
     #[test]
     fn identities_advertise_linear_schedule_and_their_limits() {
@@ -856,13 +842,12 @@ mod tests {
         };
         let msa = ModelLimits {
             max_degree: Some(20),
-            max_local_field_milli: Some(21_000),
-            exact_resolution_milli: Some(1000),
+            ..wide
         };
-        for (identity, nodes, limits, exact) in [
-            (&METAL_SA_IDENTITY, 4593, wide, true),
-            (&METAL_GIBBS_IDENTITY, 4800, wide, true),
-            (&METAL_MSA_IDENTITY, 6016, msa, false),
+        for (identity, nodes, limits) in [
+            (&METAL_SA_IDENTITY, 4593, wide),
+            (&METAL_GIBBS_IDENTITY, 4800, wide),
+            (&METAL_MSA_IDENTITY, 6016, msa),
         ] {
             let algorithm = identity.algorithm;
             assert!(
@@ -871,11 +856,10 @@ mod tests {
                     .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE),
                 "{algorithm:?}"
             );
-            assert_eq!(
+            assert!(
                 identity
                     .features
                     .contains(&quip_solver_core::EXACT_COEFFICIENTS_FEATURE),
-                exact,
                 "{algorithm:?}"
             );
             assert_eq!(identity.max_nodes, nodes, "{algorithm:?}");

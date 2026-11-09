@@ -41,7 +41,7 @@ pub enum Kernel {
     Gibbs,
 }
 
-use crate::representation::{classify, Representation};
+use crate::representation::{classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
@@ -163,6 +163,9 @@ const WIDE_SA_COST_FACTOR: f64 = 1.4;
 /// Wide Gibbs work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-10-11-wide-path.md`.
 const WIDE_GIBBS_COST_FACTOR: f64 = 2.0;
+/// Weighted MSA work per word update for chunk sizing, measured in
+/// `docs/perf/2026-11-09-weighted-msa.md`.
+const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -1011,10 +1014,11 @@ fn batch_representation(
     let mut shared = None;
     for graph in graphs {
         let rep = if kernel == Kernel::Msa {
-            Representation::Int8
+            classify_msa(graph)
         } else {
-            classify(graph).map_err(SampleError::TooLarge)?
-        };
+            classify(graph)
+        }
+        .map_err(SampleError::TooLarge)?;
         if shared.is_some_and(|prev| prev != rep) {
             return Err(SampleError::Driver(
                 "a batch mixes int8 and wide models".into(),
@@ -1122,10 +1126,17 @@ fn upload_inputs(
                 all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
                 all_h[p * n..p * n + h_milli.len()].copy_from_slice(&h_milli);
             }
-            (
-                device.new_buffer_from_slice(&all_j),
-                device.new_buffer_from_slice(&all_h),
-            )
+            if kernel == Kernel::Msa {
+                (
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+                )
+            } else {
+                (
+                    device.new_buffer_from_slice(&all_j),
+                    device.new_buffer_from_slice(&all_h),
+                )
+            }
         }
         Representation::Int8 => {
             let mut all_j = vec![0i8; num_problems * nnz_alloc];
@@ -1372,11 +1383,10 @@ fn encode_batch_inner(
                 beta.len()
             )));
         }
-        // MSA always has Int8 representation, so only SA and Gibbs enter here.
         let (index, rows) = match kernel {
             Kernel::Sa => (22, crate::wide_tables::metropolis_rows(&beta, params.seed)),
             Kernel::Gibbs => (25, crate::wide_tables::heat_bath_rows(&beta, params.seed)),
-            Kernel::Msa => unreachable!("MSA cannot use the wide representation"),
+            Kernel::Msa => (25, crate::wide_tables::metropolis_rows(&beta, params.seed)),
         };
         Some((index, device.new_buffer_from_slice(&rows)))
     } else {
@@ -1389,6 +1399,7 @@ fn encode_batch_inner(
     let pipeline = match kernel {
         Kernel::Sa if wide => &device.sa_wide,
         Kernel::Sa => &device.sa,
+        Kernel::Msa if wide => &device.msa_weighted,
         Kernel::Msa => &device.msa,
         Kernel::Gibbs if node_parallel && wide => &device.gibbs_parallel_wide,
         Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
@@ -1480,7 +1491,7 @@ fn encode_batch_inner(
         match kernel {
             Kernel::Sa => WIDE_SA_COST_FACTOR,
             Kernel::Gibbs => WIDE_GIBBS_COST_FACTOR,
-            Kernel::Msa => 1.0,
+            Kernel::Msa => WEIGHTED_MSA_COST_FACTOR,
         }
     } else {
         1.0
@@ -1556,7 +1567,10 @@ fn encode_batch_inner(
     let colors = cached.colors.clone();
     let num_colors = cached.topo.colors.num_colors;
     Ok(EncodedBatch {
-        device_energy: kernel == Kernel::Msa && graphs.iter().all(|g| device_energy_exact(g)),
+        // The weighted entry leaves energies to the host.
+        device_energy: kernel == Kernel::Msa
+            && !wide
+            && graphs.iter().all(|g| device_energy_exact(g)),
         cmds: Vec::with_capacity(plan.len()),
         d_samples: out.samples.clone(),
         n,

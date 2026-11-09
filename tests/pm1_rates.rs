@@ -9,7 +9,8 @@
 //! ```
 //!
 //! `QUIP_PM1_SCALE=wide` multiplies every coefficient by 1.5 so the same jobs
-//! run on the wide path, for the cost factor in `sampler.rs`.
+//! run on the wide SA and Gibbs paths and the weighted MSA path, for the cost
+//! factors in `sampler.rs`.
 
 use std::io::{self, Write};
 use std::time::Instant;
@@ -82,7 +83,7 @@ fn pm1_rates() {
         1.0
     };
     let edges = edges();
-    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
         let params = SampleParams {
             num_reads: 64,
             num_sweeps: 4096,

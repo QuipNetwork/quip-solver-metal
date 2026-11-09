@@ -70,7 +70,7 @@ fn a_quarter_unit_qubo_reaches_the_brute_force_minimum() {
     let Some(dev) = device() else { return };
     let graph = quarter_qubo();
     let want = brute_force_min(&graph);
-    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
         assert_eq!(best(&dev, &graph, kernel, 2000), want, "{kernel:?}");
     }
 }
@@ -83,13 +83,19 @@ fn large_and_wide_range_coefficients_are_solved_or_refused() {
         vec![5000.0, -0.002],
         vec![(0, 1), (1, 2)],
     );
-    assert_eq!(
-        best(&dev, &solved, Kernel::Sa, 500),
-        brute_force_min(&solved)
-    );
     let too_wide = IsingGraph::new(vec![0.0, 0.0], vec![300_000.0], vec![(0, 1)]);
-    let err = sample_ising(&dev, &too_wide, &params(16), Kernel::Sa).unwrap_err();
-    assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+    for kernel in [Kernel::Sa, Kernel::Msa] {
+        assert_eq!(
+            best(&dev, &solved, kernel, 500),
+            brute_force_min(&solved),
+            "{kernel:?}"
+        );
+        let err = sample_ising(&dev, &too_wide, &params(16), kernel).unwrap_err();
+        assert!(
+            matches!(err, SampleError::TooLarge(_)),
+            "{kernel:?}: {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -107,6 +113,13 @@ fn complete_graphs_at_16_64_65_and_200_nodes_report_exact_energies() {
         // best() asserts reported == recomputed for every read.
         best(&dev, &graph, Kernel::Sa, 64);
         best(&dev, &graph, Kernel::Gibbs, 64);
+        // MSA unrolls 20 neighbours: K_16 runs, denser graphs are capacity.
+        if n - 1 <= 20 {
+            best(&dev, &graph, Kernel::Msa, 64);
+        } else {
+            let err = sample_ising(&dev, &graph, &params(64), Kernel::Msa).unwrap_err();
+            assert!(matches!(err, SampleError::TooLarge(_)), "K_{n}: {err:?}");
+        }
     }
 }
 
@@ -116,11 +129,13 @@ fn the_same_topology_at_1x_and_1000x_reaches_scaled_ground_states() {
     let n = 64;
     let edges: Vec<(usize, usize)> = (0..n).map(|v| (v, (v + 1) % n)).collect();
     let ring = |scale: f64| IsingGraph::new(vec![-scale; n], vec![-scale; n], edges.clone());
-    let one = best(&dev, &ring(1.0), Kernel::Sa, 2000);
-    let thousand = best(&dev, &ring(1000.0), Kernel::Sa, 2000);
-    assert_eq!(one, -128_000);
-    assert_eq!(thousand, -128_000_000);
-    assert_eq!(thousand, 1000 * one);
+    // At 1x MSA takes the unit kernel; at 1000x, the weighted one.
+    for kernel in [Kernel::Sa, Kernel::Msa] {
+        let one = best(&dev, &ring(1.0), kernel, 2000);
+        let thousand = best(&dev, &ring(1000.0), kernel, 2000);
+        assert_eq!(one, -128_000, "{kernel:?}");
+        assert_eq!(thousand, -128_000_000, "{kernel:?}");
+    }
 }
 
 #[test]
@@ -130,7 +145,7 @@ fn a_non_representable_model_is_refused_as_capacity() {
         IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]),
         IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]),
     ] {
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let err = sample_ising(&dev, &graph, &params(16), kernel).unwrap_err();
             assert!(
                 matches!(err, SampleError::TooLarge(_)),
@@ -141,11 +156,11 @@ fn a_non_representable_model_is_refused_as_capacity() {
 }
 
 #[test]
-fn sa_and_gibbs_refuse_self_loops_for_int8_and_milli_models() {
+fn every_kernel_refuses_self_loops_for_unit_and_milli_models() {
     let Some(dev) = device() else { return };
     for j in [1.0, 0.5] {
         let graph = IsingGraph::new(vec![0.0], vec![j], vec![(0, 0)]);
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let err = sample_ising(&dev, &graph, &params(16), kernel).unwrap_err();
             assert!(
                 matches!(&err, SampleError::TooLarge(message) if message.contains("self-loop")),
@@ -159,7 +174,25 @@ fn sa_and_gibbs_refuse_self_loops_for_int8_and_milli_models() {
 fn the_wide_path_repeats_exactly_for_a_fixed_seed() {
     let Some(dev) = device() else { return };
     let graph = quarter_qubo();
-    let a = sample_ising(&dev, &graph, &params(300), Kernel::Sa).unwrap();
-    let b = sample_ising(&dev, &graph, &params(300), Kernel::Sa).unwrap();
-    assert_eq!(a, b);
+    for kernel in [Kernel::Sa, Kernel::Msa] {
+        let a = sample_ising(&dev, &graph, &params(300), kernel).unwrap();
+        let b = sample_ising(&dev, &graph, &params(300), kernel).unwrap();
+        assert_eq!(a, b, "{kernel:?}");
+    }
+}
+
+/// A whole-unit model whose sign model has a different ground state: the
+/// weight-3 bond must win over two unit bonds. The unit kernel, reading signs
+/// only, would settle the frustrated triangle anywhere.
+#[test]
+fn msa_anneals_weights_not_signs() {
+    let Some(dev) = device() else { return };
+    let triangle = IsingGraph::new(
+        vec![0.0; 3],
+        vec![3.0, -1.0, -1.0],
+        vec![(0, 1), (1, 2), (0, 2)],
+    );
+    let want = brute_force_min(&triangle);
+    let reads = sample_ising(&dev, &triangle, &params(500), Kernel::Msa).unwrap();
+    assert!(reads.iter().all(|r| r.energy_milli == want), "{reads:?}");
 }

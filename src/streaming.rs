@@ -254,16 +254,24 @@ struct BatchKey<'a> {
     schedule: quip_solver_core::BetaSchedule,
 }
 
+/// The coefficient path `kernel` runs `job` on, or `None` when it refuses it.
+fn representation(
+    job: &StreamJob,
+    kernel: Kernel,
+) -> Option<crate::representation::Representation> {
+    if kernel == Kernel::Msa {
+        crate::representation::classify_msa(&job.graph).ok()
+    } else {
+        crate::representation::classify(&job.graph).ok()
+    }
+}
+
 impl<'a> BatchKey<'a> {
     fn from_job(job: &'a StreamJob, kernel: Kernel) -> Self {
         Self {
             watermark: job.watermark,
             n: job.graph.h.len(),
-            representation: if kernel == Kernel::Msa {
-                None
-            } else {
-                crate::representation::classify(&job.graph).ok()
-            },
+            representation: representation(job, kernel),
             edges: &job.graph.edges,
             num_reads: job.params.num_reads.clamp(1, sampler::MAX_READS),
             num_sweeps: job.params.num_sweeps,
@@ -281,8 +289,7 @@ impl<'a> BatchKey<'a> {
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
             && self.schedule == job.params.schedule
-            && (kernel == Kernel::Msa
-                || self.representation == crate::representation::classify(&job.graph).ok())
+            && self.representation == representation(job, kernel)
             && self.edges == &*job.graph.edges
     }
 }
@@ -1056,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_key_groups_msa_jobs_with_different_coefficients() {
+    fn batch_key_groups_msa_jobs_by_path_not_by_coefficients() {
         let ring = |j: f64| {
             IsingGraph::new(
                 vec![0.0; 4],
@@ -1064,9 +1071,17 @@ mod tests {
                 vec![(0, 1), (1, 2), (2, 3), (3, 0)],
             )
         };
-        let first = job(b"first", ring(1.0), 16, 64, 1);
-        let second = job(b"second", ring(0.5), 16, 64, 1);
-        assert!(BatchKey::from_job(&first, Kernel::Msa).matches(&second, Kernel::Msa));
+        let unit = |name: &[u8], j: f64| job(name, ring(j), 16, 64, 1);
+        fn key(j: &StreamJob) -> BatchKey<'_> {
+            BatchKey::from_job(j, Kernel::Msa)
+        }
+        // Unit jobs of different signs share the unit kernel, and weighted
+        // jobs of different weights share the weighted one.
+        assert!(key(&unit(b"a", 1.0)).matches(&unit(b"b", -1.0), Kernel::Msa));
+        assert!(key(&unit(b"c", 0.5)).matches(&unit(b"d", 2.0), Kernel::Msa));
+        // A whole-unit weight of 2 is int8 for SA but weighted for MSA.
+        assert!(!key(&unit(b"e", 1.0)).matches(&unit(b"f", 2.0), Kernel::Msa));
+        assert!(!key(&unit(b"g", 1.0)).matches(&unit(b"h", 0.5), Kernel::Msa));
     }
 
     #[test]

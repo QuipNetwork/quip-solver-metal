@@ -299,7 +299,7 @@ fn capabilities_and_version_and_check() {
     // Per binary: algorithm, node cap, and the advertised model limits.
     for (bin, algo, nodes, degree, field, resolution) in [
         ("quip-metal-sa", "sa", 4593, 0, 268_435_000, 1),
-        ("quip-metal-msa", "msa", 6016, 20, 21_000, 1000),
+        ("quip-metal-msa", "msa", 6016, 20, 268_435_000, 1),
         ("quip-metal-gibbs", "gibbs", 4800, 0, 268_435_000, 1),
     ] {
         let path = profile_bin(bin);
@@ -315,12 +315,14 @@ fn capabilities_and_version_and_check() {
         assert!(s.contains("\"protocolVersion\":2"), "{bin}: {s}");
         assert!(s.contains("\"ISING_GENERATE\""), "{bin}: {s}");
         let caps: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert!(
-            caps["features"]
-                .as_array()
-                .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
-            "{bin}: {caps}"
-        );
+        for feature in ["linear-schedule", "exact-coefficients"] {
+            assert!(
+                caps["features"]
+                    .as_array()
+                    .is_some_and(|f| f.iter().any(|f| f == feature)),
+                "{bin} lacks {feature}: {caps}"
+            );
+        }
         assert_eq!(caps["maxNodes"], nodes, "{bin}: {caps}");
         assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
         assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");

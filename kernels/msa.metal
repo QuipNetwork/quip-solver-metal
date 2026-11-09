@@ -24,9 +24,12 @@ using namespace metal;
 //   persistent spin and RNG buffers.
 // - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
-// The host checks CSR degree <= MSA_MAX_DEG. The kernel uses only the sign
-// of each J and h, so a coefficient above one unit anneals as its sign; the
-// host does not refuse such a model yet (QUI-1642).
+// The host checks CSR degree <= MSA_MAX_DEG. The unit entries read each J and
+// h by sign, and the host sends them unit models only (J and h in {-1, 0, 1}).
+// `msa_anneal_weighted` reads milli `int` coefficients and accepts each flip
+// against a host-built integer threshold row (`wide_tables::metropolis_rows`),
+// so it holds any model whose local fields fit `WIDE_MAX_FIELD_MILLI`; the
+// host scores its energies.
 // The batch entry writes each read's energy on the last chunk;
 // slot steps write it at flagged checkpoints, in milli units to final_energies.
 // The value equals energy_milli whenever every
@@ -38,6 +41,9 @@ using namespace metal;
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
 #define MSA_MAX_DEG    20
+// Threshold entries per rung for the weighted entry. Must equal
+// `wide_tables::WIDE_ROW`.
+#define WIDE_ROW       2048
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
@@ -188,6 +194,15 @@ struct ScreenCouplings {
     }
 };
 
+// One model per word with milli `int` couplings and fields, plus the
+// batch's Metropolis threshold rows: one row of WIDE_ROW milli thresholds
+// per rung, accepting an uphill change `de` when `de <= entry`.
+struct WeightedCouplings {
+    device const int* j;
+    device const int* h;
+    device const int* rows;
+};
+
 // Per-lane energy in milli of the spin words in `state` for the nodes this
 // thread owns (var = tid, tid + gsz, ...). h*spin*1000 per node plus one
 // directed CSR half-edge J*si*sj*500 per slot; a self-loop is stored once,
@@ -277,6 +292,121 @@ inline void lane_energies(
     }
 }
 
+// Weighted energies can pass `int` range (fields reach WIDE_MAX_FIELD_MILLI
+// per node), so the host scores every weighted read and never reads these.
+inline void lane_energies(
+    thread int* ener,
+    threadgroup const uint* state,
+    device const int* row_ptr,
+    device const int* col_ind,
+    WeightedCouplings couplings,
+    int n, uint tid, uint gsz
+) {
+    for (int r = 0; r < MSA_LANES; ++r) {
+        ener[r] = 0;
+    }
+}
+
+// Lanes of `var`'s word that flip this update. The unit overload counts
+// satisfied bonds bit-sliced and compares the count with a geometric draw.
+template <typename Couplings>
+inline uint flip_mask(
+    Couplings couplings,
+    device const int* my_csr_row_ptr,
+    device const int* my_csr_col_ind,
+    threadgroup const uint* state,
+    int var, int beta_idx, float two_beta,
+    thread RngState& rng
+) {
+    int pstart = my_csr_row_ptr[var];
+    int pend = my_csr_row_ptr[var + 1];
+    int h = couplings.field(var);
+
+    // Prefetch every neighbour index and coupling before
+    // touching threadgroup memory. Slots past the degree read
+    // node 0 with a zero coupling and contribute nothing.
+    int nb[MSA_MAX_DEG];
+    uint neg[MSA_MAX_DEG];
+    bool nz[MSA_MAX_DEG];
+    #pragma unroll
+    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        int p = pstart + q;
+        bool ok = p < pend;
+        Bond bond = ok ? couplings.bond(p) : Bond{0u, false};
+        nb[q] = ok ? my_csr_col_ind[p] : 0;
+        neg[q] = bond.neg;
+        nz[q] = bond.nonzero;
+    }
+
+    uint bi = state[var];
+    uint x[MSA_MAX_DEG + 1];
+    int d = 0;
+    #pragma unroll
+    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        uint sj = state[nb[q]];
+        // Set on the replicas where bond q is satisfied.
+        uint l = neg[q] ^ bi ^ sj;
+        x[q] = nz[q] ? l : 0u;
+        d += int(nz[q]);
+    }
+    // A field is one more bond to a spin pinned at +1.
+    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
+    d += (h != 0);
+
+    uint planes[MSA_PLANES];
+    popcount21(x, planes);
+
+    // Metropolis: flip where L <= (d + M) / 2.
+    int m = geometric_draw(xoshiro128starstar(rng), two_beta);
+    int limit = (d + m) >> 1;
+    return (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
+}
+
+// The weighted overload sums each lane's local field in milli and flips where
+// the energy change `de = -2 s field` is at most one threshold drawn from the
+// rung's row, shared by the word's 32 lanes as the unit draw is. Every entry
+// is non-negative, so a downhill or level move always flips. The host bounds
+// each field by WIDE_MAX_FIELD_MILLI, so `2 * field` stays inside `int`.
+inline uint flip_mask(
+    WeightedCouplings couplings,
+    device const int* my_csr_row_ptr,
+    device const int* my_csr_col_ind,
+    threadgroup const uint* state,
+    int var, int beta_idx, float two_beta,
+    thread RngState& rng
+) {
+    int pstart = my_csr_row_ptr[var];
+    int pend = my_csr_row_ptr[var + 1];
+    int h = couplings.h[var];
+
+    int jj[MSA_MAX_DEG];
+    uint sw[MSA_MAX_DEG];
+    #pragma unroll
+    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        int p = pstart + q;
+        bool ok = p < pend;
+        jj[q] = ok ? couplings.j[p] : 0;
+        sw[q] = state[ok ? my_csr_col_ind[p] : 0];
+    }
+    uint bi = state[var];
+
+    uint draw = xoshiro128starstar(rng) & uint(WIDE_ROW - 1);
+    int threshold = couplings.rows[uint(beta_idx) * uint(WIDE_ROW) + draw];
+
+    uint accept = 0u;
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        int field = h;
+        #pragma unroll
+        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+            // Spin bit 1 is -1. Missing neighbours have J = 0.
+            field += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
+        }
+        int de = ((bi >> uint(lane)) & 1u) ? 2 * field : -2 * field;
+        accept |= uint(de <= threshold) << uint(lane);
+    }
+    return accept;
+}
+
 // ==============================================================================
 // Kernel
 // ==============================================================================
@@ -356,49 +486,9 @@ static inline void msa_body(
 
                 for (uint k = tid; k < uint(block_count); k += gsz) {
                     int var = color_node_indices[block_start + int(k)];
-                    int pstart = my_csr_row_ptr[var];
-                    int pend = my_csr_row_ptr[var + 1];
-                    int h = couplings.field(var);
-
-                    // Prefetch every neighbour index and coupling before
-                    // touching threadgroup memory. Slots past the degree read
-                    // node 0 with a zero coupling and contribute nothing.
-                    int nb[MSA_MAX_DEG];
-                    uint neg[MSA_MAX_DEG];
-                    bool nz[MSA_MAX_DEG];
-                    #pragma unroll
-                    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                        int p = pstart + q;
-                        bool ok = p < pend;
-                        Bond bond = ok ? couplings.bond(p) : Bond{0u, false};
-                        nb[q] = ok ? my_csr_col_ind[p] : 0;
-                        neg[q] = bond.neg;
-                        nz[q] = bond.nonzero;
-                    }
-
-                    uint bi = state[var];
-                    uint x[MSA_MAX_DEG + 1];
-                    int d = 0;
-                    #pragma unroll
-                    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                        uint sj = state[nb[q]];
-                        // Set on the replicas where bond q is satisfied.
-                        uint l = neg[q] ^ bi ^ sj;
-                        x[q] = nz[q] ? l : 0u;
-                        d += int(nz[q]);
-                    }
-                    // A field is one more bond to a spin pinned at +1.
-                    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
-                    d += (h != 0);
-
-                    uint planes[MSA_PLANES];
-                    popcount21(x, planes);
-
-                    // Metropolis: flip where L <= (d + M) / 2.
-                    int m = geometric_draw(xoshiro128starstar(rng), two_beta);
-                    int limit = (d + m) >> 1;
-                    uint accept = (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
-                    state[var] = bi ^ accept;
+                    uint accept = flip_mask(couplings, my_csr_row_ptr, my_csr_col_ind,
+                                            state, var, beta_idx, two_beta, rng);
+                    state[var] ^= accept;
 #ifdef QUIP_MSA_DIAGNOSTICS
                     accept_count += ulong(popcount(accept));
 #endif
@@ -566,6 +656,74 @@ kernel void msa_anneal(
 }
 
 #ifndef QUIP_MSA_DIAGNOSTICS
+// `msa_anneal` for weighted models: buffers 2 and 15 hold milli `int`
+// coefficients and buffer 25 the Metropolis rows, [num_betas * WIDE_ROW].
+// Energies are left to the host.
+kernel void msa_anneal_weighted(
+    device const int* csr_row_ptr [[buffer(0)]],
+    device const int* csr_col_ind [[buffer(1)]],
+    device const int* csr_J_vals [[buffer(2)]],
+    device const int* row_ptr_offsets [[buffer(3)]], // unused: the CSR structure is shared
+    device const int* col_ind_offsets [[buffer(4)]],
+
+    constant int& N [[buffer(5)]],
+    constant int& num_betas [[buffer(6)]],
+    constant int& sweeps_per_beta [[buffer(7)]],
+    constant uint& base_seed [[buffer(8)]],
+
+    device const float* beta_schedule [[buffer(9)]],
+
+    device int8_t* final_samples [[buffer(10)]],
+    device int* final_energies [[buffer(11)]],
+
+    constant int& num_threadgroups [[buffer(12)]],
+    constant int& num_problems [[buffer(13)]],
+    constant int& num_reads [[buffer(14)]],
+
+    device const int* csr_h_vals [[buffer(15)]],
+
+    device const int* color_block_starts [[buffer(16)]],
+    device const int* color_block_counts [[buffer(17)]],
+    device const int* color_node_indices [[buffer(18)]],
+
+    constant int& words [[buffer(19)]],
+    constant int& num_colors [[buffer(20)]],
+
+    constant int& beta_start [[buffer(21)]],
+    constant int& beta_count [[buffer(22)]],
+    device uint* persistent_state [[buffer(23)]],
+    device uint* persistent_rng [[buffer(24)]],
+    device const int* wide_rows [[buffer(25)]],
+    threadgroup uint* state [[threadgroup(0)]],
+
+    uint3 threadgroup_pos [[threadgroup_position_in_grid]],
+    uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup atomic_int lane_total[MSA_LANES];
+    uint tg = threadgroup_pos.x;
+    if (tg >= uint(num_threadgroups)) {
+        return;
+    }
+    uint tid = thread_pos_in_group.x;
+    uint gsz = threads_per_group.x;
+    uint problem_id = tg / uint(words);
+    uint w = tg - problem_id * uint(words);
+    int beta_end = min(beta_start + beta_count, num_betas);
+    uint init_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u);
+    WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
+                                &csr_h_vals[problem_id * uint(N)], wide_rows};
+    msa_body(csr_row_ptr, csr_col_ind, couplings, beta_schedule,
+             &persistent_state[tg * uint(N)], &persistent_state[tg * uint(N)],
+             &persistent_rng[(tg * gsz + tid) * 4], &persistent_rng[(tg * gsz + tid) * 4],
+             &final_energies[problem_id * uint(num_reads)],
+             &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
+             color_block_starts, color_block_counts, color_node_indices,
+             N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
+             beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
+             state, lane_total);
+}
+
 struct SlotStep {
     uint slot;        // storage index for h, J, schedule, state, rng, outputs
     int  beta_start;  // 0 = initialise spins and RNG from seed

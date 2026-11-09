@@ -606,12 +606,12 @@ struct SaltTopology {
     /// Held, so pointer equality identifies the lease's view.
     view: Arc<TopologyView>,
     prepared: Arc<PreparedTopology>,
-    /// The allowed values in whole device units, when every draw has exact
-    /// device energies and the edges meet
-    /// [`crate::topology::fill_couplings`]'s precondition.
+    /// The allowed values in whole device units, when every draw is a unit
+    /// model (couplings ±1, fields 0 or ±1) with exact device energies and
+    /// the edges meet [`crate::topology::fill_couplings`]'s precondition.
+    /// Slots run the unit kernel only, so any other lease takes
+    /// [`Preparer::prepare`] for every salt.
     units: Option<(Vec<i8>, Vec<i8>)>,
-    /// Every draw has couplings ±1 and fields 0 or ±1.
-    unit: bool,
     /// Set when every draw has couplings ±1 and zero fields on the chain
     /// topology, which the screen takes.
     screen: Option<Arc<ScreenPlan>>,
@@ -660,6 +660,11 @@ impl SaltTopology {
             && units <= sampler::DEVICE_ENERGY_MAX_UNITS;
         let to_units = |values: &[i32]| values.iter().map(|&v| (v / 1000) as i8).collect();
         let unit_j = view.allowed_j_milli.iter().all(|&j| j.abs() == 1000);
+        let unit = unit_j
+            && view
+                .allowed_h_milli
+                .iter()
+                .all(|&h| h == 0 || h.abs() == 1000);
         let screen =
             (exact && unit_j && prepared.chain && view.allowed_h_milli == [0]).then(|| {
                 let graph = IsingGraph {
@@ -703,18 +708,13 @@ impl SaltTopology {
         Some(Self {
             view: Arc::clone(view),
             prepared,
-            units: exact.then(|| {
+            units: (exact && unit).then(|| {
                 (
                     to_units(&view.allowed_h_milli),
                     to_units(&view.allowed_j_milli),
                 )
             }),
             screen,
-            unit: unit_j
-                && view
-                    .allowed_h_milli
-                    .iter()
-                    .all(|&h| h == 0 || h.abs() == 1000),
         })
     }
 }
@@ -737,7 +737,11 @@ impl Preparer {
             return Ok(None);
         }
         validate(job)?;
-        if job.params.num_sweeps == 0 || !sampler::device_energy_exact(&job.graph) {
+        // Slots run the unit kernel only. Weighted models, and refusals,
+        // take the batch path, which classifies them again.
+        let unit = crate::representation::classify_msa(&job.graph)
+            == Ok(crate::representation::Representation::Int8);
+        if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
         }
@@ -898,11 +902,7 @@ impl Preparer {
             job.params.num_sweeps = CHAIN_GATES.full_sweeps;
         }
         let beta_range = job.params.beta_range.is_none().then(|| {
-            if known.unit {
-                crate::cascade::unit_beta_range(fields.iter().map(|&h| h != 0), &prepared.degrees)
-            } else {
-                crate::cascade::resident_beta_range_from(&job.graph, &prepared.degrees)
-            }
+            crate::cascade::unit_beta_range(fields.iter().map(|&h| h != 0), &prepared.degrees)
         });
         let inputs =
             PreparedInputs::from_units(&prepared.topology, &prepared.edges, fields, &j_units);
@@ -3391,8 +3391,8 @@ mod tests {
     }
 
     /// The device-unit fast path gives the generic path's coefficients,
-    /// schedule, parameters and graph, on unit, non-unit and inexact
-    /// topologies.
+    /// schedule, parameters and graph on unit topologies. Non-unit and
+    /// inexact topologies leave the slots on both paths.
     #[test]
     fn salt_fast_path_matches_generic_preparation() {
         let (reply, _outcomes) = mpsc::channel();
@@ -3408,7 +3408,8 @@ mod tests {
         for (view, fast) in [
             (aglais_view(), true),
             (ring(vec![-1000, 0, 1000], vec![-1000, 1000]), true),
-            (ring(vec![-2000, 3000], vec![-2000, 1000, 5000]), true),
+            // Whole units, but not unit: the weighted batch path runs them.
+            (ring(vec![-2000, 3000], vec![-2000, 1000, 5000]), false),
             (ring(vec![0], vec![-1500, 1000]), false),
         ] {
             let mut fast_worker = Preparer::default();
@@ -3424,7 +3425,7 @@ mod tests {
                 if !fast {
                     assert!(
                         expected.is_none() && data.is_none(),
-                        "an inexact draw falls back"
+                        "a non-unit or inexact draw falls back"
                     );
                     continue;
                 }
@@ -3466,7 +3467,6 @@ mod tests {
             settings,
         );
         let known = preparer.salt.as_ref().unwrap();
-        assert!(known.unit);
         let (allowed_h, allowed_j) = known.units.clone().unwrap();
         let cached = Arc::clone(&known.prepared);
 
