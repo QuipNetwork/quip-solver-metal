@@ -35,7 +35,7 @@ cargo build --release
 ```
 
 The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
-from crates.io at version 0.0.2-rc3, published from
+from crates.io at version 0.0.8, published from
 [quip-solver-core](https://gitlab.com/quip.network/quip-solver-core). It
 speaks protocol version 2, so the coordinator must also speak version 2.
 
@@ -43,6 +43,15 @@ The miners accept `ISING_GENERATE` salt leases. The session draws each salt's
 problem from the lease, runs it through the same stream as a plain job, and
 sends a `Result` only for a salt whose reads meet the target. Each lease ends
 with one `LeaseDone` summary and a credit refund.
+
+Every binary declares the generic problem-family tier. It advertises no
+`solver_id` and no generated or accepted family, because no Metal session
+expands family leases. The session rejects a family lease with
+`FamilyUnsupported` and runs no fallback. For an explicit job with a
+`FamilyBinding`, the miner solves the plain model and the coordinator decides
+acceptance.
+`tests/family_compatibility.rs` checks the declaration, each kernel's limits,
+and both job paths.
 
 ## Running
 

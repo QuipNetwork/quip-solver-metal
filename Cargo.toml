@@ -1,6 +1,6 @@
 [package]
 name = "quip-solver-metal"
-version = "0.4.1"
+version = "0.4.2-rc1"
 edition = "2021"
 # MSRV contract for consumers. `rust-toolchain.toml` pins the *build* toolchain
 # (1.97.1); this is the oldest compiler the crate is supported on.
@@ -32,7 +32,7 @@ path = "src/bin/quip_metal_msa.rs"
 # this one line covers all three.
 [dependencies]
 quip-solver-ane = { path = "crates/ane-miner" }
-quip-solver-core = "0.0.3"
+quip-solver-core = "0.0.8"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
@@ -52,7 +52,7 @@ rayon = "1.10"
 objc = "0.2"
 
 [dev-dependencies]
-quip-solver-conformance = "0.0.3"
+quip-solver-conformance = "0.0.8"
 tonic = "=0.12.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "3.27.0"
