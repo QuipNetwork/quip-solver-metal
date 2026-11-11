@@ -26,8 +26,15 @@ const GIBBS_SRC: &str = include_str!("../kernels/gibbs.metal");
 /// Prepended to a kernel source to build its wide variant.
 const WIDE_DEFINE: &str = "#define QUIP_WIDE 1\n";
 
+/// Prepended to a kernel source to build its Float32 variant.
+const FLOAT_DEFINE: &str = "#define QUIP_FLOAT 1\n";
+
 fn wide(source: &str) -> String {
     format!("{WIDE_DEFINE}{source}")
+}
+
+fn float(source: &str) -> String {
+    format!("{FLOAT_DEFINE}{source}")
 }
 
 /// Multi-spin coded SA, see `kernels/msa.metal`.
@@ -68,6 +75,8 @@ pub struct MetalDevice {
     pub(crate) queue: metal::CommandQueue,
     pub(crate) sa: ComputePipelineState,
     pub(crate) sa_wide: ComputePipelineState,
+    /// `sa` for Float32 models: `float` coefficients and delta.
+    pub(crate) sa_float: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
     pub(crate) gibbs_wide: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
@@ -135,6 +144,7 @@ impl MetalDevice {
 
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
         let sa_wide = compile_pipeline(&device, &wide(SA_SRC), "pure_simulated_annealing")?;
+        let sa_float = compile_pipeline(&device, &float(SA_SRC), "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
@@ -154,6 +164,7 @@ impl MetalDevice {
             queue,
             sa,
             sa_wide,
+            sa_float,
             gibbs,
             gibbs_wide,
             gibbs_parallel,
@@ -273,6 +284,7 @@ mod tests {
         let dev = MetalDevice::open(0).unwrap();
         for (name, pipeline) in [
             ("sa_wide", &dev.sa_wide),
+            ("sa_float", &dev.sa_float),
             ("gibbs_wide", &dev.gibbs_wide),
             ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
             ("msa_weighted", &dev.msa_weighted),

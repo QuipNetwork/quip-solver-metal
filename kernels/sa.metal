@@ -15,14 +15,24 @@ typedef unsigned int uint;
 
 // Coefficient and delta types. The wide build prepends `#define QUIP_WIDE 1`:
 // `int` milli coefficients, an `int` delta, and integer acceptance against a
-// host-built threshold row, so no floating point decides a flip.
-#ifdef QUIP_WIDE
+// host-built threshold row, so no floating point decides a flip. The float
+// build prepends `#define QUIP_FLOAT 1`: `float` coefficients and delta, and
+// the same `float` Metropolis test as the int8 build. Only the int8 build
+// keeps a device energy; the host scores the wide and float builds' reads.
+#if defined(QUIP_WIDE)
 typedef int coef_t;
 typedef int delta_t;
+typedef int field_t;
 #define WIDE_ROW 2048
+#elif defined(QUIP_FLOAT)
+typedef float coef_t;
+typedef float delta_t;
+typedef float field_t;
 #else
 typedef int8_t coef_t;
 typedef int8_t delta_t;
+typedef int field_t;
+#define QUIP_DEVICE_ENERGY 1
 #endif
 
 inline uint xorshift32(thread uint &state) {
@@ -75,7 +85,10 @@ inline delta_t get_flip_energy(
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
 
-    int energy = 0;
+    // The field starts at h, then adds the row's couplings in CSR order. The
+    // host bounds the float build's rounded field for any summation order
+    // (sampler::check_float_schedule in src/), so 2 * field stays finite.
+    field_t energy = h_vals[var];
 
     // Aggressive unrolling for typical Zephyr degrees (18-20)
     #pragma unroll 20
@@ -83,19 +96,16 @@ inline delta_t get_flip_energy(
         int neighbor = csr_col_ind[p];
         coef_t Jij = csr_J_vals[p];
         int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
-        energy += neighbor_spin * Jij;
+        energy += field_t(neighbor_spin) * field_t(Jij);
     }
-
-    // Add h field contribution
-    coef_t h_var = h_vals[var];
-    energy += h_var;
 
     // Delta energy = -2 * state[var] * energy. In the int8 build the host
     // admits a local field |h| + sum |J| of at most 63 units
     // (representation::classify in src/), so |delta_E| = 2 * |energy| <= 126,
-    // inside int8_t. The wide build holds the delta in int.
+    // inside int8_t. The wide build holds the delta in int, the float build
+    // in float.
     int8_t var_spin = get_spin_packed(var, packed_state);
-    return (delta_t)(-2 * var_spin * energy);
+    return (delta_t)(field_t(-2 * var_spin) * energy);
 }
 
 // Pure SA kernel with delta energy optimization
@@ -174,7 +184,8 @@ kernel void pure_simulated_annealing(
 
     // Thread-local memory for state and delta_energy
     // Bit-packed state: (N+7)/8 bytes
-    // Delta energy: N bytes in the int8 build, 4*N bytes in the wide build.
+    // Delta energy: N bytes in the int8 build, 4*N bytes in the wide and
+    // float builds.
     thread int8_t packed_state[4593 / 8 + 1];  // Bit-packed state
     thread delta_t delta_energy[4593];           // Delta energy
 
@@ -212,7 +223,7 @@ kernel void pure_simulated_annealing(
 
         // Compute initial energy
         current_energy = 0;
-#ifndef QUIP_WIDE
+#ifdef QUIP_DEVICE_ENERGY
         for (int i = 0; i < n; i++) {
             int8_t spin_i = get_spin_packed(i, packed_state);
             current_energy += my_h_vals[i] * spin_i;
@@ -293,7 +304,7 @@ kernel void pure_simulated_annealing(
 #endif
 
                 if (flip_spin) {
-#ifndef QUIP_WIDE
+#ifdef QUIP_DEVICE_ENERGY
                     current_energy += de;
 #endif
 
@@ -301,10 +312,10 @@ kernel void pure_simulated_annealing(
                     int8_t var_spin = get_spin_packed(var, packed_state);
 
                     // Update delta energies of all neighbors
-#ifdef QUIP_WIDE
-                    int multiplier = 4 * var_spin;
-#else
+#ifdef QUIP_DEVICE_ENERGY
                     int8_t multiplier = 4 * var_spin;
+#else
+                    int multiplier = 4 * var_spin;
 #endif
                     int start = my_csr_row_ptr[var];
                     int end = my_csr_row_ptr[var + 1];
@@ -315,7 +326,13 @@ kernel void pure_simulated_annealing(
                         int neighbor = my_csr_col_ind[p];
                         coef_t Jij = my_csr_J_vals[p];
                         int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+#ifdef QUIP_FLOAT
+                        // 4*J may overflow even when the updated delta fits,
+                        // so the update rounds once, as CUDA's sa.cu does.
+                        delta_energy[neighbor] = fma(float(multiplier * neighbor_spin), Jij, delta_energy[neighbor]);
+#else
                         delta_energy[neighbor] += (delta_t)(multiplier * Jij * neighbor_spin);
+#endif
                     }
 
                     // Flip the spin and negate its delta energy

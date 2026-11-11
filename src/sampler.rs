@@ -43,7 +43,7 @@ pub enum Kernel {
 
 use crate::capacity::{footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape};
 use crate::representation::{classify, classify_msa, Representation};
-use crate::topology::{fill_h_j, fill_h_j_wide, SelfFeedingTopology};
+use crate::topology::{fill_h_j, fill_h_j_float, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::BetaSchedule;
@@ -167,6 +167,9 @@ const WIDE_GIBBS_COST_FACTOR: f64 = 2.0;
 /// Weighted MSA work per word update for chunk sizing, measured in
 /// `docs/perf/2026-11-09-weighted-msa.md`.
 const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
+/// Float32 SA work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-11-11-float-kernels.md`.
+const FLOAT_SA_COST_FACTOR: f64 = 1.3;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -1033,11 +1036,92 @@ pub(crate) fn sa_tier(rep: Representation, kernel: Kernel) -> Representation {
     }
 }
 
-/// The capacity refusal for a model only a Float32 kernel could run.
-fn no_float32_kernel() -> SampleError {
-    SampleError::TooLarge(
-        "the model needs Float32 coefficients, and no Float32 kernel exists yet".into(),
-    )
+/// Whether `kernel` has a `QUIP_FLOAT` build. A kernel gains Float32 models
+/// by its arm here, its pipeline in `MetalDevice`, its cost factor in
+/// `encode_batch_inner`, and its coefficient upload in `upload_inputs`.
+pub(crate) fn has_float32_kernel(kernel: Kernel) -> bool {
+    match kernel {
+        Kernel::Sa => true,
+        Kernel::Gibbs | Kernel::Msa => false,
+    }
+}
+
+/// The coefficient tier `kernel` runs `graph` on, or the capacity reason it
+/// refuses the model: a classifier refusal, or a Float32 model on a kernel
+/// with no Float32 build.
+pub(crate) fn kernel_representation(
+    graph: &IsingGraph,
+    kernel: Kernel,
+) -> Result<Representation, String> {
+    let rep = if kernel == Kernel::Msa {
+        classify_msa(graph)
+    } else {
+        classify(graph)
+    }?;
+    if rep == Representation::Float32 && !has_float32_kernel(kernel) {
+        return Err(format!(
+            "the model needs Float32 coefficients, and the {kernel:?} kernel has no Float32 build"
+        ));
+    }
+    Ok(sa_tier(rep, kernel))
+}
+
+/// Refuse a Float32 model that the `float` kernel arithmetic cannot hold:
+/// a beta past the finite `f32` range, a rounded local field whose delta
+/// `2 * field` overflows, or a largest beta times the largest delta that
+/// overflows the `beta * delta` product of the Metropolis test.
+///
+/// The field rule is CUDA's `check_real_fields` (commit `4bc82bb`) in its
+/// order-independent form: the `f64` sum of the `f32` magnitudes of `h` and
+/// the row's couplings, widened by the rounding bound of `degree + 1` `f32`
+/// additions. The beta rule is CUDA's `build_planned_beta_schedule` (commit
+/// `7d97e41`). The product rule is this plan's review-focus item 3.
+fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
+    if let Some(index) = beta.iter().position(|b| !b.is_finite()) {
+        return Err(SampleError::TooLarge(format!(
+            "beta schedule value at index {index} is outside the finite f32 range"
+        )));
+    }
+    let n = graph.num_nodes();
+    let mut field: Vec<f64> = graph
+        .h
+        .iter()
+        .map(|&v| f64::from((v as f32).abs()))
+        .collect();
+    let mut degree = vec![0_u32; n];
+    for (&(u, v), &j) in graph.edges.iter().zip(&graph.j) {
+        let magnitude = f64::from((j as f32).abs());
+        for node in [u, v] {
+            field[node] += magnitude;
+            degree[node] += 1;
+        }
+    }
+    let max_delta = field
+        .iter()
+        .zip(&degree)
+        .map(|(&f, &d)| {
+            let error = (f64::from(d) + 1.0) * f64::from(f32::EPSILON);
+            if error >= 1.0 {
+                f64::INFINITY
+            } else {
+                2.0 * f / (1.0 - error)
+            }
+        })
+        .fold(0.0, f64::max);
+    let float_max = f64::from(f32::MAX);
+    if max_delta > float_max {
+        return Err(SampleError::TooLarge(
+            "a local field exceeds the finite f32 delta range after rounding".into(),
+        ));
+    }
+    let max_beta = beta.iter().map(|b| f64::from(b.abs())).fold(0.0, f64::max);
+    if max_beta * max_delta > float_max {
+        return Err(SampleError::TooLarge(format!(
+            "the beta schedule's largest beta {max_beta:e} times the largest delta \
+             {max_delta:e} overflows f32"
+        )));
+    }
+    Ok(())
 }
 
 /// The one representation every graph in a batch shares, or a capacity
@@ -1048,16 +1132,7 @@ fn batch_representation(
 ) -> Result<Representation, SampleError> {
     let mut shared = None;
     for graph in graphs {
-        let rep = if kernel == Kernel::Msa {
-            classify_msa(graph)
-        } else {
-            classify(graph)
-        }
-        .map_err(SampleError::TooLarge)?;
-        let rep = sa_tier(rep, kernel);
-        if rep == Representation::Float32 {
-            return Err(no_float32_kernel());
-        }
+        let rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
         if shared.is_some_and(|prev| prev != rep) {
             return Err(SampleError::Driver(
                 "a batch mixes int8 and wide models".into(),
@@ -1242,7 +1317,19 @@ fn upload_inputs(
                 )
             }
         }
-        Representation::Float32 => return Err(no_float32_kernel()),
+        Representation::Float32 => {
+            let mut all_j = vec![0_f32; num_problems * nnz_alloc];
+            let mut all_h = vec![0_f32; num_problems * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                let (j_csr, h_f32) = fill_h_j_float(topo, graph);
+                all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
+                all_h[p * n..p * n + h_f32.len()].copy_from_slice(&h_f32);
+            }
+            (
+                checked_buffer(device.new_buffer_from_slice(&all_j))?,
+                checked_buffer(device.new_buffer_from_slice(&all_h))?,
+            )
+        }
         Representation::Binary | Representation::Int8 => {
             let mut all_j = vec![0i8; num_problems * nnz_alloc];
             let mut all_h = vec![0i8; num_problems * n];
@@ -1461,6 +1548,10 @@ fn encode_batch_inner(
 ) -> Result<EncodedBatch, SampleError> {
     let (first, n, rep) = validate_batch(graphs, params, kernel)?;
     let wide = rep == Representation::Wide;
+    let float = rep == Representation::Float32;
+    // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
+    // geometry.
+    let four_byte = wide || float;
 
     let num_problems = graphs.len();
     let num_reads = simd_rounded_reads(params.num_reads);
@@ -1485,6 +1576,11 @@ fn encode_batch_inner(
             params.schedule,
         ),
     };
+    if float {
+        for graph in graphs {
+            check_float_schedule(graph, &beta)?;
+        }
+    }
     let wide_rows = if wide {
         if !crate::wide_tables::wide_table_fits(beta.len()) {
             return Err(SampleError::TooLarge(format!(
@@ -1507,6 +1603,7 @@ fn encode_batch_inner(
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
     let pipeline = match kernel {
         Kernel::Sa if wide => &device.sa_wide,
+        Kernel::Sa if float => &device.sa_float,
         Kernel::Sa => &device.sa,
         Kernel::Msa if wide => &device.msa_weighted,
         Kernel::Msa => &device.msa,
@@ -1545,7 +1642,7 @@ fn encode_batch_inner(
             (num_samples, WIDE_GIBBS_GROUP)
         }
         Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
-        Kernel::Sa | Kernel::Gibbs if wide => {
+        Kernel::Sa | Kernel::Gibbs if four_byte => {
             let group = wide_sa_group(num_reads, max_threads);
             (num_samples.div_ceil(group), group)
         }
@@ -1596,14 +1693,14 @@ fn encode_batch_inner(
     );
     let inputs = upload_inputs(device, &cached, graphs, kernel, rep)?;
 
-    let cost = if wide {
-        match kernel {
-            Kernel::Sa => WIDE_SA_COST_FACTOR,
-            Kernel::Gibbs => WIDE_GIBBS_COST_FACTOR,
-            Kernel::Msa => WEIGHTED_MSA_COST_FACTOR,
-        }
-    } else {
-        1.0
+    let cost = match (rep, kernel) {
+        (Representation::Wide, Kernel::Sa) => WIDE_SA_COST_FACTOR,
+        (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
+        (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
+        (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
+        // `kernel_representation` refuses Float32 on the other kernels.
+        (Representation::Float32, Kernel::Gibbs | Kernel::Msa)
+        | (Representation::Binary | Representation::Int8, _) => 1.0,
     };
     let plan = match plan_override {
         Some(p) => p.to_vec(),
@@ -1620,7 +1717,7 @@ fn encode_batch_inner(
                 energies: checked_buffer(device.new_zeroed_buffer((num_samples * 4) as u64))?, // i32
             },
             KernelEncode::Sa {
-                persist: new_sa_persistent(device, &dims, if wide { 4 } else { 1 })?,
+                persist: new_sa_persistent(device, &dims, if four_byte { 4 } else { 1 })?,
             },
         ),
         Kernel::Gibbs => (
@@ -1874,8 +1971,43 @@ pub fn sample_ising(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-    let n = graph.num_nodes();
-    if n == 0 {
+    sample_planned(device, graph, params, kernel, None)
+}
+
+/// [`sample_ising`] with the beta schedule split into chunks of
+/// `rungs_per_chunk` rungs, so tests can compare a chunked anneal with an
+/// unchunked one of the same seed.
+///
+/// # Errors
+///
+/// The same as [`sample_ising`].
+#[doc(hidden)]
+pub fn sample_ising_chunked(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    rungs_per_chunk: usize,
+) -> Result<Vec<SamplerResult>, SampleError> {
+    let num_betas = (params.num_sweeps / params.sweeps_per_beta.max(1)).max(1);
+    let step = rungs_per_chunk.clamp(1, num_betas);
+    let plan: Vec<(i32, i32)> = (0..num_betas)
+        .step_by(step)
+        .map(|start| (start as i32, step.min(num_betas - start) as i32))
+        .collect();
+    sample_planned(device, graph, params, kernel, Some(&plan))
+}
+
+/// One problem through [`encode_batch_inner`], committed chunk by chunk and
+/// harvested. A zero-node graph returns empty reads without the GPU.
+fn sample_planned(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    plan: Option<&[(i32, i32)]>,
+) -> Result<Vec<SamplerResult>, SampleError> {
+    if graph.num_nodes() == 0 {
         let reads = params.num_reads.max(1);
         return Ok((0..reads)
             .map(|_| SamplerResult {
@@ -1885,7 +2017,7 @@ pub fn sample_ising(
             .collect());
     }
 
-    let mut batch = encode_batch(device, &[graph], params, kernel, 1)?;
+    let mut batch = encode_batch_inner(device, &[graph], params, kernel, 1, plan, None)?;
     while batch.commit_next(|| false) {
         batch.wait_until_completed();
     }
@@ -2323,8 +2455,8 @@ mod tests {
             num_sweeps: 8,
             ..Default::default()
         };
-        let graph = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        let graph = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let err = validate_batch(&[&graph], &params, kernel).unwrap_err();
             assert!(
                 matches!(err, SampleError::TooLarge(_)),
@@ -2351,20 +2483,78 @@ mod tests {
     }
 
     #[test]
-    fn validate_batch_refuses_float32_models_as_a_capacity_error() {
+    fn validate_batch_refuses_float32_models_without_a_float_build() {
         let params = SampleParams {
             num_reads: 32,
             num_sweeps: 8,
             ..Default::default()
         };
         let off_grid = IsingGraph::new(vec![0.1 + 0.2, 0.0], vec![1.0], vec![(0, 1)]);
-        for kernel in [Kernel::Sa, Kernel::Msa] {
+        for kernel in [Kernel::Gibbs, Kernel::Msa] {
             let err = validate_batch(&[&off_grid], &params, kernel).unwrap_err();
             assert!(
                 matches!(&err, SampleError::TooLarge(m) if m.contains("Float32")),
                 "{err:?}"
             );
         }
+        let (_, _, rep) = validate_batch(&[&off_grid], &params, Kernel::Sa).unwrap();
+        assert_eq!(rep, Representation::Float32);
+    }
+
+    fn too_large(result: Result<(), SampleError>) -> String {
+        match result {
+            Err(SampleError::TooLarge(m)) => m,
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_large_coupling_runs_float32_under_its_default_schedule() {
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e30], vec![(0, 1)]);
+        let (beta, _) = build_beta_schedule(&bond, 64, 1, None, BetaSchedule::Geometric);
+        check_float_schedule(&bond, &beta).unwrap();
+    }
+
+    #[test]
+    fn a_schedule_whose_beta_times_delta_overflows_f32_is_refused() {
+        let graph = IsingGraph::new(vec![0.0, 0.0, 1e-12], vec![1e30], vec![(0, 1)]);
+        let (beta, _) = build_beta_schedule(&graph, 64, 1, None, BetaSchedule::Geometric);
+        let message = too_large(check_float_schedule(&graph, &beta));
+        assert!(message.contains("overflows f32"), "{message}");
+        // An explicit schedule overflows the same coupling alone.
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e30], vec![(0, 1)]);
+        too_large(check_float_schedule(&bond, &[1.0, 1e9]));
+    }
+
+    #[test]
+    fn a_beta_past_the_f32_range_is_refused() {
+        let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
+        let (beta, _) = build_beta_schedule(&graph, 64, 1, None, BetaSchedule::Geometric);
+        let message = too_large(check_float_schedule(&graph, &beta));
+        assert!(message.contains("finite f32"), "{message}");
+        too_large(check_float_schedule(&graph, &[1.0, f32::NAN]));
+    }
+
+    #[test]
+    fn a_rounded_field_past_half_f32_max_is_refused() {
+        // A single bond of 1e38 has a delta of 2e38, inside f32. Two at one
+        // node double past f32::MAX.
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e38], vec![(0, 1)]);
+        check_float_schedule(&bond, &[0.0]).unwrap();
+        let chain = IsingGraph::new(vec![0.0; 3], vec![1e38; 2], vec![(0, 1), (1, 2)]);
+        let message = too_large(check_float_schedule(&chain, &[0.0]));
+        assert!(message.contains("delta range"), "{message}");
+        // CUDA's rounding case: h just under half of f32::MAX plus three
+        // couplings whose exact sum is below half, but whose bound is not.
+        let half_max = f32::MAX / 2.0;
+        let h = f32::from_bits(half_max.to_bits() - 2);
+        let coupling = f64::from((half_max - h) * 0.3);
+        let star = IsingGraph::new(
+            vec![f64::from(h), 0.0, 0.0, 0.0],
+            vec![coupling; 3],
+            vec![(0, 1), (0, 2), (0, 3)],
+        );
+        too_large(check_float_schedule(&star, &[0.0]));
     }
 
     #[test]

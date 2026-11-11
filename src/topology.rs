@@ -384,6 +384,32 @@ pub(crate) fn fill_h_j_wide(
     (j_csr, h)
 }
 
+/// [`fill_h_j`] for the Float32 kernels: each `f64` coefficient rounded to
+/// the nearest `f32`.
+///
+/// The caller has classified `graph`, which refuses any value past `f32::MAX`.
+pub(crate) fn fill_h_j_float(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut j_csr = vec![0_f32; topology.nnz];
+    for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
+        let Some(&(u, v)) = graph.edges.get(k) else {
+            continue;
+        };
+        if u >= topology.n || v >= topology.n {
+            continue;
+        }
+        let val = graph.j.get(k).copied().unwrap_or(0.0) as f32;
+        j_csr[pos_ij as usize] = val;
+        if u != v {
+            j_csr[pos_ji as usize] = val;
+        }
+    }
+    let h = graph.h.iter().map(|&v| v as f32).collect();
+    (j_csr, h)
+}
+
 /// [`fill_h_j`]'s couplings from whole-unit `j_units` in the establishing
 /// edge order.
 ///

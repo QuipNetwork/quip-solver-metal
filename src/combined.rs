@@ -354,13 +354,7 @@ fn eligibility(
         && n <= crate::sampler::kernel_max_nodes(kernel)
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
-    // No Float32 kernel exists yet, so it is a refusal like a classifier error.
-    let runnable = |rep: Result<crate::representation::Representation, String>| matches!(rep, Ok(r) if r != crate::representation::Representation::Float32);
-    metal &= if kernel == Kernel::Msa {
-        runnable(crate::representation::classify_msa(graph))
-    } else {
-        runnable(crate::representation::classify(graph))
-    };
+    metal &= crate::sampler::kernel_representation(graph, kernel).is_ok();
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa
         && n <= 16_384
@@ -1351,8 +1345,13 @@ mod tests {
         let mut facts = EdgeFactsCache::default();
         let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
         assert_eq!(
-            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
+            eligibility(Kernel::Gibbs, &off_step, &params, cfg, &mut facts),
             [false, false]
+        );
+        // SA runs an off-step model on its Float32 build.
+        assert_eq!(
+            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
+            [true, false]
         );
         let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
         assert_eq!(

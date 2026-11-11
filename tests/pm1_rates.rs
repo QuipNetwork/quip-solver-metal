@@ -10,7 +10,8 @@
 //!
 //! `QUIP_PM1_SCALE=wide` multiplies every coefficient by 1.5 so the same jobs
 //! run on the wide SA and Gibbs paths and the weighted MSA path, for the cost
-//! factors in `sampler.rs`.
+//! factors in `sampler.rs`. `QUIP_PM1_SCALE=float` multiplies by 1.0005, off
+//! the milli grid, so the jobs run on the kernels with a Float32 build.
 
 use std::io::{self, Write};
 use std::time::Instant;
@@ -77,13 +78,13 @@ fn digest_uses_little_endian_energy_then_spins() {
 #[ignore = "minutes of device time; see the module comment"]
 fn pm1_rates() {
     let dev = MetalDevice::open(0).unwrap();
-    let scale = if std::env::var("QUIP_PM1_SCALE").as_deref() == Ok("wide") {
-        1.5
-    } else {
-        1.0
+    let (scale, kernels): (f64, &[Kernel]) = match std::env::var("QUIP_PM1_SCALE").as_deref() {
+        Ok("wide") => (1.5, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
+        Ok("float") => (1.0005, &[Kernel::Sa]),
+        _ => (1.0, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
     };
     let edges = edges();
-    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+    for &kernel in kernels {
         let params = SampleParams {
             num_reads: 64,
             num_sweeps: 4096,

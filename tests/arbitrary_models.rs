@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! QUI-78 acceptance cases on Metal: exact or refused, never quantized.
+//! QUI-78 acceptance cases on Metal: exact or refused, never quantized. SA
+//! anneals a model off the milli grid in `f32` and scores it exactly on the host.
 
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::SampleParams;
@@ -90,12 +91,14 @@ fn large_and_wide_range_coefficients_are_solved_or_refused() {
             brute_force_min(&solved),
             "{kernel:?}"
         );
-        let err = sample_ising(&dev, &too_wide, &params(16), kernel).unwrap_err();
-        assert!(
-            matches!(err, SampleError::TooLarge(_)),
-            "{kernel:?}: {err:?}"
-        );
     }
+    // Past the wide bound, SA runs its Float32 build; MSA has none yet.
+    assert_eq!(
+        best(&dev, &too_wide, Kernel::Sa, 500),
+        brute_force_min(&too_wide)
+    );
+    let err = sample_ising(&dev, &too_wide, &params(16), Kernel::Msa).unwrap_err();
+    assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
 }
 
 #[test]
@@ -141,18 +144,23 @@ fn the_same_topology_at_1x_and_1000x_reaches_scaled_ground_states() {
 #[test]
 fn a_non_representable_model_is_refused_as_capacity() {
     let Some(dev) = device() else { return };
-    for graph in [
-        IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]),
-        IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]),
+    let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+    let non_finite = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
+    for (graph, kernel) in [
+        (&off_step, Kernel::Gibbs),
+        (&off_step, Kernel::Msa),
+        (&non_finite, Kernel::Sa),
+        (&non_finite, Kernel::Gibbs),
+        (&non_finite, Kernel::Msa),
     ] {
-        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
-            let err = sample_ising(&dev, &graph, &params(16), kernel).unwrap_err();
-            assert!(
-                matches!(err, SampleError::TooLarge(_)),
-                "{kernel:?}: {err:?}"
-            );
-        }
+        let err = sample_ising(&dev, graph, &params(16), kernel).unwrap_err();
+        assert!(
+            matches!(err, SampleError::TooLarge(_)),
+            "{kernel:?}: {err:?}"
+        );
     }
+    // SA runs the off-step model on its Float32 build.
+    best(&dev, &off_step, Kernel::Sa, 64);
 }
 
 #[test]
