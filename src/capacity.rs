@@ -41,8 +41,6 @@ pub const MAX_NODES: usize = i32::MAX as usize;
 const MAX_NNZ: usize = u32::MAX as usize;
 /// Bytes of one `col_ind` entry.
 const COL_IND_ENTRY_BYTES: usize = 4;
-/// Read count the advertised limits plan against.
-const ADVERTISED_READS: usize = 100;
 /// Beta entries the advertised limits plan against.
 const ADVERTISED_BETAS: usize = 64;
 
@@ -473,7 +471,8 @@ fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
 ///   `col_ind` bytes needed and the bytes `u32::MAX` entries occupy.
 /// - [`CapacityError::Degree`] when no tier admits the degree.
 /// - [`CapacityError::Memory`] when `total(instances)` exceeds
-///   `limits.usable_bytes()`. This check runs first.
+///   `limits.usable_bytes()`. Of the per-tier checks this runs first; the
+///   node and `col_ind` bounds above run before any tier.
 /// - [`CapacityError::Buffer`] when the largest buffer exceeds
 ///   `limits.max_buffer_bytes`. A per-model buffer counts for the
 ///   [`models_per_buffer`] models it holds; a shared buffer counts once.
@@ -533,6 +532,12 @@ pub fn footprint(
     Err(first_error.unwrap_or(CapacityError::Degree {
         max: MSA_SPARSE_MAX_DEGREE,
     }))
+}
+
+/// Reads the advertised limits plan against: the kernel's read cap, so a
+/// limit holds for every read count the miner accepts.
+fn advertised_reads(kernel: Kernel) -> usize {
+    crate::streaming::max_reads(kernel) as usize
 }
 
 /// How many couplings a model has for a given node count.
@@ -620,7 +625,7 @@ pub fn advertised_nodes(
         Connectivity::Degree(0),
         Precision::Binary,
         limits,
-        ADVERTISED_READS,
+        advertised_reads(kernel),
     )
     .map_or(0, |(shape, _)| shape.nodes);
     match cap {
@@ -639,7 +644,7 @@ pub fn advertised_couplers(kernel: Kernel, limits: &DeviceLimits) -> usize {
         Connectivity::Complete,
         Precision::Binary,
         limits,
-        ADVERTISED_READS,
+        advertised_reads(kernel),
     )
     .map_or(0, |(shape, _)| shape.edges)
 }
@@ -995,7 +1000,7 @@ mod tests {
         max_buffer_bytes: 64 << 30,
     };
 
-    fn shape_for(connectivity: Connectivity, nodes: usize) -> ModelShape {
+    fn shape_for(connectivity: Connectivity, nodes: usize, reads: usize) -> ModelShape {
         let (edges, max_degree) = connectivity.size(nodes);
         ModelShape {
             nodes,
@@ -1003,7 +1008,7 @@ mod tests {
             max_degree,
             precision: Precision::Binary,
             betas: 64,
-            reads: ADVERTISED_READS,
+            reads,
         }
     }
 
@@ -1011,12 +1016,18 @@ mod tests {
     fn max_model_is_the_last_shape_that_fits() {
         for kernel in KERNELS {
             let connectivity = Connectivity::Degree(20);
-            let (shape, fp) = max_model(kernel, connectivity, Precision::Binary, &BIG, 100)
+            let reads = advertised_reads(kernel);
+            let (shape, fp) = max_model(kernel, connectivity, Precision::Binary, &BIG, reads)
                 .unwrap_or_else(|| panic!("{kernel:?}: nothing fits"));
             assert_eq!(footprint(kernel, &shape, &BIG), Ok(fp), "{kernel:?}");
-            let mut bigger = shape_for(connectivity, shape.nodes + 1);
-            bigger.reads = 100;
-            assert!(footprint(kernel, &bigger, &BIG).is_err(), "{kernel:?}");
+            // Memory is the binding limit here: the buffer limit equals the
+            // planning memory, and the total always exceeds its largest buffer.
+            let bigger = shape_for(connectivity, shape.nodes + 1, reads);
+            let err = footprint(kernel, &bigger, &BIG).unwrap_err();
+            assert!(
+                matches!(err, CapacityError::Memory { .. }),
+                "{kernel:?}: {err:?}"
+            );
         }
     }
 
@@ -1028,10 +1039,12 @@ mod tests {
             let shape = ModelShape {
                 nodes,
                 edges: couplers,
-                max_degree: 20,
+                // The fewest neighbours the busiest node needs to carry
+                // `couplers` edges over `nodes` nodes.
+                max_degree: (2 * couplers).div_ceil(nodes).min(nodes - 1),
                 precision: Precision::Binary,
                 betas: 64,
-                reads: ADVERTISED_READS,
+                reads: advertised_reads(kernel),
             };
             let err = footprint(kernel, &shape, &BIG).unwrap_err();
             assert!(
@@ -1077,10 +1090,12 @@ mod tests {
             max_buffer_bytes: 1 << 25,
         };
         for kernel in KERNELS {
+            let reads = advertised_reads(kernel);
             for connectivity in [Connectivity::Degree(20), Connectivity::Complete] {
                 let mut failed = false;
                 for nodes in (1..40_000).step_by(97) {
-                    let fits = footprint(kernel, &shape_for(connectivity, nodes), &limits).is_ok();
+                    let fits =
+                        footprint(kernel, &shape_for(connectivity, nodes, reads), &limits).is_ok();
                     assert!(!(failed && fits), "{kernel:?} {connectivity:?} {nodes}");
                     failed |= !fits;
                 }
@@ -1089,6 +1104,26 @@ mod tests {
                     "{kernel:?} {connectivity:?} never reached the limit"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn max_model_is_none_when_one_node_does_not_fit() {
+        let tiny = DeviceLimits {
+            memory_bytes: 16,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: 16,
+        };
+        for kernel in KERNELS {
+            let reads = advertised_reads(kernel);
+            for connectivity in [Connectivity::Degree(20), Connectivity::Complete] {
+                assert!(
+                    max_model(kernel, connectivity, Precision::Binary, &tiny, reads).is_none(),
+                    "{kernel:?} {connectivity:?}"
+                );
+            }
+            assert_eq!(advertised_nodes(kernel, &tiny, None), Ok(0));
+            assert_eq!(advertised_couplers(kernel, &tiny), 0);
         }
     }
 }
