@@ -36,6 +36,16 @@ pub const MSA_SPARSE_MAX_DEGREE: usize = 62;
 /// Largest node count the 32-bit kernel indexing can address.
 pub const MAX_NODES: usize = i32::MAX as usize;
 
+/// Largest CSR entry count (`2 * edges`) the 32-bit kernel indexing can
+/// address.
+const MAX_NNZ: usize = u32::MAX as usize;
+/// Bytes of one `col_ind` entry.
+const COL_IND_ENTRY_BYTES: usize = 4;
+/// Read count the advertised limits plan against.
+const ADVERTISED_READS: usize = 100;
+/// Beta entries the advertised limits plan against.
+const ADVERTISED_BETAS: usize = 64;
+
 /// Memory headroom numerator, as CUDA's `MEMORY_HEADROOM_NUM`.
 const HEADROOM_NUM: usize = 4;
 /// Memory headroom denominator, as CUDA's `MEMORY_HEADROOM_DEN`.
@@ -458,6 +468,9 @@ fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
 /// # Errors
 ///
 /// - [`CapacityError::Nodes`] when `shape.nodes` exceeds [`MAX_NODES`].
+/// - [`CapacityError::Buffer`] when `2 * shape.edges` exceeds `u32::MAX`, the
+///   most `col_ind` entries 32-bit indexing addresses. It reports the
+///   `col_ind` bytes needed and the bytes `u32::MAX` entries occupy.
 /// - [`CapacityError::Degree`] when no tier admits the degree.
 /// - [`CapacityError::Memory`] when `total(instances)` exceeds
 ///   `limits.usable_bytes()`. This check runs first.
@@ -471,6 +484,13 @@ pub fn footprint(
 ) -> Result<Footprint, CapacityError> {
     if shape.nodes > MAX_NODES {
         return Err(CapacityError::Nodes { max: MAX_NODES });
+    }
+    if shape.edges.saturating_mul(2) > MAX_NNZ {
+        // `col_ind` indexes its entries with 32 bits, whatever the memory.
+        return Err(CapacityError::Buffer {
+            needed: shape.edges.saturating_mul(2 * COL_IND_ENTRY_BYTES),
+            max: MAX_NNZ * COL_IND_ENTRY_BYTES,
+        });
     }
     let mut admitted: Vec<(Footprint, usize)> = [
         (Storage::Threadgroup, threadgroup_sizes(kernel, shape)),
@@ -513,6 +533,115 @@ pub fn footprint(
     Err(first_error.unwrap_or(CapacityError::Degree {
         max: MSA_SPARSE_MAX_DEGREE,
     }))
+}
+
+/// How many couplings a model has for a given node count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Connectivity {
+    /// Every node has this many neighbours: `nodes * degree / 2` edges,
+    /// rounded down, and at most the complete count.
+    Degree(usize),
+    /// Every pair of nodes is coupled.
+    Complete,
+}
+
+impl Connectivity {
+    /// `(edges, max_degree)` of a model with `nodes` nodes.
+    fn size(self, nodes: usize) -> (usize, usize) {
+        let complete_degree = nodes.saturating_sub(1);
+        let complete_edges = nodes.saturating_mul(complete_degree) / 2;
+        match self {
+            Self::Complete => (complete_edges, complete_degree),
+            Self::Degree(degree) => (
+                (nodes.saturating_mul(degree) / 2).min(complete_edges),
+                degree.min(complete_degree),
+            ),
+        }
+    }
+}
+
+/// The largest model of `connectivity` that `footprint` admits, with its
+/// footprint, or `None` when not even one node fits.
+///
+/// Binary search on the node count. Fit is monotone in it: a model with
+/// fewer nodes has no more edges, degree, or bytes in any tier, and every
+/// tier that admits the larger model admits the smaller.
+#[must_use]
+pub fn max_model(
+    kernel: Kernel,
+    connectivity: Connectivity,
+    precision: Precision,
+    limits: &DeviceLimits,
+    reads: usize,
+) -> Option<(ModelShape, Footprint)> {
+    let probe = |nodes: usize| {
+        let (edges, max_degree) = connectivity.size(nodes);
+        let shape = ModelShape {
+            nodes,
+            edges,
+            max_degree,
+            precision,
+            betas: ADVERTISED_BETAS,
+            reads,
+        };
+        footprint(kernel, &shape, limits)
+            .ok()
+            .map(|footprint| (shape, footprint))
+    };
+    let mut best = None;
+    // Invariant: `low` fits or is 0; `high + 1` does not fit or exceeds the
+    // node bound.
+    let (mut low, mut high) = (0, MAX_NODES);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if let Some(found) = probe(mid) {
+            best = Some(found);
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+/// The most nodes a miner advertises: the largest Binary model with no
+/// edges. `cap` lowers it.
+///
+/// # Errors
+///
+/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it.
+pub fn advertised_nodes(
+    kernel: Kernel,
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<usize, CapacityError> {
+    let limit = max_model(
+        kernel,
+        Connectivity::Degree(0),
+        Precision::Binary,
+        limits,
+        ADVERTISED_READS,
+    )
+    .map_or(0, |(shape, _)| shape.nodes);
+    match cap {
+        Some(cap) if cap > limit => Err(CapacityError::Nodes { max: limit }),
+        Some(cap) => Ok(cap),
+        None => Ok(limit),
+    }
+}
+
+/// The most couplers a miner advertises: the couplers of the largest
+/// complete Binary model, or 0 when none fits.
+#[must_use]
+pub fn advertised_couplers(kernel: Kernel, limits: &DeviceLimits) -> usize {
+    max_model(
+        kernel,
+        Connectivity::Complete,
+        Precision::Binary,
+        limits,
+        ADVERTISED_READS,
+    )
+    .map_or(0, |(shape, _)| shape.edges)
 }
 
 /// Saturating sum of buffer sizes.
@@ -857,5 +986,109 @@ mod tests {
         let nnz_bytes = shape.edges * 2 * 4;
         let sizes = threadgroup_sizes(Kernel::Msa, &shape);
         assert!(sizes.shared.contains(&nnz_bytes));
+    }
+
+    /// 64 GiB of planning memory, near a large Apple Silicon host.
+    const BIG: DeviceLimits = DeviceLimits {
+        memory_bytes: 64 << 30,
+        tg_memory_bytes: TG_MEMORY_BYTES,
+        max_buffer_bytes: 64 << 30,
+    };
+
+    fn shape_for(connectivity: Connectivity, nodes: usize) -> ModelShape {
+        let (edges, max_degree) = connectivity.size(nodes);
+        ModelShape {
+            nodes,
+            edges,
+            max_degree,
+            precision: Precision::Binary,
+            betas: 64,
+            reads: ADVERTISED_READS,
+        }
+    }
+
+    #[test]
+    fn max_model_is_the_last_shape_that_fits() {
+        for kernel in KERNELS {
+            let connectivity = Connectivity::Degree(20);
+            let (shape, fp) = max_model(kernel, connectivity, Precision::Binary, &BIG, 100)
+                .unwrap_or_else(|| panic!("{kernel:?}: nothing fits"));
+            assert_eq!(footprint(kernel, &shape, &BIG), Ok(fp), "{kernel:?}");
+            let mut bigger = shape_for(connectivity, shape.nodes + 1);
+            bigger.reads = 100;
+            assert!(footprint(kernel, &bigger, &BIG).is_err(), "{kernel:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_near_both_limits_is_refused() {
+        for kernel in KERNELS {
+            let nodes = advertised_nodes(kernel, &BIG, None).unwrap();
+            let couplers = advertised_couplers(kernel, &BIG);
+            let shape = ModelShape {
+                nodes,
+                edges: couplers,
+                max_degree: 20,
+                precision: Precision::Binary,
+                betas: 64,
+                reads: ADVERTISED_READS,
+            };
+            let err = footprint(kernel, &shape, &BIG).unwrap_err();
+            assert!(
+                matches!(err, CapacityError::Memory { .. }),
+                "{kernel:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cap_above_the_limit_names_the_limit() {
+        for kernel in KERNELS {
+            let limit = advertised_nodes(kernel, &BIG, None).unwrap();
+            assert!(limit > 0, "{kernel:?}");
+            assert_eq!(
+                advertised_nodes(kernel, &BIG, Some(usize::MAX)),
+                Err(CapacityError::Nodes { max: limit }),
+                "{kernel:?}"
+            );
+            assert_eq!(advertised_nodes(kernel, &BIG, Some(limit)), Ok(limit));
+            assert_eq!(advertised_nodes(kernel, &BIG, Some(1)), Ok(1));
+        }
+    }
+
+    #[test]
+    fn edges_past_32_bit_indexing_are_refused_whatever_the_memory() {
+        let mut shape = unit_shape();
+        shape.edges = u32::MAX as usize / 2 + 1;
+        for kernel in KERNELS {
+            let err = footprint(kernel, &shape, &ROOMY).unwrap_err();
+            assert!(
+                matches!(err, CapacityError::Buffer { .. }),
+                "{kernel:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_is_monotone_in_the_node_count() {
+        let limits = DeviceLimits {
+            memory_bytes: 1 << 25,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: 1 << 25,
+        };
+        for kernel in KERNELS {
+            for connectivity in [Connectivity::Degree(20), Connectivity::Complete] {
+                let mut failed = false;
+                for nodes in (1..40_000).step_by(97) {
+                    let fits = footprint(kernel, &shape_for(connectivity, nodes), &limits).is_ok();
+                    assert!(!(failed && fits), "{kernel:?} {connectivity:?} {nodes}");
+                    failed |= !fits;
+                }
+                assert!(
+                    failed,
+                    "{kernel:?} {connectivity:?} never reached the limit"
+                );
+            }
+        }
     }
 }
