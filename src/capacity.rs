@@ -138,18 +138,14 @@ pub enum Precision {
 }
 
 impl Precision {
-    /// Bytes per coefficient in the CSR value and field buffers.
+    /// Bytes per coefficient in the CSR value and field buffers, and per
+    /// `delta_energy` entry (one for the narrow representation, four for the
+    /// wide one; `new_sa_persistent`).
     const fn sparse_bytes(self) -> usize {
         match self {
             Self::Binary | Self::Int8 => 1,
             Self::Int32 | Self::Float32 => 4,
         }
-    }
-
-    /// Bytes per entry of the `delta_energy` array: one for the narrow
-    /// representation, four for the wide one (`new_sa_persistent`).
-    const fn delta_bytes(self) -> usize {
-        self.sparse_bytes()
     }
 
     /// Bytes of an `n * n` dense coupling matrix.
@@ -351,7 +347,7 @@ fn sa_persistent(shape: &ModelShape) -> [usize; 4] {
         reads.saturating_mul(shape.nodes.div_ceil(8).max(1)),
         reads
             .saturating_mul(shape.nodes.max(1))
-            .saturating_mul(shape.precision.delta_bytes()),
+            .saturating_mul(shape.precision.sparse_bytes()),
         reads.saturating_mul(4),
         reads.saturating_mul(4),
     ]
@@ -440,9 +436,24 @@ fn largest_buffer(sizes: &Sizes, tiling: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Choose the cheapest tier that admits `shape` and check that it fits.
+/// Models that share one `MTLBuffer` of per-model data.
 ///
-/// Ties go to the earlier tier in the order threadgroup, spill, dense.
+/// All three kernels size a buffer for one batch of
+/// [`batch_size_for_reads`] models: SA and Gibbs through `num_problems` in
+/// `encode_batch_inner` (`src/sampler.rs`), and MSA through the slot pool
+/// capacity (`SlotPool::new`, `src/slots.rs`, whose per-slot regions are
+/// `capacity * size`), which `src/resident.rs` sets to `batch_size_for_reads`
+/// for each of its two pools. [`instances`] counts both batches in flight.
+fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
+    batch_size_for_reads(kernel, reads)
+}
+
+/// Choose the cheapest tier that admits `shape` and fits `limits`.
+///
+/// Tiers are tried from cheapest to dearest by per-model bytes; ties go to
+/// the earlier tier in the order threadgroup, spill, dense. The first tier
+/// that passes both checks is returned. When none passes, the error is the
+/// cheapest tier's.
 ///
 /// # Errors
 ///
@@ -451,9 +462,8 @@ fn largest_buffer(sizes: &Sizes, tiling: usize) -> usize {
 /// - [`CapacityError::Memory`] when `total(instances)` exceeds
 ///   `limits.usable_bytes()`. This check runs first.
 /// - [`CapacityError::Buffer`] when the largest buffer exceeds
-///   `limits.max_buffer_bytes`. A per-model buffer counts for the models of
-///   one in-flight batch (half of [`instances`]); a shared buffer counts
-///   once.
+///   `limits.max_buffer_bytes`. A per-model buffer counts for the
+///   [`models_per_buffer`] models it holds; a shared buffer counts once.
 pub fn footprint(
     kernel: Kernel,
     shape: &ModelShape,
@@ -462,50 +472,47 @@ pub fn footprint(
     if shape.nodes > MAX_NODES {
         return Err(CapacityError::Nodes { max: MAX_NODES });
     }
-    let candidates = [
+    let mut admitted: Vec<(Footprint, usize)> = [
         (Storage::Threadgroup, threadgroup_sizes(kernel, shape)),
         (Storage::Spill, spill_sizes(kernel, shape)),
         (Storage::Dense, dense_sizes(kernel, shape)),
-    ];
+    ]
+    .into_iter()
+    .filter(|(storage, _)| admits(kernel, *storage, shape))
+    .map(|(storage, sizes)| {
+        let tiling = models_per_buffer(kernel, shape.reads);
+        let footprint = Footprint {
+            storage,
+            per_instance_bytes: sum(&sizes.per_instance),
+            shared_bytes: sum(&sizes.shared),
+        };
+        (footprint, largest_buffer(&sizes, tiling))
+    })
+    .collect();
+    // Stable: equal costs keep the tier order.
+    admitted.sort_by_key(|(footprint, _)| footprint.per_instance_bytes);
     let in_flight = instances(kernel, shape.reads);
-    let tiling = (in_flight / 2).max(1);
-    let mut best: Option<(Footprint, usize)> = None;
-    for (storage, sizes) in candidates {
-        if !admits(kernel, storage, shape) {
-            continue;
-        }
-        let per_instance_bytes = sum(&sizes.per_instance);
-        if best.is_some_and(|(chosen, _)| chosen.per_instance_bytes <= per_instance_bytes) {
-            continue;
-        }
-        best = Some((
-            Footprint {
-                storage,
-                per_instance_bytes,
-                shared_bytes: sum(&sizes.shared),
-            },
-            largest_buffer(&sizes, tiling),
-        ));
+    let mut first_error = None;
+    for (footprint, largest) in admitted {
+        let needed = footprint.total(in_flight);
+        let error = if needed > limits.usable_bytes() {
+            CapacityError::Memory {
+                needed,
+                usable: limits.usable_bytes(),
+            }
+        } else if largest > limits.max_buffer_bytes {
+            CapacityError::Buffer {
+                needed: largest,
+                max: limits.max_buffer_bytes,
+            }
+        } else {
+            return Ok(footprint);
+        };
+        first_error.get_or_insert(error);
     }
-    let Some((chosen, largest)) = best else {
-        return Err(CapacityError::Degree {
-            max: MSA_SPARSE_MAX_DEGREE,
-        });
-    };
-    let needed = chosen.total(in_flight);
-    if needed > limits.usable_bytes() {
-        return Err(CapacityError::Memory {
-            needed,
-            usable: limits.usable_bytes(),
-        });
-    }
-    if largest > limits.max_buffer_bytes {
-        return Err(CapacityError::Buffer {
-            needed: largest,
-            max: limits.max_buffer_bytes,
-        });
-    }
-    Ok(chosen)
+    Err(first_error.unwrap_or(CapacityError::Degree {
+        max: MSA_SPARSE_MAX_DEGREE,
+    }))
 }
 
 /// Saturating sum of buffer sizes.
@@ -791,6 +798,57 @@ mod tests {
                 "{kernel:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_costlier_tier_is_used_when_the_cheapest_fails_the_buffer_limit() {
+        // Dense is the cheaper tier (matrix 500,000 bytes against 563,000
+        // bytes of CSR), but its matrix is the largest single buffer. A
+        // limit between the two largest buffers refuses dense only.
+        let shape = ModelShape {
+            nodes: 2_000,
+            edges: 55_555,
+            max_degree: 100,
+            precision: Precision::Binary,
+            betas: 64,
+            reads: 100,
+        };
+        let kernel = Kernel::Sa;
+        let tiling = models_per_buffer(kernel, shape.reads);
+        let dense = dense_sizes(kernel, &shape);
+        let threadgroup = threadgroup_sizes(kernel, &shape);
+        assert!(sum(&dense.per_instance) < sum(&threadgroup.per_instance));
+        let dense_largest = largest_buffer(&dense, tiling);
+        let threadgroup_largest = largest_buffer(&threadgroup, tiling);
+        assert!(dense_largest > threadgroup_largest);
+        let limits = DeviceLimits {
+            memory_bytes: 1 << 40,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: threadgroup_largest,
+        };
+        assert_eq!(
+            footprint(kernel, &shape, &limits).unwrap().storage,
+            Storage::Threadgroup
+        );
+        let roomy = DeviceLimits {
+            max_buffer_bytes: dense_largest,
+            ..limits
+        };
+        assert_eq!(
+            footprint(kernel, &shape, &roomy).unwrap().storage,
+            Storage::Dense
+        );
+        let tight = DeviceLimits {
+            max_buffer_bytes: 1,
+            ..limits
+        };
+        assert_eq!(
+            footprint(kernel, &shape, &tight).unwrap_err(),
+            CapacityError::Buffer {
+                needed: dense_largest,
+                max: 1
+            }
+        );
     }
 
     #[test]
