@@ -46,6 +46,7 @@ compile_error!(
      on no other platform. Build it on macOS (Apple Silicon)."
 );
 
+pub mod capacity;
 pub mod sampler;
 
 mod cascade;
