@@ -273,12 +273,13 @@ pub fn instances(kernel: Kernel, reads: usize) -> usize {
     }
 }
 
-/// One tier's buffers: sizes of the per-model buffers and the shared bytes.
+/// One tier's buffers: the size of each per-model buffer and of each shared
+/// buffer. Each buffer the kernel allocates appears exactly once.
 struct Sizes {
     /// Each per-model buffer, in bytes.
     per_instance: Vec<usize>,
-    /// Bytes shared by all models.
-    shared: usize,
+    /// Each buffer shared by all models, in bytes.
+    shared: Vec<usize>,
 }
 
 /// Threadgroup node cap of a kernel.
@@ -325,13 +326,21 @@ fn csr_buffers(shape: &ModelShape) -> [usize; 4] {
     ]
 }
 
-/// Bytes every kernel shares: the beta schedule and the colour-class node
+/// Buffers every kernel shares: the beta schedule and the colour-class node
 /// list (`encode_batch`, `build_cached_topology`).
-fn common_shared(shape: &ModelShape) -> usize {
-    shape
-        .betas
-        .saturating_mul(4)
-        .saturating_add(shape.nodes.saturating_mul(4))
+fn common_shared(shape: &ModelShape) -> Vec<usize> {
+    vec![shape.betas.saturating_mul(4), shape.nodes.saturating_mul(4)]
+}
+
+/// Carry-over buffers of one model, whatever the tier. They hold the spin
+/// state of every node, so they already cover the nodes past the threadgroup
+/// cap.
+fn persistent_buffers(kernel: Kernel, shape: &ModelShape) -> Vec<usize> {
+    match kernel {
+        Kernel::Sa => sa_persistent(shape).to_vec(),
+        Kernel::Gibbs => gibbs_persistent(shape).to_vec(),
+        Kernel::Msa => msa_persistent(shape).to_vec(),
+    }
 }
 
 /// SA carry-over buffers of one model (`new_sa_persistent`): packed spins,
@@ -380,72 +389,55 @@ fn threadgroup_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     let mut per_instance = Vec::new();
     per_instance.extend(output_buffers(shape));
     let mut shared = common_shared(shape);
-    match kernel {
-        Kernel::Sa => {
-            per_instance.extend(csr);
-            per_instance.extend(sa_persistent(shape));
-        }
-        Kernel::Gibbs => {
-            per_instance.extend(csr);
-            per_instance.extend(gibbs_persistent(shape));
-        }
-        Kernel::Msa => {
-            per_instance.extend(&csr[2..]);
-            shared = shared.saturating_add(csr[0]).saturating_add(csr[1]);
-            per_instance.extend(msa_persistent(shape));
-        }
+    if kernel == Kernel::Msa {
+        per_instance.extend(&csr[2..]);
+        shared.extend(&csr[..2]);
+    } else {
+        per_instance.extend(csr);
     }
+    per_instance.extend(persistent_buffers(kernel, shape));
     Sizes {
         per_instance,
         shared,
     }
 }
 
-/// Bytes of the spin state for the `nodes - K` nodes past the threadgroup
-/// cap `K`, held in a device buffer by the spill and dense tiers. This is
-/// the intended layout of kernels that do not exist yet.
-///
-/// - MSA: `(nodes - K) * words * 4`, with `words = reads / 32`.
-/// - SA: per read, the packed state `ceil((nodes - K) / 8)` plus
-///   `delta_energy` at `(nodes - K) * delta_bytes`.
-/// - Gibbs: one byte per spin per sample, `reads * (nodes - K)`.
-fn spill_state_bytes(kernel: Kernel, shape: &ModelShape) -> usize {
-    let extra = shape.nodes.saturating_sub(node_cap(kernel));
-    let reads = simd_rounded_reads(shape.reads);
-    match kernel {
-        Kernel::Msa => extra.saturating_mul(reads / MSA_LANES).saturating_mul(4),
-        Kernel::Sa => reads.saturating_mul(
-            extra
-                .div_ceil(8)
-                .saturating_add(extra.saturating_mul(shape.precision.delta_bytes())),
-        ),
-        Kernel::Gibbs => reads.saturating_mul(extra),
-    }
-}
-
-/// Spill-tier sizes: the threadgroup-tier buffers plus the spill state.
+/// Spill-tier sizes. The spill kernel keeps the spin state of the
+/// `nodes - K` nodes past the threadgroup cap `K` in device memory. That
+/// state is the carry-over buffers the threadgroup tier already counts (they
+/// hold every node's state), so the spill tier allocates the same buffers
+/// and adds none. This kernel does not exist yet; a later task corrects this
+/// when its layout is known.
 fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
-    let mut sizes = threadgroup_sizes(kernel, shape);
-    sizes.per_instance.push(spill_state_bytes(kernel, shape));
-    sizes
+    threadgroup_sizes(kernel, shape)
 }
 
 /// Dense-tier sizes: an `N * N` coupling matrix at the precision's width
 /// (1 bit, 1, 4, 4 bytes) replaces the CSR structure and couplings. The
-/// fields, the outputs, and the spill-style spin state remain.
+/// fields, the outputs, and the carry-over buffers remain.
 fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     let mut per_instance = vec![
         shape
             .precision
             .dense_bytes(shape.nodes.saturating_mul(shape.nodes)),
         shape.nodes.saturating_mul(shape.precision.sparse_bytes()),
-        spill_state_bytes(kernel, shape),
     ];
     per_instance.extend(output_buffers(shape));
+    per_instance.extend(persistent_buffers(kernel, shape));
     Sizes {
         per_instance,
         shared: common_shared(shape),
     }
+}
+
+/// Largest single buffer: each per-model buffer counted for the `tiling`
+/// models one batch buffer holds, and each shared buffer on its own.
+fn largest_buffer(sizes: &Sizes, tiling: usize) -> usize {
+    let per_instance = sizes.per_instance.iter().map(|&b| b.saturating_mul(tiling));
+    per_instance
+        .chain(sizes.shared.iter().copied())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Choose the cheapest tier that admits `shape` and check that it fits.
@@ -455,11 +447,13 @@ fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
 /// # Errors
 ///
 /// - [`CapacityError::Nodes`] when `shape.nodes` exceeds [`MAX_NODES`].
-/// - [`CapacityError::Buffer`] when the largest buffer, counted for the
-///   models of one in-flight batch (half of [`instances`]), exceeds
-///   `limits.max_buffer_bytes`.
+/// - [`CapacityError::Degree`] when no tier admits the degree.
 /// - [`CapacityError::Memory`] when `total(instances)` exceeds
-///   `limits.usable_bytes()`.
+///   `limits.usable_bytes()`. This check runs first.
+/// - [`CapacityError::Buffer`] when the largest buffer exceeds
+///   `limits.max_buffer_bytes`. A per-model buffer counts for the models of
+///   one in-flight batch (half of [`instances`]); a shared buffer counts
+///   once.
 pub fn footprint(
     kernel: Kernel,
     shape: &ModelShape,
@@ -473,26 +467,24 @@ pub fn footprint(
         (Storage::Spill, spill_sizes(kernel, shape)),
         (Storage::Dense, dense_sizes(kernel, shape)),
     ];
+    let in_flight = instances(kernel, shape.reads);
+    let tiling = (in_flight / 2).max(1);
     let mut best: Option<(Footprint, usize)> = None;
     for (storage, sizes) in candidates {
         if !admits(kernel, storage, shape) {
             continue;
         }
-        let per_instance_bytes = sizes
-            .per_instance
-            .iter()
-            .fold(0usize, |sum, &bytes| sum.saturating_add(bytes));
+        let per_instance_bytes = sum(&sizes.per_instance);
         if best.is_some_and(|(chosen, _)| chosen.per_instance_bytes <= per_instance_bytes) {
             continue;
         }
-        let largest = sizes.per_instance.iter().copied().max().unwrap_or(0);
         best = Some((
             Footprint {
                 storage,
                 per_instance_bytes,
-                shared_bytes: sizes.shared,
+                shared_bytes: sum(&sizes.shared),
             },
-            largest,
+            largest_buffer(&sizes, tiling),
         ));
     }
     let Some((chosen, largest)) = best else {
@@ -500,14 +492,6 @@ pub fn footprint(
             max: MSA_SPARSE_MAX_DEGREE,
         });
     };
-    let in_flight = instances(kernel, shape.reads);
-    let buffer = largest.saturating_mul((in_flight / 2).max(1));
-    if buffer > limits.max_buffer_bytes {
-        return Err(CapacityError::Buffer {
-            needed: buffer,
-            max: limits.max_buffer_bytes,
-        });
-    }
     let needed = chosen.total(in_flight);
     if needed > limits.usable_bytes() {
         return Err(CapacityError::Memory {
@@ -515,7 +499,18 @@ pub fn footprint(
             usable: limits.usable_bytes(),
         });
     }
+    if largest > limits.max_buffer_bytes {
+        return Err(CapacityError::Buffer {
+            needed: largest,
+            max: limits.max_buffer_bytes,
+        });
+    }
     Ok(chosen)
+}
+
+/// Saturating sum of buffer sizes.
+fn sum(sizes: &[usize]) -> usize {
+    sizes.iter().fold(0, |total, &b| total.saturating_add(b))
 }
 
 #[cfg(test)]
@@ -673,7 +668,7 @@ mod tests {
         let limits = DeviceLimits {
             memory_bytes: 1 << 20,
             tg_memory_bytes: TG_MEMORY_BYTES,
-            max_buffer_bytes: usize::MAX,
+            max_buffer_bytes: 1 << 20,
         };
         for kernel in KERNELS {
             let err = footprint(kernel, &sparse_shape(), &limits).unwrap_err();
@@ -724,14 +719,85 @@ mod tests {
     }
 
     #[test]
-    fn spill_state_counts_only_the_nodes_past_the_cap() {
-        let mut shape = unit_shape();
-        shape.reads = 64;
-        shape.nodes = MSA_MAX_NODES + 10;
-        assert_eq!(spill_state_bytes(Kernel::Msa, &shape), 10 * 2 * 4);
-        shape.nodes = SA_MAX_NODES;
-        assert_eq!(spill_state_bytes(Kernel::Sa, &shape), 0);
-        shape.nodes = GIBBS_MAX_NODES + 10;
-        assert_eq!(spill_state_bytes(Kernel::Gibbs, &shape), 64 * 10);
+    fn dense_carries_at_least_the_persistent_buffers() {
+        for kernel in KERNELS {
+            for shape in [unit_shape(), complete_shape()] {
+                let persistent = sum(&persistent_buffers(kernel, &shape));
+                assert!(persistent > 0, "{kernel:?}");
+                let dense = sum(&dense_sizes(kernel, &shape).per_instance);
+                let threadgroup = sum(&threadgroup_sizes(kernel, &shape).per_instance);
+                assert!(dense >= persistent, "{kernel:?}: {dense} < {persistent}");
+                assert!(threadgroup >= persistent, "{kernel:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn spill_counts_each_buffer_once() {
+        for kernel in KERNELS {
+            let shape = sparse_shape();
+            let spill = spill_sizes(kernel, &shape);
+            let threadgroup = threadgroup_sizes(kernel, &shape);
+            assert_eq!(spill.per_instance, threadgroup.per_instance, "{kernel:?}");
+            assert_eq!(spill.shared, threadgroup.shared, "{kernel:?}");
+        }
+    }
+
+    #[test]
+    fn memory_is_checked_before_the_buffer_limit() {
+        let limits = DeviceLimits {
+            memory_bytes: 1 << 20,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: 1 << 10,
+        };
+        let err = footprint(Kernel::Sa, &sparse_shape(), &limits).unwrap_err();
+        assert!(matches!(err, CapacityError::Memory { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_shared_buffer_over_the_limit_is_counted() {
+        let sizes = Sizes {
+            per_instance: vec![10, 20],
+            shared: vec![5, 1_000],
+        };
+        // Per-model buffers are multiplied by the tiling; shared ones are not.
+        assert_eq!(largest_buffer(&sizes, 4), 1_000);
+        assert_eq!(largest_buffer(&sizes, 100), 2_000);
+    }
+
+    #[test]
+    fn a_shared_buffer_alone_over_the_limit_returns_buffer() {
+        let shape = ModelShape {
+            nodes: 10,
+            edges: 10,
+            max_degree: 3,
+            precision: Precision::Int8,
+            betas: 10_000_000,
+            reads: 32,
+        };
+        let limits = DeviceLimits {
+            memory_bytes: 1 << 40,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: 1 << 20,
+        };
+        for kernel in KERNELS {
+            let err = footprint(kernel, &shape, &limits).unwrap_err();
+            assert_eq!(
+                err,
+                CapacityError::Buffer {
+                    needed: 40_000_000,
+                    max: 1 << 20
+                },
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn msa_col_ind_is_in_the_shared_buffers() {
+        let shape = unit_shape();
+        let nnz_bytes = shape.edges * 2 * 4;
+        let sizes = threadgroup_sizes(Kernel::Msa, &shape);
+        assert!(sizes.shared.contains(&nnz_bytes));
     }
 }
