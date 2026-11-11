@@ -92,11 +92,15 @@ fn large_and_wide_range_coefficients_are_solved_or_refused() {
             "{kernel:?}"
         );
     }
-    // Past the wide bound, SA runs its Float32 build; MSA has none yet.
-    assert_eq!(
-        best(&dev, &too_wide, Kernel::Sa, 500),
-        brute_force_min(&too_wide)
-    );
+    // Past the wide bound, SA and Gibbs run their Float32 builds; MSA has
+    // none yet.
+    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        assert_eq!(
+            best(&dev, &too_wide, kernel, 500),
+            brute_force_min(&too_wide),
+            "{kernel:?}"
+        );
+    }
     let err = sample_ising(&dev, &too_wide, &params(16), Kernel::Msa).unwrap_err();
     assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
 }
@@ -147,7 +151,6 @@ fn a_non_representable_model_is_refused_as_capacity() {
     let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
     let non_finite = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
     for (graph, kernel) in [
-        (&off_step, Kernel::Gibbs),
         (&off_step, Kernel::Msa),
         (&non_finite, Kernel::Sa),
         (&non_finite, Kernel::Gibbs),
@@ -159,8 +162,9 @@ fn a_non_representable_model_is_refused_as_capacity() {
             "{kernel:?}: {err:?}"
         );
     }
-    // SA runs the off-step model on its Float32 build.
+    // SA and Gibbs run the off-step model on their Float32 builds.
     best(&dev, &off_step, Kernel::Sa, 64);
+    best(&dev, &off_step, Kernel::Gibbs, 64);
 }
 
 #[test]

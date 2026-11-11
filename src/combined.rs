@@ -1345,14 +1345,17 @@ mod tests {
         let mut facts = EdgeFactsCache::default();
         let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
         assert_eq!(
-            eligibility(Kernel::Gibbs, &off_step, &params, cfg, &mut facts),
+            eligibility(Kernel::Msa, &off_step, &params, cfg, &mut facts),
             [false, false]
         );
-        // SA runs an off-step model on its Float32 build.
-        assert_eq!(
-            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
-            [true, false]
-        );
+        // SA and Gibbs run an off-step model on their Float32 builds.
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            assert_eq!(
+                eligibility(kernel, &off_step, &params, cfg, &mut facts),
+                [true, false],
+                "{kernel:?}"
+            );
+        }
         let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
         assert_eq!(
             eligibility(Kernel::Sa, &pm1, &params, cfg, &mut facts),

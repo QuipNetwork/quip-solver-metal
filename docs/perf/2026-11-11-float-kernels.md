@@ -73,3 +73,55 @@ Float32 SA divided by int8 SA is `37.6167 / 30.2229 = 1.2446`. Rounded up to one
 The load average before the int8 run was 20.91. If that load slowed the int8 run, the true ratio is higher than 1.2446. The int8 SA time of the base run, 30.5262 seconds, is within 1% of the int8 time of this run. This agreement makes a large error unlikely. With the base time, the ratio is 1.2323, which also rounds up to 1.3.
 
 The mean best energy of the Float32 jobs is not comparable with the int8 value, because every coefficient is 1.0005 times larger.
+
+## Gibbs
+
+Float32 Gibbs takes 1.24 times the int8 Gibbs time per job on the Advantage2 jobs. `FLOAT_GIBBS_COST_FACTOR` is 1.3, the measured ratio rounded up. Both Gibbs entry points have a `QUIP_FLOAT` build: the sequential `block_gibbs_sampler` and the node-parallel `block_gibbs_parallel`, which is the default dispatch. Float32 uses the same dispatch geometry as the wide build in each case.
+
+### Host and load
+
+The host was an Apple M4 Max with 16 logical CPUs and 128 GiB of memory. Other sessions were active on the host, so other GPU and CPU work possibly ran during the timed runs.
+
+`uptime` immediately before each timed run reported:
+
+| Run | Uptime output |
+| --- | --- |
+| Int8 ±1 | `18:42  up 20 days,  4:49, 5 users, load averages: 13.17 8.04 8.13` |
+| Float32 ±1.0005 | `18:47  up 20 days,  4:53, 5 users, load averages: 3.86 5.71 7.07` |
+
+### Commands and method
+
+The method is the method of the Simulated annealing section. The working tree was `0c31d25` with this change applied. The runs were sequential in one supervised script. `QUIP_PM1_SCALE=float` now runs both SA and Gibbs.
+
+```sh
+cargo test --release --test pm1_rates --no-run
+uptime
+cargo test --release --test pm1_rates -- --ignored --nocapture
+uptime
+QUIP_PM1_SCALE=float cargo test --release --test pm1_rates -- --ignored --nocapture
+```
+
+### Raw measurements
+
+Int8 ±1, with this change:
+
+```json
+{"kernel":"Sa","scale":1,"median_s":30.1612,"mean_best_milli":-14954500.0,"digest":"e4e22f86b64cda5d"}
+{"kernel":"Gibbs","scale":1,"median_s":0.5024,"mean_best_milli":-14952750.0,"digest":"bc085a7fc384f073"}
+{"kernel":"Msa","scale":1,"median_s":0.1598,"mean_best_milli":-14961000.0,"digest":"6ec8d35ff7c9f123"}
+```
+
+Float32 ±1.0005:
+
+```json
+{"kernel":"Sa","scale":1.0005,"median_s":37.6302,"mean_best_milli":-14977712.8,"digest":"04210f9bbe78e5d8"}
+{"kernel":"Gibbs","scale":1.0005,"median_s":0.6207,"mean_best_milli":-14967702.8,"digest":"eabc348f9005570c"}
+```
+
+### Identical int8 reads
+
+The int8 digests for SA, Gibbs, and MSA equal the digests that the SA section records for the commit before this change (`e4e22f86b64cda5d`, `bc085a7fc384f073`, `6ec8d35ff7c9f123`). The int8 Gibbs build keeps its arithmetic and its device energy.
+
+### Cost ratio
+
+Float32 Gibbs divided by int8 Gibbs is `0.6207 / 0.5024 = 1.2355`. Rounded up to one decimal, this sets `FLOAT_GIBBS_COST_FACTOR` to `1.3`. A Gibbs job takes about half a second on these jobs, so the ratio is less precise than the SA ratio. The Float32 SA ratio of 1.2446 agrees with it. The mean best energy of the Float32 jobs is not comparable with the int8 value, because every coefficient is 1.0005 times larger.

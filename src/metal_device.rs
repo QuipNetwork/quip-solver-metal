@@ -79,11 +79,15 @@ pub struct MetalDevice {
     pub(crate) sa_float: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
     pub(crate) gibbs_wide: ComputePipelineState,
+    /// `gibbs` for Float32 models: `float` coefficients and heat-bath.
+    pub(crate) gibbs_float: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
     pub(crate) gibbs_parallel: ComputePipelineState,
     pub(crate) gibbs_parallel_wide: ComputePipelineState,
+    /// `gibbs_parallel` for Float32 models.
+    pub(crate) gibbs_parallel_float: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
@@ -147,9 +151,12 @@ impl MetalDevice {
         let sa_float = compile_pipeline(&device, &float(SA_SRC), "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
+        let gibbs_float = compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
         let gibbs_parallel_wide =
             compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
+        let gibbs_parallel_float =
+            compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
@@ -167,8 +174,10 @@ impl MetalDevice {
             sa_float,
             gibbs,
             gibbs_wide,
+            gibbs_float,
             gibbs_parallel,
             gibbs_parallel_wide,
+            gibbs_parallel_float,
             msa,
             msa_weighted,
             msa_slots,
@@ -286,7 +295,9 @@ mod tests {
             ("sa_wide", &dev.sa_wide),
             ("sa_float", &dev.sa_float),
             ("gibbs_wide", &dev.gibbs_wide),
+            ("gibbs_float", &dev.gibbs_float),
             ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
+            ("gibbs_parallel_float", &dev.gibbs_parallel_float),
             ("msa_weighted", &dev.msa_weighted),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();

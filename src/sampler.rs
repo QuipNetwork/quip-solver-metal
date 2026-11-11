@@ -170,6 +170,9 @@ const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
 /// Float32 SA work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-11-11-float-kernels.md`.
 const FLOAT_SA_COST_FACTOR: f64 = 1.3;
+/// Float32 Gibbs work per spin update for chunk sizing, measured in
+/// `docs/perf/2026-11-11-float-kernels.md`.
+const FLOAT_GIBBS_COST_FACTOR: f64 = 1.3;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -1041,8 +1044,8 @@ pub(crate) fn sa_tier(rep: Representation, kernel: Kernel) -> Representation {
 /// `encode_batch_inner`, and its coefficient upload in `upload_inputs`.
 pub(crate) fn has_float32_kernel(kernel: Kernel) -> bool {
     match kernel {
-        Kernel::Sa => true,
-        Kernel::Gibbs | Kernel::Msa => false,
+        Kernel::Sa | Kernel::Gibbs => true,
+        Kernel::Msa => false,
     }
 }
 
@@ -1599,8 +1602,10 @@ fn encode_batch_inner(
         Kernel::Msa if wide => &device.msa_weighted,
         Kernel::Msa => &device.msa,
         Kernel::Gibbs if node_parallel && wide => &device.gibbs_parallel_wide,
+        Kernel::Gibbs if node_parallel && float => &device.gibbs_parallel_float,
         Kernel::Gibbs if node_parallel => &device.gibbs_parallel,
         Kernel::Gibbs if wide => &device.gibbs_wide,
+        Kernel::Gibbs if float => &device.gibbs_float,
         Kernel::Gibbs => &device.gibbs,
     };
 
@@ -1689,8 +1694,9 @@ fn encode_batch_inner(
         (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
         (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
-        // `kernel_representation` refuses Float32 on the other kernels.
-        (Representation::Float32, Kernel::Gibbs | Kernel::Msa)
+        (Representation::Float32, Kernel::Gibbs) => FLOAT_GIBBS_COST_FACTOR,
+        // `kernel_representation` refuses Float32 on MSA.
+        (Representation::Float32, Kernel::Msa)
         | (Representation::Binary | Representation::Int8, _) => 1.0,
     };
     let plan = match plan_override {
@@ -2481,15 +2487,15 @@ mod tests {
             ..Default::default()
         };
         let off_grid = IsingGraph::new(vec![0.1 + 0.2, 0.0], vec![1.0], vec![(0, 1)]);
-        for kernel in [Kernel::Gibbs, Kernel::Msa] {
-            let err = validate_batch(&[&off_grid], &params, kernel).unwrap_err();
-            assert!(
-                matches!(&err, SampleError::TooLarge(m) if m.contains("Float32")),
-                "{err:?}"
-            );
+        let err = validate_batch(&[&off_grid], &params, Kernel::Msa).unwrap_err();
+        assert!(
+            matches!(&err, SampleError::TooLarge(m) if m.contains("Float32")),
+            "{err:?}"
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let (_, _, rep) = validate_batch(&[&off_grid], &params, kernel).unwrap();
+            assert_eq!(rep, Representation::Float32, "{kernel:?}");
         }
-        let (_, _, rep) = validate_batch(&[&off_grid], &params, Kernel::Sa).unwrap();
-        assert_eq!(rep, Representation::Float32);
     }
 
     fn too_large(result: Result<(), SampleError>) -> String {

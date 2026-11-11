@@ -16,13 +16,19 @@ using namespace metal;
 
 typedef unsigned int uint;
 
-#ifdef QUIP_WIDE
+#if defined(QUIP_WIDE)
 typedef int coef_t;
 typedef int field_t;
 #define WIDE_ROW 2048
+#elif defined(QUIP_FLOAT)
+// Real-valued models: float coefficients, float field, float heat-bath.
+// The host scores float samples from the original f64 graph.
+typedef float coef_t;
+typedef float field_t;
 #else
 typedef int8_t coef_t;
 typedef float field_t;
+#define QUIP_DEVICE_ENERGY 1
 #endif
 
 // ==============================================================================
@@ -182,7 +188,12 @@ inline field_t compute_effective_field_shared(
 inline int8_t gibbs_sample(float h_eff, float beta, thread RngState &rng_state) {
     // Compute probability of spin = +1
     // P(+1) = 1 / (1 + exp(2 * beta * h_eff))
+#ifdef QUIP_FLOAT
+    // The admitted field keeps 2 * h_eff finite; 2 * beta need not fit.
+    float prob_plus = 1.0f / (1.0f + exp((2.0f * h_eff) * beta));
+#else
     float prob_plus = 1.0f / (1.0f + exp(2.0f * beta * h_eff));
+#endif
 
     // Sample from Bernoulli
     uint rand_val = xoshiro128starstar(rng_state);
@@ -397,8 +408,8 @@ kernel void block_gibbs_sampler(
         }
     }
 
-#ifdef QUIP_WIDE
-    // The host scores wide samples; their total energy can exceed int.
+#ifndef QUIP_DEVICE_ENERGY
+    // The host scores wide and float samples; their energy can exceed int.
 #else
     // Compute final energy: E = sum_i(h_i * x_i) + sum_{i<j}(J_ij * x_i * x_j)
     int current_energy = 0;
@@ -443,8 +454,8 @@ kernel void block_gibbs_sampler(
         output[byte_idx] = packed_state[byte_idx];
     }
 
-#ifdef QUIP_WIDE
-    // No device energy is needed for wide samples.
+#ifndef QUIP_DEVICE_ENERGY
+    // No device energy is needed for wide or float samples.
 #else
     final_energies[thread_id] = current_energy;
 #endif
@@ -651,7 +662,11 @@ kernel void block_gibbs_parallel(
 #else
                     if (update_mode == 0) {
                         // Gibbs sampling
+#ifdef QUIP_FLOAT
+                        float prob_plus = 1.0f / (1.0f + exp((2.0f * h_eff) * beta));
+#else
                         float prob_plus = 1.0f / (1.0f + exp(2.0f * beta * h_eff));
+#endif
                         uint rand_val = xoshiro128starstar(rng_state);
                         float rand_normalized = float(rand_val) / 4294967295.0f;
                         new_spin = (rand_normalized < prob_plus) ? 1 : -1;
@@ -697,8 +712,8 @@ kernel void block_gibbs_parallel(
         }
     }
 
-#ifdef QUIP_WIDE
-    // The host scores wide samples; their total energy can exceed int.
+#ifndef QUIP_DEVICE_ENERGY
+    // The host scores wide and float samples; their energy can exceed int.
 #else
     // Compute final energy collaboratively
     // Each thread computes partial energy for its subset of nodes

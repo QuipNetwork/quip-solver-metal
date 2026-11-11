@@ -80,7 +80,7 @@ fn pm1_rates() {
     let dev = MetalDevice::open(0).unwrap();
     let (scale, kernels): (f64, &[Kernel]) = match std::env::var("QUIP_PM1_SCALE").as_deref() {
         Ok("wide") => (1.5, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
-        Ok("float") => (1.0005, &[Kernel::Sa]),
+        Ok("float") => (1.0005, &[Kernel::Sa, Kernel::Gibbs]),
         _ => (1.0, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
     };
     let edges = edges();

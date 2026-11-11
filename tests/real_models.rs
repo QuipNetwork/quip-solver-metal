@@ -196,3 +196,27 @@ mod sa {
         super::chunked_and_unchunked_real_anneals_match(Kernel::Sa);
     }
 }
+
+mod gibbs {
+    use super::Kernel;
+
+    #[test]
+    fn a_real_model_returns_exact_energies() {
+        super::a_real_model_returns_exact_energies(Kernel::Gibbs);
+    }
+
+    #[test]
+    fn portfolio_models_reach_their_ground_states() {
+        super::portfolio_models_reach_their_ground_states(Kernel::Gibbs);
+    }
+
+    #[test]
+    fn a_model_whose_schedule_overflows_f32_is_refused() {
+        super::a_model_whose_schedule_overflows_f32_is_refused(Kernel::Gibbs);
+    }
+
+    #[test]
+    fn chunked_and_unchunked_real_anneals_match() {
+        super::chunked_and_unchunked_real_anneals_match(Kernel::Gibbs);
+    }
+}
