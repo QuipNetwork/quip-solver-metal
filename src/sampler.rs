@@ -1067,15 +1067,14 @@ pub(crate) fn kernel_representation(
 }
 
 /// Refuse a Float32 model that the `float` kernel arithmetic cannot hold:
-/// a beta past the finite `f32` range, a rounded local field whose delta
-/// `2 * field` overflows, or a largest beta times the largest delta that
-/// overflows the `beta * delta` product of the Metropolis test.
+/// a beta past the finite `f32` range, or a rounded local field whose delta
+/// `2 * field` overflows.
 ///
 /// The field rule is CUDA's `check_real_fields` (commit `4bc82bb`) in its
 /// order-independent form: the `f64` sum of the `f32` magnitudes of `h` and
 /// the row's couplings, widened by the rounding bound of `degree + 1` `f32`
 /// additions. The beta rule is CUDA's `build_planned_beta_schedule` (commit
-/// `7d97e41`). The product rule is this plan's review-focus item 3.
+/// `7d97e41`).
 fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
     if let Some(index) = beta.iter().position(|b| !b.is_finite()) {
         return Err(SampleError::TooLarge(format!(
@@ -1108,18 +1107,10 @@ fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleEr
             }
         })
         .fold(0.0, f64::max);
-    let float_max = f64::from(f32::MAX);
-    if max_delta > float_max {
+    if max_delta > f64::from(f32::MAX) {
         return Err(SampleError::TooLarge(
             "a local field exceeds the finite f32 delta range after rounding".into(),
         ));
-    }
-    let max_beta = beta.iter().map(|b| f64::from(b.abs())).fold(0.0, f64::max);
-    if max_beta * max_delta > float_max {
-        return Err(SampleError::TooLarge(format!(
-            "the beta schedule's largest beta {max_beta:e} times the largest delta \
-             {max_delta:e} overflows f32"
-        )));
     }
     Ok(())
 }
@@ -2516,14 +2507,14 @@ mod tests {
     }
 
     #[test]
-    fn a_schedule_whose_beta_times_delta_overflows_f32_is_refused() {
+    fn a_large_beta_beside_a_large_coupling_is_admitted() {
+        // The kernel skips a flip when `de >= 22.18 / beta`, so `de * beta`
+        // stays small wherever `exp` runs. CUDA admits these models too.
         let graph = IsingGraph::new(vec![0.0, 0.0, 1e-12], vec![1e30], vec![(0, 1)]);
         let (beta, _) = build_beta_schedule(&graph, 64, 1, None, BetaSchedule::Geometric);
-        let message = too_large(check_float_schedule(&graph, &beta));
-        assert!(message.contains("overflows f32"), "{message}");
-        // An explicit schedule overflows the same coupling alone.
+        check_float_schedule(&graph, &beta).unwrap();
         let bond = IsingGraph::new(vec![0.0; 2], vec![1e30], vec![(0, 1)]);
-        too_large(check_float_schedule(&bond, &[1.0, 1e9]));
+        check_float_schedule(&bond, &[1.0, 1e9]).unwrap();
     }
 
     #[test]

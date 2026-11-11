@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     #[expect(clippy::print_stderr, reason = "report GPU pipeline thread maxima")]
-    fn wide_pipelines_compile_and_admit_a_simd_group() {
+    fn wide_and_float_pipelines_compile_and_admit_a_simd_group() {
         if MetalDevice::device_count() == 0 {
             return;
         }

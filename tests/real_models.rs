@@ -129,13 +129,14 @@ fn portfolio_models_reach_their_ground_states(kernel: Kernel) {
     }
 }
 
-/// A 1e30 coupling beside a 1e-12 field: the default schedule's cold beta,
-/// about 2.3e12, times the coupling's delta of 2e30 is past `f32::MAX`.
+/// 64 fields of 1.2e-38: the default schedule's cold beta, about 3.6e38, is
+/// past `f32::MAX` (CUDA commit `7d97e41`). A large coupling alone is
+/// admitted, as in CUDA.
 fn a_model_whose_schedule_overflows_f32_is_refused(kernel: Kernel) {
     let Some(dev) = device() else {
         return;
     };
-    let graph = IsingGraph::new(vec![0.0, 0.0, 1e-12], vec![1e30], vec![(0, 1)]);
+    let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
     let params = SampleParams {
         num_reads: 32,
         num_sweeps: 64,
@@ -143,7 +144,7 @@ fn a_model_whose_schedule_overflows_f32_is_refused(kernel: Kernel) {
     };
     let err = sample_ising(&dev, &graph, &params, kernel).unwrap_err();
     assert!(
-        matches!(&err, SampleError::TooLarge(m) if m.contains("overflows f32")),
+        matches!(&err, SampleError::TooLarge(m) if m.contains("beta") && m.contains("f32")),
         "{err:?}"
     );
     assert_eq!(
