@@ -67,6 +67,7 @@ mod wide_tables;
 
 pub mod iokit_gov;
 pub mod metal_device;
+pub mod model_file;
 pub mod streaming;
 pub mod topology;
 
