@@ -7,14 +7,16 @@
 
 use crate::capacity::{max_model, Connectivity, DeviceLimits, Precision};
 use crate::sampler::Kernel;
+use serde::{Serialize, Serializer};
 use std::io::Write;
 
 /// The largest model of one connectivity and precision.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProbeCell {
     /// `degree-20`, `degree-60`, or `complete`.
     pub connectivity: String,
     /// Coefficient type.
+    #[serde(serialize_with = "serialize_precision")]
     pub precision: Precision,
     /// Nodes of the largest admitted model; 0 when none fits.
     pub nodes: usize,
@@ -45,6 +47,18 @@ const fn precision_name(precision: Precision) -> &'static str {
         Precision::Int32 => "int32",
         Precision::Float32 => "float32",
     }
+}
+
+/// Serialize a precision as its lowercase name.
+fn serialize_precision<S: Serializer>(precision: &Precision, out: S) -> Result<S::Ok, S::Error> {
+    out.serialize_str(precision_name(*precision))
+}
+
+/// The JSON object `--probe-capacity --json` prints.
+#[derive(Serialize)]
+struct ProbeReport<'a> {
+    kernel: &'static str,
+    cells: &'a [ProbeCell],
 }
 
 /// Name of a kernel, as the binaries and the JSON output print it.
@@ -106,30 +120,17 @@ fn render_probe(kernel: Kernel, limits: &DeviceLimits, json: bool) -> String {
     let reads = crate::streaming::max_reads(kernel) as usize;
     let cells = probe(kernel, limits, reads);
     if json {
-        // Every string is a fixed ASCII name, so no escaping is needed.
-        let cells: Vec<String> = cells
-            .iter()
-            .map(|cell| {
-                format!(
-                    "{{\"connectivity\":\"{}\",\"precision\":\"{}\",\"nodes\":{},\
-                     \"couplers\":{},\"bytes_per_instance\":{},\"tier\":\"{}\",\
-                     \"slowdown\":{}}}",
-                    cell.connectivity,
-                    precision_name(cell.precision),
-                    cell.nodes,
-                    cell.couplers,
-                    cell.bytes_per_instance,
-                    cell.tier,
-                    cell.slowdown
-                        .map_or_else(|| "null".to_owned(), |x| x.to_string()),
-                )
-            })
-            .collect();
-        return format!(
-            "{{\"kernel\":\"{}\",\"cells\":[{}]}}\n",
-            kernel_name(kernel),
-            cells.join(",")
-        );
+        let report = ProbeReport {
+            kernel: kernel_name(kernel),
+            cells: &cells,
+        };
+        return match serde_json::to_string(&report) {
+            Ok(text) => text + "\n",
+            Err(error) => {
+                tracing::warn!(%error, "could not serialize the capacity probe");
+                String::new()
+            }
+        };
     }
     let mut text = format!(
         "kernel {}: {} usable bytes\n{:<10} {:<8} {:>12} {:>16} {:>18} tier\n",
