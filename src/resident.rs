@@ -758,7 +758,7 @@ impl Preparer {
         // Slots run the unit kernel only. Weighted models, and refusals,
         // take the batch path, which classifies them again.
         let unit = crate::representation::classify_msa(&job.graph)
-            == Ok(crate::representation::Representation::Int8);
+            == Ok(crate::representation::Representation::Binary);
         if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);

@@ -354,10 +354,12 @@ fn eligibility(
         && n <= crate::sampler::kernel_max_nodes(kernel)
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
+    // No Float32 kernel exists yet, so it is a refusal like a classifier error.
+    let runnable = |rep: Result<crate::representation::Representation, String>| matches!(rep, Ok(r) if r != crate::representation::Representation::Float32);
     metal &= if kernel == Kernel::Msa {
-        crate::representation::classify_msa(graph).is_ok()
+        runnable(crate::representation::classify_msa(graph))
     } else {
-        crate::representation::classify(graph).is_ok()
+        runnable(crate::representation::classify(graph))
     };
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa

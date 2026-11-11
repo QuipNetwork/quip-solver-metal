@@ -259,11 +259,14 @@ fn representation(
     job: &StreamJob,
     kernel: Kernel,
 ) -> Option<crate::representation::Representation> {
-    if kernel == Kernel::Msa {
+    let rep = if kernel == Kernel::Msa {
         crate::representation::classify_msa(&job.graph).ok()
     } else {
         crate::representation::classify(&job.graph).ok()
-    }
+    };
+    // No Float32 kernel exists yet, so it is a refusal like a classifier error.
+    rep.filter(|&rep| rep != crate::representation::Representation::Float32)
+        .map(|rep| crate::sampler::sa_tier(rep, kernel))
 }
 
 impl<'a> BatchKey<'a> {

@@ -41,9 +41,7 @@ pub enum Kernel {
     Gibbs,
 }
 
-use crate::capacity::{
-    footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape, Precision,
-};
+use crate::capacity::{footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape};
 use crate::representation::{classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
@@ -1025,6 +1023,23 @@ fn max_csr_degree(graph: &IsingGraph) -> usize {
     degree.into_iter().max().unwrap_or(0)
 }
 
+/// The int8 SA and Gibbs build runs `Binary` and `Int8` models alike, so the
+/// two tiers are one batch group there. MSA keeps `Binary` for its unit kernel.
+pub(crate) fn sa_tier(rep: Representation, kernel: Kernel) -> Representation {
+    if kernel != Kernel::Msa && rep == Representation::Binary {
+        Representation::Int8
+    } else {
+        rep
+    }
+}
+
+/// The capacity refusal for a model only a Float32 kernel could run.
+fn no_float32_kernel() -> SampleError {
+    SampleError::TooLarge(
+        "the model needs Float32 coefficients, and no Float32 kernel exists yet".into(),
+    )
+}
+
 /// The one representation every graph in a batch shares, or a capacity
 /// refusal. `BatchKey` keeps representations apart, so a mix is a driver bug.
 fn batch_representation(
@@ -1039,6 +1054,10 @@ fn batch_representation(
             classify(graph)
         }
         .map_err(SampleError::TooLarge)?;
+        let rep = sa_tier(rep, kernel);
+        if rep == Representation::Float32 {
+            return Err(no_float32_kernel());
+        }
         if shared.is_some_and(|prev| prev != rep) {
             return Err(SampleError::Driver(
                 "a batch mixes int8 and wide models".into(),
@@ -1133,10 +1152,7 @@ fn admit_footprint(
         nodes: graph.num_nodes(),
         edges: graph.edges.len(),
         max_degree: max_csr_degree(graph),
-        precision: match rep {
-            Representation::Int8 => Precision::Int8,
-            Representation::Wide => Precision::Int32,
-        },
+        precision: rep.precision(),
         // `num_sweeps` bounds the beta schedule length from above.
         betas: params.num_sweeps,
         reads: params.num_reads,
@@ -1221,7 +1237,8 @@ fn upload_inputs(
                 )
             }
         }
-        Representation::Int8 => {
+        Representation::Float32 => return Err(no_float32_kernel()),
+        Representation::Binary | Representation::Int8 => {
             let mut all_j = vec![0i8; num_problems * nnz_alloc];
             let mut all_h = vec![0i8; num_problems * n];
             for (p, graph) in graphs.iter().enumerate() {
@@ -2322,8 +2339,27 @@ mod tests {
         let quarter = IsingGraph::new(vec![0.25, 0.0], vec![-0.75], vec![(0, 1)]);
         let (_, _, rep) = validate_batch(&[&pm1], &params, Kernel::Sa).unwrap();
         assert_eq!(rep, Representation::Int8);
+        let (_, _, rep) = validate_batch(&[&pm1], &params, Kernel::Msa).unwrap();
+        assert_eq!(rep, Representation::Binary);
         let (_, _, rep) = validate_batch(&[&quarter], &params, Kernel::Sa).unwrap();
         assert_eq!(rep, Representation::Wide);
+    }
+
+    #[test]
+    fn validate_batch_refuses_float32_models_as_a_capacity_error() {
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 8,
+            ..Default::default()
+        };
+        let off_grid = IsingGraph::new(vec![0.1 + 0.2, 0.0], vec![1.0], vec![(0, 1)]);
+        for kernel in [Kernel::Sa, Kernel::Msa] {
+            let err = validate_batch(&[&off_grid], &params, kernel).unwrap_err();
+            assert!(
+                matches!(&err, SampleError::TooLarge(m) if m.contains("Float32")),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
