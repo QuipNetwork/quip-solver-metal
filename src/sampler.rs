@@ -1152,7 +1152,12 @@ fn admit_footprint(
         nodes: graph.num_nodes(),
         edges: graph.edges.len(),
         max_degree: max_csr_degree(graph),
-        precision: rep.precision(),
+        // No bit-packed kernel exists, so a Binary model costs what Int8 does.
+        precision: if rep == Representation::Binary {
+            Representation::Int8.precision()
+        } else {
+            rep.precision()
+        },
         // `num_sweeps` bounds the beta schedule length from above.
         betas: params.num_sweeps,
         reads: params.num_reads,
