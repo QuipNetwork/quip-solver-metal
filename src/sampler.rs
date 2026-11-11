@@ -41,6 +41,9 @@ pub enum Kernel {
     Gibbs,
 }
 
+use crate::capacity::{
+    footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape, Precision,
+};
 use crate::representation::{classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
@@ -638,6 +641,27 @@ pub(crate) struct BufferPool {
 impl BufferPool {
     /// Smallest free buffer with `len <= length <= 2 * len`, else a new shared buffer.
     pub(crate) fn take(&self, device: &metal::DeviceRef, len: u64) -> metal::Buffer {
+        self.take_free(len)
+            .unwrap_or_else(|| device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared))
+    }
+
+    /// [`Self::take`], refusing as a capacity error when the device cannot
+    /// allocate a new buffer.
+    pub(crate) fn try_take(
+        &self,
+        device: &metal::DeviceRef,
+        len: u64,
+    ) -> Result<metal::Buffer, SampleError> {
+        match self.take_free(len) {
+            Some(buf) => Ok(buf),
+            None => {
+                checked_buffer(device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared))
+            }
+        }
+    }
+
+    /// The smallest free buffer that fits `len`, if any.
+    fn take_free(&self, len: u64) -> Option<metal::Buffer> {
         let mut free = self
             .free
             .lock()
@@ -651,11 +675,7 @@ impl BufferPool {
                 best_len = length;
             }
         }
-        if let Some(index) = best_index {
-            return free.swap_remove(index);
-        }
-        drop(free);
-        device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared)
+        best_index.map(|index| free.swap_remove(index))
     }
 
     /// Keep `buf` if the pool holds fewer than 64 buffers.
@@ -678,19 +698,19 @@ fn pooled_from_slice<T: Copy>(
     pool: &BufferPool,
     device: &metal::DeviceRef,
     data: &[T],
-) -> metal::Buffer {
+) -> Result<metal::Buffer, SampleError> {
     let bytes = std::mem::size_of_val(data);
     if bytes == 0 {
-        let buf = pool.take(device, 4);
+        let buf = pool.try_take(device, 4)?;
         // SAFETY: `take(4)` returns StorageModeShared storage of at least 4
         // bytes, so `contents()` maps those bytes on the host. The write stays
         // inside that mapping.
         unsafe {
             std::ptr::write_bytes(buf.contents().cast::<u8>(), 0, 4);
         }
-        return buf;
+        return Ok(buf);
     }
-    let buf = pool.take(device, bytes as u64);
+    let buf = pool.try_take(device, bytes as u64)?;
     // SAFETY: `take` returns StorageModeShared storage of at least `bytes`
     // bytes, so `contents()` is a non-null host mapping of that many bytes.
     // `data` is a separate allocation and cannot overlap the mapping.
@@ -701,7 +721,7 @@ fn pooled_from_slice<T: Copy>(
             bytes,
         );
     }
-    buf
+    Ok(buf)
 }
 
 /// A prepared batch retaining its inputs and carry-over state between chunks.
@@ -1039,6 +1059,25 @@ pub(crate) fn validate_batch<'a>(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
+    validate_batch_within(graphs, params, kernel, host_device_limits())
+}
+
+/// Memory limits of this host, computed once.
+fn host_device_limits() -> &'static DeviceLimits {
+    static LIMITS: std::sync::OnceLock<DeviceLimits> = std::sync::OnceLock::new();
+    LIMITS.get_or_init(host_limits)
+}
+
+/// [`validate_batch`] against explicit memory `limits`.
+///
+/// The footprint check comes last and runs before any buffer exists, so a
+/// model that does not fit is refused without allocating.
+fn validate_batch_within<'a>(
+    graphs: &[&'a IsingGraph],
+    params: &SampleParams,
+    kernel: Kernel,
+    limits: &DeviceLimits,
+) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
         // batch would have indexed `graphs[0]` and panicked the miner.
@@ -1078,7 +1117,51 @@ pub(crate) fn validate_batch<'a>(
         )));
     }
     let rep = batch_representation(graphs, kernel)?;
+    admit_footprint(first, params, kernel, rep, limits)?;
     Ok((first, n, rep))
+}
+
+/// Refuse a batch whose models in flight need more than the usable memory.
+fn admit_footprint(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    rep: Representation,
+    limits: &DeviceLimits,
+) -> Result<(), SampleError> {
+    let shape = ModelShape {
+        nodes: graph.num_nodes(),
+        edges: graph.edges.len(),
+        max_degree: max_csr_degree(graph),
+        precision: match rep {
+            Representation::Int8 => Precision::Int8,
+            Representation::Wide => Precision::Int32,
+        },
+        // `num_sweeps` bounds the beta schedule length from above.
+        betas: params.num_sweeps,
+        reads: params.num_reads,
+    };
+    // `footprint` compares the total for `instances` with `usable_bytes`.
+    capacity_footprint(kernel, &shape, limits)
+        .map(drop)
+        .map_err(|e| {
+            SampleError::TooLarge(format!("{kernel:?} model of {} nodes: {e}", shape.nodes))
+        })
+}
+
+/// A buffer, or a capacity refusal when the allocation returned a null
+/// handle. Metal reports a failed allocation as nil, and metal-rs hands that
+/// back as a `Buffer` rather than an `Option`.
+pub(crate) fn checked_buffer(buffer: metal::Buffer) -> Result<metal::Buffer, SampleError> {
+    use metal::foreign_types::ForeignType;
+    require_buffer((!buffer.as_ptr().is_null()).then_some(buffer))
+}
+
+/// `buffer`, or a capacity refusal when it is `None`.
+fn require_buffer(buffer: Option<metal::Buffer>) -> Result<metal::Buffer, SampleError> {
+    buffer.ok_or_else(|| {
+        SampleError::TooLarge("the device could not allocate a buffer for this model".into())
+    })
 }
 
 /// Build and upload one batch's CSR structure and per-problem `h` / `J`.
@@ -1092,7 +1175,7 @@ fn upload_inputs(
     graphs: &[&IsingGraph],
     kernel: Kernel,
     rep: Representation,
-) -> InputBuffers {
+) -> Result<InputBuffers, SampleError> {
     let topo = &cached.topo;
     let num_problems = graphs.len();
     let n = topo.n;
@@ -1111,8 +1194,8 @@ fn upload_inputs(
         };
         let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
         (
-            device.new_buffer_from_slice(&tile_i32(base_row, num_problems)),
-            device.new_buffer_from_slice(&tile_i32(base_col, num_problems)),
+            checked_buffer(device.new_buffer_from_slice(&tile_i32(base_row, num_problems)))?,
+            checked_buffer(device.new_buffer_from_slice(&tile_i32(base_col, num_problems)))?,
         )
     };
     let row_ptr_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * rp_len) as i32).collect();
@@ -1128,13 +1211,13 @@ fn upload_inputs(
             }
             if kernel == Kernel::Msa {
                 (
-                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
-                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j)?,
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h)?,
                 )
             } else {
                 (
-                    device.new_buffer_from_slice(&all_j),
-                    device.new_buffer_from_slice(&all_h),
+                    checked_buffer(device.new_buffer_from_slice(&all_j))?,
+                    checked_buffer(device.new_buffer_from_slice(&all_h))?,
                 )
             }
         }
@@ -1148,26 +1231,26 @@ fn upload_inputs(
             }
             if kernel == Kernel::Msa {
                 (
-                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j),
-                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h),
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j)?,
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h)?,
                 )
             } else {
                 (
-                    device.new_buffer_from_slice(&all_j),
-                    device.new_buffer_from_slice(&all_h),
+                    checked_buffer(device.new_buffer_from_slice(&all_j))?,
+                    checked_buffer(device.new_buffer_from_slice(&all_h))?,
                 )
             }
         }
     };
 
-    InputBuffers {
+    Ok(InputBuffers {
         row,
         col,
         j,
         h,
-        row_off: device.new_buffer_from_slice(&row_ptr_offsets),
-        col_off: device.new_buffer_from_slice(&col_ind_offsets),
-    }
+        row_off: checked_buffer(device.new_buffer_from_slice(&row_ptr_offsets))?,
+        col_off: checked_buffer(device.new_buffer_from_slice(&col_ind_offsets))?,
+    })
 }
 
 /// Bind the shared buffer layout (indices 0..15) — identical in both kernels.
@@ -1203,13 +1286,15 @@ fn new_sa_persistent(
     device: &crate::metal_device::MetalDevice,
     dims: &BatchDims,
     delta_bytes: usize,
-) -> [metal::Buffer; 4] {
-    [
-        device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64),
-        device.new_zeroed_buffer((dims.num_threads * dims.n.max(1) * delta_bytes) as u64),
-        device.new_zeroed_buffer((dims.num_threads * 4) as u64), // uint rng
-        device.new_zeroed_buffer((dims.num_threads * 4) as u64), // int energy
-    ]
+) -> Result<[metal::Buffer; 4], SampleError> {
+    Ok([
+        checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64))?,
+        checked_buffer(
+            device.new_zeroed_buffer((dims.num_threads * dims.n.max(1) * delta_bytes) as u64),
+        )?,
+        checked_buffer(device.new_zeroed_buffer((dims.num_threads * 4) as u64))?, // uint rng
+        checked_buffer(device.new_zeroed_buffer((dims.num_threads * 4) as u64))?, // int energy
+    ])
 }
 
 /// Gibbs carry-over state: spins plus the RNG stream, allocated per anneal.
@@ -1229,22 +1314,24 @@ fn new_gibbs_persistent(
     dims: &BatchDims,
     node_parallel: bool,
     threads_per_group: usize,
-) -> [metal::Buffer; 2] {
+) -> Result<[metal::Buffer; 2], SampleError> {
     // 4 x u32 of xoshiro128** state per stream.
     const RNG_BYTES_PER_STREAM: usize = 16;
-    if node_parallel {
+    Ok(if node_parallel {
         [
-            device.new_zeroed_buffer((dims.num_threads * dims.n.max(1)) as u64),
-            device.new_zeroed_buffer(
+            checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.n.max(1)) as u64))?,
+            checked_buffer(device.new_zeroed_buffer(
                 (dims.num_threads * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
-            ),
+            ))?,
         ]
     } else {
         [
-            device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64),
-            device.new_zeroed_buffer((dims.num_threads * RNG_BYTES_PER_STREAM) as u64),
+            checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64))?,
+            checked_buffer(
+                device.new_zeroed_buffer((dims.num_threads * RNG_BYTES_PER_STREAM) as u64),
+            )?,
         ]
-    }
+    })
 }
 
 /// Multi-spin carry-over state: one `uint` word per (threadgroup, spin) plus
@@ -1256,15 +1343,15 @@ fn new_msa_persistent(
     num_streams: usize,
     n: usize,
     threads_per_group: usize,
-) -> [metal::Buffer; 2] {
+) -> Result<[metal::Buffer; 2], SampleError> {
     const RNG_BYTES_PER_STREAM: usize = 16;
-    [
-        pool.take(device, (num_streams * n.max(1) * 4) as u64),
-        pool.take(
+    Ok([
+        pool.try_take(device, (num_streams * n.max(1) * 4) as u64)?,
+        pool.try_take(
             device,
             (num_streams * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
-        ),
-    ]
+        )?,
+    ])
 }
 
 /// Per-kernel encode state: the carry-over buffers every chunk binds, plus
@@ -1388,7 +1475,7 @@ fn encode_batch_inner(
             Kernel::Gibbs => (25, crate::wide_tables::heat_bath_rows(&beta, params.seed)),
             Kernel::Msa => (25, crate::wide_tables::metropolis_rows(&beta, params.seed)),
         };
-        Some((index, device.new_buffer_from_slice(&rows)))
+        Some((index, checked_buffer(device.new_buffer_from_slice(&rows))?))
     } else {
         None
     };
@@ -1485,7 +1572,7 @@ fn encode_batch_inner(
         first,
         kernel == Kernel::Msa && msa_four_color(),
     );
-    let inputs = upload_inputs(device, &cached, graphs, kernel, rep);
+    let inputs = upload_inputs(device, &cached, graphs, kernel, rep)?;
 
     let cost = if wide {
         match kernel {
@@ -1504,42 +1591,46 @@ fn encode_batch_inner(
     let (out, kstate) = match kernel {
         Kernel::Sa => (
             DispatchBuffers {
-                beta: device.new_buffer_from_slice(&beta),
-                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
-                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+                beta: checked_buffer(device.new_buffer_from_slice(&beta))?,
+                samples: checked_buffer(
+                    device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                )?,
+                energies: checked_buffer(device.new_zeroed_buffer((num_samples * 4) as u64))?, // i32
             },
             KernelEncode::Sa {
-                persist: new_sa_persistent(device, &dims, if wide { 4 } else { 1 }),
+                persist: new_sa_persistent(device, &dims, if wide { 4 } else { 1 })?,
             },
         ),
         Kernel::Gibbs => (
             DispatchBuffers {
-                beta: device.new_buffer_from_slice(&beta),
-                samples: device.new_zeroed_buffer((num_samples * packed_size) as u64),
-                energies: device.new_zeroed_buffer((num_samples * 4) as u64), // i32
+                beta: checked_buffer(device.new_buffer_from_slice(&beta))?,
+                samples: checked_buffer(
+                    device.new_zeroed_buffer((num_samples * packed_size) as u64),
+                )?,
+                energies: checked_buffer(device.new_zeroed_buffer((num_samples * 4) as u64))?, // i32
             },
             KernelEncode::Gibbs {
-                persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group),
+                persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group)?,
             },
         ),
         Kernel::Msa => {
-            let beta_buf = pooled_from_slice(&device.buffer_pool, &device.device, &beta);
+            let beta_buf = pooled_from_slice(&device.buffer_pool, &device.device, &beta)?;
             // The kernel writes `samples`, `energies`, and the persistent buffers
             // in full before any read (first chunk initializes state and RNG, and
             // every read's bytes are packed), so pooled buffers need no zeroing.
             let samples = device
                 .buffer_pool
-                .take(&device.device, (num_samples * packed_size) as u64);
+                .try_take(&device.device, (num_samples * packed_size) as u64)?;
             let energies = device
                 .buffer_pool
-                .take(&device.device, (num_samples * 4) as u64);
+                .try_take(&device.device, (num_samples * 4) as u64)?;
             let persist = new_msa_persistent(
                 &device.buffer_pool,
                 &device.device,
                 groups,
                 n,
                 threads_per_group,
-            );
+            )?;
             pooled.extend([
                 inputs.j.clone(),
                 inputs.h.clone(),
@@ -2156,6 +2247,43 @@ mod tests {
         // `graphs[0]`.
         let err = validate_batch(&[], &params(64), Kernel::Sa).unwrap_err();
         assert!(driver_msg(err).contains("at least one graph"));
+    }
+
+    #[test]
+    fn validate_batch_refuses_before_allocation() {
+        // Zero usable bytes refuse every model, so the footprint check is the
+        // only possible cause of the refusal.
+        let limits = crate::capacity::DeviceLimits {
+            memory_bytes: 0,
+            tg_memory_bytes: 32_768,
+            max_buffer_bytes: 0,
+        };
+        let device = (crate::metal_device::MetalDevice::device_count() > 0)
+            .then(|| crate::metal_device::MetalDevice::open(0).unwrap());
+        let before = device.as_ref().map(|d| d.device.current_allocated_size());
+        let g = ring();
+        let err = validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits).unwrap_err();
+        let SampleError::TooLarge(message) = &err else {
+            panic!("expected TooLarge, got {err:?}");
+        };
+        assert!(message.contains("bytes needed"), "{message}");
+        assert!(message.contains("usable"), "{message}");
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        let after = device.as_ref().map(|d| d.device.current_allocated_size());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_failed_buffer_allocation_is_a_capacity_error() {
+        let err = require_buffer(None).unwrap_err();
+        assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
     }
 
     #[test]

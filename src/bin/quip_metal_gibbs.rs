@@ -24,10 +24,24 @@ struct Cli {
     /// Yield to other GPU users under thermal/display pressure.
     #[arg(long, default_value_t = false)]
     yielding: bool,
+    /// Print the largest model each connectivity and precision admits, then exit. Opens no device.
+    #[arg(long, conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve"])]
+    probe_capacity: bool,
+    /// Print the probe as JSON. Only with `--probe-capacity`.
+    #[arg(long, requires = "probe_capacity")]
+    json: bool,
 }
 
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
+    if cli.probe_capacity {
+        quip_solver_metal::probe::print_probe(
+            quip_solver_metal::sampler::Kernel::Gibbs,
+            &quip_solver_metal::capacity::host_limits(),
+            cli.json,
+        );
+        return ExitCode::SUCCESS;
+    }
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));
     }
