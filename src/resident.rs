@@ -1405,10 +1405,10 @@ fn admit_batch(
 ) -> Result<(), SampleError> {
     let footprint = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)?;
     let needed = footprint
-        .total(crate::capacity::instances(
-            Kernel::Msa,
-            job.params.num_reads,
-        ))
+        .total(
+            crate::capacity::instances(Kernel::Msa, job.params.num_reads),
+            crate::capacity::batches_in_flight(Kernel::Msa),
+        )
         .saturating_add(reserved_bytes);
     if needed > usable_bytes {
         let error = crate::capacity::CapacityError::Memory {
@@ -4533,7 +4533,7 @@ mod tests {
         let job = unit_ring(20_000);
         let needed = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)
             .unwrap()
-            .total(crate::capacity::instances(Kernel::Msa, 32));
+            .total(crate::capacity::instances(Kernel::Msa, 32), 1);
         admit_batch(&job, 0, needed).unwrap();
         admit_batch(&job, 1_000, needed + 1_000).unwrap();
         let refused = admit_batch(&job, 1_000, needed + 999).unwrap_err();

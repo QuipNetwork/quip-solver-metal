@@ -243,12 +243,13 @@ pub struct Footprint {
 }
 
 impl Footprint {
-    /// Bytes for `instances` models at once.
+    /// Bytes for `instances` models at once, held in `batches` batches that
+    /// each allocate the shared buffers.
     #[must_use]
-    pub fn total(&self, instances: usize) -> usize {
+    pub fn total(&self, instances: usize, batches: usize) -> usize {
         self.per_instance_bytes
             .saturating_mul(instances)
-            .saturating_add(self.shared_bytes)
+            .saturating_add(self.shared_bytes.saturating_mul(batches))
     }
 }
 
@@ -308,6 +309,18 @@ pub fn instances(kernel: Kernel, reads: usize) -> usize {
     match kernel {
         Kernel::Sa | Kernel::Gibbs => STREAM_IN_FLIGHT * batch_size_for_reads(kernel, reads),
         Kernel::Msa => crate::resident::PREP_BOUND,
+    }
+}
+
+/// Batches whose shared buffers exist at once: [`STREAM_IN_FLIGHT`] for the
+/// SA and Gibbs streams, each with its own beta schedule and colour list,
+/// and 1 for the multi-spin batch path, which runs one batch at a time
+/// beside the resident slot pools (`resident::run_fallback`).
+#[must_use]
+pub fn batches_in_flight(kernel: Kernel) -> usize {
+    match kernel {
+        Kernel::Sa | Kernel::Gibbs => STREAM_IN_FLIGHT,
+        Kernel::Msa => 1,
     }
 }
 
@@ -607,7 +620,8 @@ fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
 /// - [`CapacityError::Index`] when one model passes a 32-bit index of the
 ///   tier ([`check_indices`]). Of the per-tier checks this runs first; the
 ///   node and `col_ind` bounds above run before any tier.
-/// - [`CapacityError::Memory`] when `total(instances)` exceeds
+/// - [`CapacityError::Memory`] when `total(instances, batches_in_flight)`
+///   exceeds
 ///   `limits.usable_bytes()`.
 /// - [`CapacityError::Buffer`] when the largest buffer exceeds
 ///   `limits.max_buffer_bytes`. A per-model buffer counts for the
@@ -782,7 +796,7 @@ pub(crate) fn footprint_in(
     let in_flight = instances(kernel, shape.reads);
     let mut first_error = None;
     for (footprint, largest) in admitted {
-        let needed = footprint.total(in_flight);
+        let needed = footprint.total(in_flight, batches_in_flight(kernel));
         let error = if let Err(error) = check_indices(kernel, footprint.storage, shape, 1) {
             error
         } else if needed > limits.usable_bytes() {
@@ -1480,13 +1494,46 @@ mod tests {
     }
 
     #[test]
-    fn total_adds_shared_bytes_once() {
+    fn total_adds_shared_bytes_once_per_batch() {
         let fp = Footprint {
             storage: Storage::Threadgroup,
             per_instance_bytes: 10,
             shared_bytes: 7,
         };
-        assert_eq!(fp.total(3), 37);
+        assert_eq!(fp.total(3, 1), 37);
+        assert_eq!(fp.total(3, 2), 44);
+    }
+
+    /// Each stream batch in flight allocates its own beta schedule and colour
+    /// list, so SA and Gibbs count the shared buffers twice. The multi-spin
+    /// batch path runs one batch at a time.
+    #[test]
+    fn the_shared_buffers_count_once_per_batch_in_flight() {
+        let shape = unit_shape();
+        for kernel in KERNELS {
+            let sizes = threadgroup_sizes(kernel, &shape);
+            let once =
+                sum(&sizes.per_instance) * instances(kernel, shape.reads) + sum(&sizes.shared);
+            // `usable_bytes` is 4/5 of the memory.
+            let limits = DeviceLimits {
+                memory_bytes: once / 4 * 5 + 5,
+                max_buffer_bytes: 1 << 40,
+            };
+            assert!(limits.usable_bytes() >= once, "{kernel:?}");
+            assert!(
+                limits.usable_bytes() < once + sum(&sizes.shared),
+                "{kernel:?}"
+            );
+            let fits = footprint(kernel, &shape, &limits);
+            if kernel == Kernel::Msa {
+                assert_eq!(fits.map(|fp| fp.storage), Ok(Storage::Threadgroup));
+            } else {
+                assert!(
+                    matches!(fits, Err(CapacityError::Memory { .. })),
+                    "{kernel:?}: {fits:?}"
+                );
+            }
+        }
     }
 
     #[test]
