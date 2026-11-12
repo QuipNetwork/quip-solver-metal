@@ -259,22 +259,21 @@ typedef int weighted_field_t;
 #endif
 
 // The weighted row walk, shared by the float lane and the int lane's dense
-// rows: `field[l]` becomes the local field of lane `lane0 + l` for the
-// `GROUP` lanes from `lane0`, `h` and then the CSR slots [pstart, pend) in
-// order, MSA_ROW_CHUNK slots per chunk. Each chunk prefetches its couplings
-// and neighbour words, then adds them to the group's fields, which stay in
-// registers. Slots past `pend` read node 0 with a zero coupling.
-template <int GROUP>
+// rows: `field[lane]` becomes each lane's local field, `h` and then the CSR
+// slots [pstart, pend) in order, MSA_ROW_CHUNK slots per chunk. Each chunk
+// prefetches its couplings and neighbour words once, then adds them to the
+// 32 lane fields, which stay in registers. Slots past `pend` read node 0
+// with a zero coupling.
 inline void weighted_lane_fields(
     thread weighted_field_t* field,
     WeightedCouplings couplings,
     device const int* my_csr_col_ind,
     threadgroup const uint* state,
-    int var, int pstart, int pend, int lane0
+    int var, int pstart, int pend
 ) {
     weighted_field_t h = couplings.field(var);
-    for (int l = 0; l < GROUP; ++l) {
-        field[l] = h;
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        field[lane] = h;
     }
     for (int base = pstart; base < pend; base += MSA_ROW_CHUNK) {
         weighted_field_t jj[MSA_ROW_CHUNK];
@@ -286,15 +285,14 @@ inline void weighted_lane_fields(
             jj[q] = ok ? couplings.coupling(p) : weighted_field_t(0);
             sw[q] = state[ok ? my_csr_col_ind[p] : 0];
         }
-        for (int l = 0; l < GROUP; ++l) {
-            weighted_field_t f = field[l];
-            uint lane = uint(lane0 + l);
+        for (int lane = 0; lane < MSA_LANES; ++lane) {
+            weighted_field_t f = field[lane];
             #pragma unroll
             for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
                 // Spin bit 1 is -1. Missing neighbours have J = 0.
-                f += ((sw[q] >> lane) & 1u) ? -jj[q] : jj[q];
+                f += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
             }
-            field[l] = f;
+            field[lane] = f;
         }
     }
 }
@@ -492,8 +490,7 @@ inline uint flip_mask(
     int pstart = my_csr_row_ptr[var];
     int pend = my_csr_row_ptr[var + 1];
     float field[MSA_LANES];
-    weighted_lane_fields<MSA_LANES>(field, couplings, my_csr_col_ind, state,
-                                    var, pstart, pend, 0);
+    weighted_lane_fields(field, couplings, my_csr_col_ind, state, var, pstart, pend);
     uint bi = state[var];
     uint draw = xoshiro128starstar(rng);
 
@@ -510,18 +507,15 @@ inline uint flip_mask(
     return accept;
 }
 #else
-// Lanes go in groups of MSA_LANE_GROUP, whose fields stay in registers while
-// the row's neighbour words are reloaded chunk by chunk for each group
-// (quip-solver-cuda 1ac73d5), so the dense path's frame stays near the
-// one-chunk path's.
-#define MSA_LANE_GROUP 8
-
 // `flip_mask` for a row denser than MSA_ROW_CHUNK: the same fields, draw, and
 // threshold test as the one-chunk code. Integer sums are exact in any order,
 // so the chunking does not change the result. Only the QUIP_MSA_DENSE build
 // calls it, which the host selects for a model with a row denser than
 // MSA_ROW_CHUNK, so the default build (every Advantage2 model) compiles the
-// one-chunk code alone and keeps its registers and rate.
+// one-chunk code alone and keeps its registers and rate. The dense build may
+// therefore hold all 32 lane fields in registers and load each neighbour word
+// once; CUDA 1ac73d5's 8-lane groups, which reload the row for each group,
+// measured 1.4 to 1.7 times the GPU time here.
 inline uint weighted_accept_dense(
     WeightedCouplings couplings,
     device const int* my_csr_col_ind,
@@ -533,16 +527,12 @@ inline uint weighted_accept_dense(
     uint draw = xoshiro128starstar(rng) & uint(WIDE_ROW - 1);
     int threshold = couplings.rows[uint(beta_idx) * uint(WIDE_ROW) + draw];
 
+    int field[MSA_LANES];
+    weighted_lane_fields(field, couplings, my_csr_col_ind, state, var, pstart, pend);
     uint accept = 0u;
-    for (int lane0 = 0; lane0 < MSA_LANES; lane0 += MSA_LANE_GROUP) {
-        int field[MSA_LANE_GROUP];
-        weighted_lane_fields<MSA_LANE_GROUP>(field, couplings, my_csr_col_ind, state,
-                                             var, pstart, pend, lane0);
-        for (int l = 0; l < MSA_LANE_GROUP; ++l) {
-            uint lane = uint(lane0 + l);
-            int de = ((bi >> lane) & 1u) ? 2 * field[l] : -2 * field[l];
-            accept |= uint(de <= threshold) << lane;
-        }
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        int de = ((bi >> uint(lane)) & 1u) ? 2 * field[lane] : -2 * field[lane];
+        accept |= uint(de <= threshold) << uint(lane);
     }
     return accept;
 }

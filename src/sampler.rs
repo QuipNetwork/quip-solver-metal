@@ -177,6 +177,11 @@ const FLOAT_GIBBS_COST_FACTOR: f64 = 1.3;
 /// `docs/perf/2026-11-11-float-kernels.md`: 1.5 times the weighted lane's
 /// [`WEIGHTED_MSA_COST_FACTOR`], rounded up.
 const FLOAT_MSA_COST_FACTOR: f64 = 5.3;
+/// Weighted MSA work per word update and row chunk on the dense pipeline
+/// (`int` storage, a row past one chunk), for chunk sizing. Measured against
+/// the Float32 lane on degree-62 circulants: see
+/// `weighted_msa_high_degree_chunks_stay_under_the_ceiling`.
+const WEIGHTED_MSA_DENSE_COST_FACTOR: f64 = 6.8;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -1229,6 +1234,21 @@ pub(crate) fn validate_batch<'a>(
     kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
     validate_batch_within(graphs, params, kernel, host_device_limits(), false)
+        .map(|batch| (batch.first, batch.n, batch.rep))
+}
+
+/// A batch [`validate_batch_within`] admits.
+#[derive(Debug)]
+struct ValidBatch<'a> {
+    /// The establishing graph; every graph shares its topology.
+    first: &'a IsingGraph,
+    n: usize,
+    rep: Representation,
+    /// The `int8_t` storage scale, when the batch takes that storage.
+    i8_scale: Option<i32>,
+    /// An MSA batch with a CSR row past one chunk of [`MSA_UNIT_MAX_DEG`]:
+    /// it runs on the dense weighted pipeline.
+    dense_rows: bool,
 }
 
 /// Memory limits of this host, computed once.
@@ -1239,7 +1259,8 @@ fn host_device_limits() -> &'static DeviceLimits {
 
 /// [`validate_batch`] against explicit memory `limits`. `allow_i8` sizes a wide
 /// batch that [`batch_i8_scale`] accepts at one byte per coefficient, for the
-/// batch path that uploads it so.
+/// batch path that uploads it so. A dense MSA batch always takes `int`
+/// storage, the faster one on the dense pipeline.
 ///
 /// The footprint check comes last and runs before any buffer exists, so a
 /// model that does not fit is refused without allocating.
@@ -1249,7 +1270,7 @@ fn validate_batch_within<'a>(
     kernel: Kernel,
     limits: &DeviceLimits,
     allow_i8: bool,
-) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
+) -> Result<ValidBatch<'a>, SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
         // batch would have indexed `graphs[0]` and panicked the miner.
@@ -1277,6 +1298,7 @@ fn validate_batch_within<'a>(
         )));
     }
     let mut rep = batch_representation(graphs, kernel)?;
+    let mut dense_rows = false;
     if kernel == Kernel::Msa {
         // The unit kernel unrolls a fixed 20-neighbour prefetch, so a denser
         // unit model moves to the weighted lane, and the weighted lanes walk
@@ -1292,12 +1314,19 @@ fn validate_batch_within<'a>(
                  {budget}-neighbour budget"
             )));
         }
+        dense_rows = max_deg > MSA_UNIT_MAX_DEG;
     }
-    let i8_scale = batch_i8_scale(graphs, rep, allow_i8);
+    let i8_scale = batch_i8_scale(graphs, rep, allow_i8 && !dense_rows);
     shape_footprint(first, params, kernel, rep, i8_scale.is_some(), limits)
         .map(drop)
         .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}")))?;
-    Ok((first, n, rep))
+    Ok(ValidBatch {
+        first,
+        n,
+        rep,
+        i8_scale,
+        dense_rows,
+    })
 }
 
 /// The scale of a wide batch stored as `int8_t` coefficients, or `None` when
@@ -1356,10 +1385,13 @@ pub fn model_footprint(
     kernel: Kernel,
 ) -> Result<crate::capacity::Footprint, SampleError> {
     let mut rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
+    let mut dense_rows = false;
     if kernel == Kernel::Msa {
-        rep = msa_lane(rep, max_csr_degree(graph));
+        let degree = max_csr_degree(graph);
+        rep = msa_lane(rep, degree);
+        dense_rows = degree > MSA_UNIT_MAX_DEG;
     }
-    let i8_scale = batch_i8_scale(&[graph], rep, true);
+    let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows);
     shape_footprint(
         graph,
         params,
@@ -1727,9 +1759,13 @@ fn encode_batch_storage(
     beta_override: Option<Vec<f32>>,
     wide_i8: bool,
 ) -> Result<EncodedBatch, SampleError> {
-    let (first, n, rep) =
-        validate_batch_within(graphs, params, kernel, host_device_limits(), wide_i8)?;
-    let i8_scale = batch_i8_scale(graphs, rep, wide_i8);
+    let ValidBatch {
+        first,
+        n,
+        rep,
+        i8_scale,
+        dense_rows,
+    } = validate_batch_within(graphs, params, kernel, host_device_limits(), wide_i8)?;
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -1784,14 +1820,11 @@ fn encode_batch_storage(
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
-    // Every graph of a batch shares `first`'s topology, so its degree is the
-    // batch's. A milli model with a row past one chunk takes the weighted
-    // lane's dense build; the default build keeps the one-chunk code alone.
-    let degree = max_csr_degree(first);
-    let dense_rows = degree > MSA_UNIT_MAX_DEG;
+    // A milli model with a row past one chunk takes the weighted lane's dense
+    // build, on `int` storage; the default build keeps the one-chunk code
+    // alone.
     let pipeline = match kernel {
         Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
-        Kernel::Msa if i8_scale.is_some() && dense_rows => &device.msa_weighted_i8_dense,
         Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
         Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
         Kernel::Gibbs if i8_scale.is_some() => &device.gibbs_wide_i8,
@@ -1895,24 +1928,22 @@ fn encode_batch_storage(
         (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
         (Representation::Float32, Kernel::Gibbs) => FLOAT_GIBBS_COST_FACTOR,
-        // Both weighted factors were measured at degree <= MSA_UNIT_MAX_DEG,
-        // one row chunk. A denser row is walked in chunks of
-        // MSA_UNIT_MAX_DEG, so the cost grows with the chunk count, and a
-        // dense model of few nodes is planned by its colour steps. The milli
-        // lane keeps its one-chunk plan up to MSA_UNIT_MAX_DEG, so
-        // Advantage2 plans as it did.
-        (Representation::Wide, Kernel::Msa) => {
-            if !dense_rows {
-                WEIGHTED_MSA_COST_FACTOR
-            } else {
-                WEIGHTED_MSA_COST_FACTOR
-                    * msa_row_chunks(degree) as f64
-                    * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
-            }
+        // The weighted factors are per word update of one row chunk. A
+        // denser row is walked in chunks of MSA_UNIT_MAX_DEG, so the cost
+        // grows with the chunk count, and a dense model of few nodes is
+        // planned by its colour steps. The milli lane keeps its one-chunk
+        // plan up to MSA_UNIT_MAX_DEG, so Advantage2 plans as it did. Every
+        // graph of a batch shares `first`'s topology, so its degree is the
+        // batch's.
+        (Representation::Wide, Kernel::Msa) if dense_rows => {
+            WEIGHTED_MSA_DENSE_COST_FACTOR
+                * msa_row_chunks(max_csr_degree(first)) as f64
+                * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
         }
+        (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
         (Representation::Float32, Kernel::Msa) => {
             FLOAT_MSA_COST_FACTOR
-                * msa_row_chunks(degree) as f64
+                * msa_row_chunks(max_csr_degree(first)) as f64
                 * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
         }
         (Representation::Binary | Representation::Int8, _) => 1.0,
@@ -2459,6 +2490,76 @@ mod tests {
         }
     }
 
+    /// Largest command buffer of milli MSA batches past one row chunk: a
+    /// weighted and a unit circulant of degree 62 on MSA_MAX_NODES nodes,
+    /// which take the dense weighted pipeline on `int` storage, beside a
+    /// Float32 circulant of the same shape for reference. At 128 sweeps per
+    /// beta the plan is one rung per chunk, its floor, so the kernel sets the
+    /// chunk time; at one sweep per beta the plan groups rungs, so
+    /// [`WEIGHTED_MSA_DENSE_COST_FACTOR`] sets it. Run:
+    /// `cargo test --release --lib weighted_msa_high_degree_chunks -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "device timing; see the doc comment"]
+    #[expect(clippy::print_stdout, reason = "report the measured chunk times")]
+    fn weighted_msa_high_degree_chunks_stay_under_the_ceiling() {
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let n = MSA_MAX_NODES;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=31).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let circulant = |seed: usize, values: [f64; 3]| {
+            let [plus, minus, h] = values;
+            let j = (0..edges.len())
+                .map(|e| {
+                    if (e * 7 + seed).is_multiple_of(3) {
+                        plus
+                    } else {
+                        minus
+                    }
+                })
+                .collect();
+            IsingGraph::new(vec![h; n], j, edges.clone())
+        };
+        let family = |values: [f64; 3]| -> Vec<IsingGraph> {
+            (0..8).map(|seed| circulant(seed, values)).collect()
+        };
+        let weighted = family([1.5, -0.75, 0.25]);
+        let unit = family([1.0, -1.0, 0.0]);
+        let float = family([0.0011, -0.0007, 0.0003]);
+        let batches: [(&str, Vec<&IsingGraph>); 5] = [
+            ("weighted x1", vec![&weighted[0]]),
+            ("weighted x8", weighted.iter().collect()),
+            ("unit x1", vec![&unit[0]]),
+            ("unit x8", unit.iter().collect()),
+            ("float x8", float.iter().collect()),
+        ];
+        for sweeps_per_beta in [128, 1] {
+            let params = SampleParams {
+                num_reads: 128,
+                num_sweeps: 8192,
+                sweeps_per_beta,
+                seed: 42,
+                ..Default::default()
+            };
+            for (name, graphs) in &batches {
+                let mut batch =
+                    encode_batch_inner(&dev, graphs, &params, Kernel::Msa, 1, None, None).unwrap();
+                assert!(batch.coef_scale.is_none(), "{name}: int storage");
+                let chunks = batch.chunk_count();
+                while batch.commit_next(|| false) {
+                    batch.wait_until_completed();
+                }
+                assert!(batch.failed_status().is_none(), "{name}");
+                let max_ms = batch.max_chunk_us() as f64 / 1000.0;
+                let total_ms = batch.gpu_time_us() as f64 / 1000.0;
+                println!(
+                    "{{\"batch\":\"{name}\",\"sweeps_per_beta\":{sweeps_per_beta},\"chunks\":{chunks},\"max_chunk_ms\":{max_ms:.1},\"total_gpu_ms\":{total_ms:.1}}}"
+                );
+                assert!(max_ms < TARGET_DISPATCH_MS, "{name}: {max_ms} ms");
+            }
+        }
+    }
+
     #[test]
     fn msa_non_unit_graph_falls_back_to_host_scoring() {
         if crate::metal_device::MetalDevice::device_count() == 0 {
@@ -2996,7 +3097,9 @@ mod tests {
 
     /// K_40 has degree 39, two row chunks. Integer fields are exact in any
     /// order, and every carry-over resumes from the persistent buffers, so a
-    /// split plan returns the reads of one whole chunk, on both storages.
+    /// split plan returns the reads of one whole chunk. Both models fit
+    /// `int8_t` storage, but a dense batch takes `int` storage whatever the
+    /// request.
     #[test]
     fn the_weighted_lane_resumes_rows_past_one_chunk_without_changing_reads() {
         if crate::metal_device::MetalDevice::device_count() == 0 {
@@ -3036,6 +3139,13 @@ mod tests {
         for graph in [&weighted, &unit] {
             let (_, _, rep) = validate_batch(&[graph], &p, Kernel::Msa).unwrap();
             assert_eq!(rep, Representation::Wide);
+            assert!(batch_wide_i8_scale(&[graph]).is_some());
+            let batch =
+                encode_batch_storage(&dev, &[graph], &p, Kernel::Msa, 1, None, None, true).unwrap();
+            assert!(
+                batch.coef_scale.is_none(),
+                "a dense batch takes int storage"
+            );
             let mut storages = Vec::new();
             for wide_i8 in [true, false] {
                 let a =
@@ -3051,7 +3161,7 @@ mod tests {
                 }
                 storages.push(a);
             }
-            assert_eq!(storages[0], storages[1], "int8 and int storage agree");
+            assert_eq!(storages[0], storages[1], "both requests run int storage");
         }
     }
 
