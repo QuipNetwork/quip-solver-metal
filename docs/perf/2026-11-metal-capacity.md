@@ -761,9 +761,9 @@ cargo test --release --test gibbs_capacity the_largest_admitted -- --ignored --n
 cargo test --release --test msa_spill the_largest_admitted -- --ignored --nocapture
 ```
 
-The 400 ms target is for runs on a quiet GPU. Other GPU work on a loaded host can make a chunk longer than 400 ms, and the 500 ms planning ceiling with its margin under the GPU watchdog covers that case.
+The planner plans each chunk against the 500 ms ceiling (`TARGET_DISPATCH_MS`), and a measured chunk on a quiet GPU must stay below 400 ms. Heavy GPU load from other processes made chunks longer than both values.
 
-During Task 5.3b fix round 2, other sessions loaded the host. Six runs of the Gibbs limit test passed 400 ms. The load average is the one that `uptime` printed before the run.
+During Task 5.3b fix round 2, other sessions loaded the host. Six runs of the Gibbs limit test took 405 to 708 ms in their longest chunk. The load average is the one that `uptime` printed before the run.
 
 | Shape | Longest chunk (ms) | Load average (1, 5 and 15 minutes) |
 |---|---|---|
@@ -775,6 +775,8 @@ During Task 5.3b fix round 2, other sessions loaded the host. Six runs of the Gi
 | Gibbs spill, degree 62, 358,494 nodes, `int32` | 707.5 | 19.66, 12.10, 11.12 |
 
 The same test at the earlier commit `84d6715` failed in the same way under that load, with 454.7 and 406.4 ms. The constants stay as they are.
+
+The 500 ms ceiling does not cover these chunks. The margin to the macOS GPU watchdog prevents a fault at these times. The `TARGET_DISPATCH_MS` doc comment in `src/sampler.rs` says that the watchdog aborts a command buffer that runs more than a few seconds, and that MLX measured watchdog kills at about 1.2 s per operation with a display attached. The longest chunk here, 707.5 ms, is below 1.2 s.
 
 ### Grid rerun
 
