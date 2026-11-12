@@ -395,16 +395,16 @@ fn a_cancelled_watermark_returns_cancelled() {
     });
 }
 
-/// A complete model of 1,700 nodes is refused for every kernel: SA and
-/// Gibbs by the one-sweep limit on dense-matrix storage, and MSA by the
-/// 1,000,000-edge limit of the resident runner (1,444,150 edges).
+/// A complete model past each kernel's dense one-sweep limit is refused:
+/// 1,700 nodes for SA and Gibbs, and for MSA 4,899 nodes, whose 11,997,651
+/// edges also pass the advertised `max_edges` of 11,992,753.
 #[test]
 fn an_oversized_job_fails_without_a_panic() {
-    let oversized = complete_int32(1_700);
     each_kernel(|kernel| {
         let Some(sampler) = open(kernel) else { return };
+        let oversized = complete_int32(if kernel == Kernel::Msa { 4_899 } else { 1_700 });
         let jobs = vec![
-            job("oversized", oversized.clone(), params(8, 64, 1), None),
+            job("oversized", oversized, params(8, 64, 1), None),
             job("valid", ring(16), params(8, 64, 2), None),
         ];
         let results = stream(&sampler, jobs, &CancelToken::default(), || {});
