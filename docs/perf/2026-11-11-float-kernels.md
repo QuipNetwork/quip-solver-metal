@@ -229,7 +229,7 @@ cargo test --release --lib float_msa_high_degree_chunks -- --ignored --nocapture
 {"batch":"circulant x8","degree":62,"chunks":64,"max_chunk_ms":142.4,"total_gpu_ms":8174.0}
 ```
 
-Each batch splits into one command buffer per rung, and the largest one takes 142.4 ms, under the 400 ms chunk target and the 500 ms ceiling. The portfolio batch takes the same total GPU time as the batch with one command buffer, 3,951.9 ms against 3,952.3 ms. The plan cannot split a rung, so a single rung of more sweeps than these runs use can still take longer.
+Each batch splits into one command buffer per rung, and the largest one takes 142.4 ms, under the 400 ms one-sweep limit and the 500 ms chunk target. The portfolio batch takes the same total GPU time as the batch with one command buffer, 3,951.9 ms against 3,952.3 ms. The plan cannot split a rung, so a single rung of more sweeps than these runs use can still take longer.
 
 ## Digests after the sweep change of November 12
 

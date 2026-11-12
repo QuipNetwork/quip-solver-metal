@@ -38,6 +38,8 @@ struct Cli {
     #[arg(long)]
     max_nodes: Option<usize>,
     /// Print the largest model each connectivity and precision admits, then exit. Opens no device.
+    /// The probe applies the memory model only. A running session also applies the one-sweep
+    /// limit and `maxDegree`.
     #[arg(long, conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve"])]
     probe_capacity: bool,
     /// Print the probe as JSON. Only with `--probe-capacity`.

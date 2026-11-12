@@ -3,7 +3,9 @@
 
 //! `--probe-capacity`: the largest model each connectivity and precision
 //! admits, from the capacity model alone. It opens no device and connects
-//! nowhere.
+//! nowhere. The probe applies the memory model only. A running session also
+//! applies the one-sweep limit and `maxDegree`, so it can advertise less than
+//! the probe reports.
 
 use crate::capacity::{max_model, Connectivity, DeviceLimits, Precision};
 use crate::sampler::Kernel;

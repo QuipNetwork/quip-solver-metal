@@ -192,7 +192,7 @@ only with the GPU core count. The scaling is conservative for a GPU with
 fewer cores, but not for a GPU whose cores are slower. The planner plans
 each chunk against 500 ms (`TARGET_DISPATCH_MS`), and the one-sweep limit
 keeps a measured chunk below 400 ms. The `TARGET_DISPATCH_MS` comment in
-`src/sampler.rs` records the macOS GPU watchdog: MLX measured watchdog
+`src/sampler.rs` records the macOS GPU watchdog and that MLX measured watchdog
 kills at about 1.2 s per operation with a display attached.
 
 ## Engine selection
@@ -280,6 +280,19 @@ See `tests/msa_bench.rs` for the commands to repeat each run.
 ```sh
 cargo test -- --test-threads=1                       # the default run, as CI runs it (dev profile)
 cargo test --features long-tests -- --test-threads=1 # adds the tests that take more than ten seconds
+```
+
+To run the CI deadline check, build both binary profiles, then run the tests
+with the deadline variables:
+
+```sh
+cargo build --bins
+cargo build --release --bins
+RUSTC_BOOTSTRAP=1 \
+RUST_TEST_TIME_UNIT=10000,30000 \
+RUST_TEST_TIME_INTEGRATION=10000,30000 \
+RUST_TEST_TIME_DOCTEST=10000,30000 \
+cargo test -- --test-threads=1 -Z unstable-options --ensure-time
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via

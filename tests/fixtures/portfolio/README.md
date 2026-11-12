@@ -53,14 +53,17 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 The script writes the manifest once all solves finish. A restart loads saved results with the same source hash and time limit.
 Supervise the batch with taskd.
 
-Both GPU tests use 128 reads, 8,192 sweeps, 64 beta steps, and seed 42 for every proven model.
-The automatic path uses sparse storage because each node has at most 55 edges.
-The second test forces dense storage. Both tests check the storage tier.
+The GPU tests use 128 reads, 8,192 sweeps, 64 beta steps, and seed 42 for every proven model.
+`tests/real_models.rs` runs the SA, Gibbs, and MSA kernels on the automatic path.
+Each node has at most 55 edges, so that path uses sparse storage.
+`tests/sa_dense.rs`, `tests/gibbs_dense.rs`, and `tests/msa_dense.rs` force dense storage and check the storage tier.
 The energy tolerance is `1e-6 * max(1, abs(proven_energy))`.
 
-Run the host check and both GPU tests in the CI container:
+Run the tests on a Mac with a Metal device:
 
 ```sh
-cargo test --release --test portfolio_ground_gpu
-cargo test --release --test portfolio_ground_gpu -- --include-ignored --test-threads=1 --nocapture
+cargo test --test real_models --test sa_dense --test gibbs_dense --test msa_dense -- --test-threads=1
+cargo test --features long-tests --test real_models --test sa_dense --test gibbs_dense --test msa_dense -- --test-threads=1
 ```
+
+The second command adds the later fixtures, which take minutes.

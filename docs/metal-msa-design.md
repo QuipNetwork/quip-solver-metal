@@ -224,9 +224,14 @@ and returns each job's credit after its committed chunk finishes.
   `num_problems * num_reads`. Persistent: `num_streams * N * 4` bytes of
   state, `num_streams * 256 * 16` bytes of RNG.
 - **Validation.** `MSA_MAX_NODES = 6016` (compile-time asserted against the
-  32 KB cap), CSR degree at most 20 (`TooLarge`, so the coordinator routes
-  the job elsewhere), and `N * 4 + static <= max_threadgroup_memory_length`
-  on the opened device.
+  32 KB cap) is the threadgroup limit, not a refusal. A model with more
+  nodes spills its spin words past threadgroup memory. The weighted lanes
+  (milli and Float32) walk each row in chunks of 20 neighbours, up to 62
+  neighbours (`MSA_SPARSE_MAX_DEG`). The unit kernel admits 20. A denser
+  complete model goes to dense storage. A model that fits no tier returns
+  `TooLarge`, so the coordinator routes the job elsewhere. On the
+  threadgroup tier, `N * 4 + static <= max_threadgroup_memory_length` on
+  the opened device.
 - **Chunk rate.** `MSA_OCCUPANCY_CURVE` records word-updates/s at each
   occupancy. It shares interpolation with the simulated annealing kernel.
   The curve scales toward zero below its first point. It stays flat for

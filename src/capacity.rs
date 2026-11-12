@@ -23,7 +23,7 @@
 //!   slice of its carry-over spin buffer, which holds one byte per spin.
 //! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. It
 //!   admits any degree, so a multi-spin model past the sparse degree routes
-//!   here. [`routed_footprint`] keeps a graph with a repeated coupler or a
+//!   here. [`routed_runnable_footprint`] keeps a graph with a repeated coupler or a
 //!   self-loop off this tier. Every kernel runs it (see
 //!   [`runnable_storages`]).
 //!
@@ -31,8 +31,8 @@
 //! correct one without touching the routing.
 
 use crate::sampler::{
-    simd_rounded_reads, Kernel, GIBBS_MAX_NODES, MAX_READS, MSA_LANES, MSA_MAX_NODES,
-    MSA_SPARSE_MAX_DEG, MSA_THREADS, MSA_UNIT_MAX_DEG, SA_MAX_NODES, SIMD_WIDTH,
+    simd_rounded_reads, Kernel, MAX_READS, MSA_LANES, MSA_SPARSE_MAX_DEG, MSA_THREADS,
+    MSA_UNIT_MAX_DEG, SIMD_WIDTH,
 };
 use crate::streaming::{batch_size_for_reads, STREAM_IN_FLIGHT};
 use quip_solver_core::IsingGraph;
@@ -409,15 +409,6 @@ struct Sizes {
     shared: Vec<usize>,
 }
 
-/// Threadgroup node cap of a kernel.
-const fn node_cap(kernel: Kernel) -> usize {
-    match kernel {
-        Kernel::Sa => SA_MAX_NODES,
-        Kernel::Gibbs => GIBBS_MAX_NODES,
-        Kernel::Msa => MSA_MAX_NODES,
-    }
-}
-
 /// Whether `storage` admits `shape` on `kernel`.
 fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
     match storage {
@@ -429,7 +420,7 @@ fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
                 Precision::Binary | Precision::Int8 => MSA_UNIT_MAX_DEG,
                 Precision::Int32 | Precision::Int8Scaled | Precision::Float32 => MSA_SPARSE_MAX_DEG,
             };
-            shape.nodes <= node_cap(kernel)
+            shape.nodes <= crate::sampler::kernel_max_nodes(kernel)
                 && (kernel != Kernel::Msa || shape.max_degree <= msa_degree)
         }
         Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEG,
@@ -734,6 +725,7 @@ pub fn footprint(
 /// The errors of [`footprint`]. A non-candidate that no sparse tier admits,
 /// such as a multi-spin model past the sparse degree, is a
 /// [`CapacityError::Degree`].
+#[cfg(test)]
 pub fn routed_footprint(
     kernel: Kernel,
     graph: &IsingGraph,
@@ -749,13 +741,16 @@ pub fn routed_footprint(
     )
 }
 
-/// [`routed_footprint`] over only the tiers in [`runnable_storages`]: the
-/// tier and bytes the sampler's batch path allocates, which its admission
-/// checks before any buffer exists.
+/// [`footprint`] for a graph, over only the tiers in [`runnable_storages`]:
+/// the tier and bytes the sampler's batch path allocates, which its admission
+/// checks before any buffer exists. A graph that is not a dense candidate
+/// (a repeated coupler or a self-loop, see `topology::dense_candidate`) never
+/// takes [`Storage::Dense`].
 ///
 /// # Errors
 ///
-/// The errors of [`routed_footprint`].
+/// The errors of [`footprint`]. A non-candidate that no sparse tier admits
+/// is a [`CapacityError::Degree`].
 pub fn routed_runnable_footprint(
     kernel: Kernel,
     graph: &IsingGraph,
@@ -765,7 +760,7 @@ pub fn routed_runnable_footprint(
     routed_on(kernel, graph, shape, limits, runnable_storages(kernel))
 }
 
-/// The routing of [`routed_footprint`] over `tiers`: the cheapest tier that
+/// The routing of [`routed_runnable_footprint`] over `tiers`: the cheapest tier that
 /// fits, except that a graph that is not a dense candidate takes the
 /// cheapest of the other tiers.
 fn routed_on(
@@ -826,6 +821,7 @@ pub const fn runnable_storages(kernel: Kernel) -> &'static [Storage] {
 /// # Errors
 ///
 /// The errors of [`footprint`].
+#[cfg(test)]
 pub fn runnable_footprint(
     kernel: Kernel,
     shape: &ModelShape,
@@ -1140,6 +1136,7 @@ fn sum(sizes: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampler::{GIBBS_MAX_NODES, SA_MAX_NODES};
 
     const KERNELS: [Kernel; 3] = [Kernel::Sa, Kernel::Gibbs, Kernel::Msa];
 

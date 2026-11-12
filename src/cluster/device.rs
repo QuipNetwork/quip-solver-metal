@@ -510,46 +510,64 @@ impl ClusterDevice {
         let zeros = |bytes: usize| self.zeroed(bytes);
         Ok(Buffers {
             uploads: [
-                self.upload_slice(&d.tiles),
-                self.upload_slice(&d.gauges),
-                self.upload_slice(&d.pairs),
-                self.upload_slice(&d.weak_deg),
-                self.upload_slice(&d.weak_ell),
-                self.upload_slice(&d.all_deg),
-                self.upload_slice(&d.all_ell),
-                self.upload_slice(&d.color_off),
-                self.upload_slice(&d.h),
-                self.upload_slice(&d.tile_w),
-                self.upload_slice(&d.link_w),
+                self.upload_slice(&d.tiles)?,
+                self.upload_slice(&d.gauges)?,
+                self.upload_slice(&d.pairs)?,
+                self.upload_slice(&d.weak_deg)?,
+                self.upload_slice(&d.weak_ell)?,
+                self.upload_slice(&d.all_deg)?,
+                self.upload_slice(&d.all_ell)?,
+                self.upload_slice(&d.color_off)?,
+                self.upload_slice(&d.h)?,
+                self.upload_slice(&d.tile_w)?,
+                self.upload_slice(&d.link_w)?,
             ],
-            spins: self.upload_slice(&spins),
-            rng: self.upload_slice(&rng),
-            parent: zeros(params.anneals * n * 4),
-            acc: zeros(params.anneals * n * 4),
-            changed: zeros(4),
+            spins: self.upload_slice(&spins)?,
+            rng: self.upload_slice(&rng)?,
+            parent: zeros(params.anneals * n * 4)?,
+            acc: zeros(params.anneals * n * 4)?,
+            changed: zeros(4)?,
         })
     }
 
     /// A shared buffer holding `data`, or one zeroed element when it is empty.
-    fn upload_slice<T: Copy>(&self, data: &[T]) -> metal::Buffer {
+    /// A failed allocation is a capacity refusal.
+    fn upload_slice<T: Copy>(&self, data: &[T]) -> Result<metal::Buffer, ClusterDeviceError> {
         if data.is_empty() {
             return self.zeroed(std::mem::size_of::<T>());
         }
-        self.device.new_buffer_with_data(
-            data.as_ptr().cast(),
-            std::mem::size_of_val(data) as u64,
-            MTLResourceOptions::StorageModeShared,
+        let bytes = std::mem::size_of_val(data);
+        self.checked(
+            self.device.new_buffer_with_data(
+                data.as_ptr().cast(),
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            bytes,
         )
     }
 
-    fn zeroed(&self, bytes: usize) -> metal::Buffer {
-        let buffer = self
-            .device
-            .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-        // SAFETY: `contents` points at `bytes` writable bytes of a new shared
-        // buffer that no command buffer uses yet.
+    fn zeroed(&self, bytes: usize) -> Result<metal::Buffer, ClusterDeviceError> {
+        let buffer = self.checked(
+            self.device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared),
+            bytes,
+        )?;
+        // SAFETY: `contents` points at `bytes` writable bytes of a new, nonnull
+        // shared buffer that no command buffer uses yet.
         unsafe { std::ptr::write_bytes(buffer.contents().cast::<u8>(), 0, bytes) };
-        buffer
+        Ok(buffer)
+    }
+
+    /// `buffer`, or a capacity refusal when the allocation returned nil.
+    fn checked(
+        &self,
+        buffer: metal::Buffer,
+        bytes: usize,
+    ) -> Result<metal::Buffer, ClusterDeviceError> {
+        // A nil handle is a failed allocation; `checked_buffer` detects it.
+        let buffer = crate::sampler::checked_buffer(buffer).ok();
+        require_buffer(buffer, bytes, self.device.max_buffer_length() as usize)
     }
 
     /// Encode, commit, and wait for one command buffer. Passes its GPU
@@ -623,6 +641,16 @@ fn set_value<T>(encoder: &metal::ComputeCommandEncoderRef, index: u64, value: &T
         std::mem::size_of::<T>() as u64,
         std::ptr::from_ref(value).cast(),
     );
+}
+
+/// `buffer`, or [`CapacityError::Buffer`] when `None`: the allocation of
+/// `bytes` against a `max` byte buffer limit failed.
+fn require_buffer(
+    buffer: Option<metal::Buffer>,
+    bytes: usize,
+    max: usize,
+) -> Result<metal::Buffer, ClusterDeviceError> {
+    buffer.ok_or_else(|| CapacityError::Buffer { needed: bytes, max }.into())
 }
 
 fn write_slice<T: Copy>(buffer: &metal::Buffer, values: &[T]) {
@@ -1046,6 +1074,21 @@ mod tests {
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_buffer_allocation_is_a_capacity_error() {
+        let err = require_buffer(None, 64, 32).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClusterDeviceError::Capacity(CapacityError::Buffer {
+                    needed: 64,
+                    max: 32
+                })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
