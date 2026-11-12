@@ -1247,6 +1247,11 @@ impl EncodedBatch {
         self.cmds.iter().map(|c| gpu_time_us(c)).max().unwrap_or(0)
     }
 
+    /// GPU time of each command buffer, in order, microseconds.
+    pub(crate) fn chunk_us(&self) -> Vec<u64> {
+        self.cmds.iter().map(|c| gpu_time_us(c)).collect()
+    }
+
     /// Number of command buffers this batch was split into.
     pub(crate) fn chunk_count(&self) -> usize {
         self.plan.len()
@@ -3084,6 +3089,8 @@ pub struct TunedRun {
     pub plan: Vec<Chunk>,
     /// GPU time of the longest command buffer, microseconds.
     pub max_chunk_us: u64,
+    /// GPU time of each command buffer, in the order of `plan`, microseconds.
+    pub chunk_us: Vec<u64>,
     /// GPU time of every command buffer together, microseconds.
     pub gpu_time_us: u64,
     /// The storage tier the anneal ran on.
@@ -3151,6 +3158,7 @@ fn run_planned(
                 .collect(),
             plan: Vec::new(),
             max_chunk_us: 0,
+            chunk_us: Vec::new(),
             gpu_time_us: 0,
             storage: crate::capacity::Storage::Threadgroup,
         });
@@ -3192,6 +3200,7 @@ fn run_planned(
         reads: samples,
         plan: batch.plan.clone(),
         max_chunk_us: batch.max_chunk_us(),
+        chunk_us: batch.chunk_us(),
         gpu_time_us: batch.gpu_time_us(),
         storage: batch.storage,
     })

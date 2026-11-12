@@ -50,9 +50,14 @@
 //! - `sweeps`: sweeps that the plan ran, per read.
 //! - `chunks`: number of command buffers.
 //! - `max_chunk_ms`: GPU time of the longest command buffer.
-//! - `max_chunk_sweeps`: sweeps of the chunk with the most sweeps, which is
-//!   the longest chunk in practice. `max_chunk_ms / max_chunk_sweeps` is the
-//!   time of one sweep of the longest chunk.
+//! - `max_chunk_sweeps`: sweeps of the chunk that took the longest.
+//! - `mean_ms_per_sweep`: `gpu_ms / sweeps`, the mean sweep time. The
+//!   degree term of the planner calibrates on this value.
+//! - `worst_ms_per_sweep`: the largest `ms / sweeps` over the chunks in
+//!   `chunk_log`. The one-sweep refusal calibrates on this value, because the
+//!   mean hides a slow sweep such as the hot start of SA.
+//! - `chunk_log`: one object per command buffer, in order: `ms` (GPU time),
+//!   `sweeps` (`beta_count * sweep_count`), `beta_start` and `sweep_start`.
 //! - `gpu_ms`: GPU time of the whole run.
 //! - `ns_per_update`: `gpu_ms` over `reads_dispatched * nodes * sweeps`, in
 //!   nanoseconds. A spin update is one visit of one spin of one read.
@@ -267,6 +272,9 @@ fn run_bench(dev: &MetalDevice, cfg: &Config) -> Value {
         other => panic!("QUIP_BENCH_STORAGE: unknown storage {other}"),
     };
     let reads_asked = cfg.reads.clamp(1, MAX_READS);
+    // The same rule as `simd_rounded_reads` in `src/sampler.rs`, which is
+    // private to the crate: the record would go stale if that rule changed,
+    // so `the_harness_rounds_reads_to_a_simd_group` checks one case.
     let reads_dispatched = reads_asked
         .div_ceil(SIMD_WIDTH)
         .saturating_mul(SIMD_WIDTH)
@@ -306,17 +314,36 @@ fn run_bench(dev: &MetalDevice, cfg: &Config) -> Value {
     match sample_ising_tuned(dev, &graph, &params, kernel, tuning) {
         Ok(run) => {
             let wall_ms = started.elapsed().as_secs_f64() * 1e3;
-            let sweeps: i64 = run
+            let chunk_sweeps = |c: &quip_solver_metal::sampler::Chunk| {
+                i64::from(c.beta_count) * i64::from(c.sweep_count)
+            };
+            let sweeps: i64 = run.plan.iter().map(chunk_sweeps).sum();
+            let chunk_log: Vec<Value> = run
                 .plan
                 .iter()
-                .map(|c| i64::from(c.beta_count) * i64::from(c.sweep_count))
-                .sum();
-            let longest = run
+                .zip(&run.chunk_us)
+                .map(|(c, us)| {
+                    json!({
+                        "ms": *us as f64 / 1e3,
+                        "sweeps": chunk_sweeps(c),
+                        "beta_start": c.beta_start,
+                        "sweep_start": c.sweep_start,
+                    })
+                })
+                .collect();
+            // The slowest chunk per sweep: the worst sweep time the plan met.
+            let worst_ms_per_sweep = run
                 .plan
                 .iter()
-                .map(|c| i64::from(c.beta_count) * i64::from(c.sweep_count))
-                .max()
-                .unwrap_or(0);
+                .zip(&run.chunk_us)
+                .map(|(c, us)| *us as f64 / 1e3 / chunk_sweeps(c).max(1) as f64)
+                .fold(0.0, f64::max);
+            let longest_sweeps = run
+                .plan
+                .iter()
+                .zip(&run.chunk_us)
+                .max_by_key(|(_, us)| **us)
+                .map_or(0, |(c, _)| chunk_sweeps(c));
             let updates = reads_dispatched as f64 * cfg.nodes as f64 * sweeps as f64;
             let ns_per_update = run.gpu_time_us as f64 * 1e3 / updates.max(1.0);
             put("status", json!("ok"));
@@ -326,7 +353,13 @@ fn run_bench(dev: &MetalDevice, cfg: &Config) -> Value {
             put("sweeps", json!(sweeps));
             put("chunks", json!(run.plan.len()));
             put("max_chunk_ms", json!(run.max_chunk_us as f64 / 1e3));
-            put("max_chunk_sweeps", json!(longest));
+            put("max_chunk_sweeps", json!(longest_sweeps));
+            put(
+                "mean_ms_per_sweep",
+                json!(run.gpu_time_us as f64 / 1e3 / sweeps.max(1) as f64),
+            );
+            put("worst_ms_per_sweep", json!(worst_ms_per_sweep));
+            put("chunk_log", json!(chunk_log));
             put("gpu_ms", json!(run.gpu_time_us as f64 / 1e3));
             put("ns_per_update", json!(ns_per_update));
             put("wall_ms", json!(wall_ms));
@@ -356,7 +389,7 @@ fn emit(record: &Value, path: Option<&Path>) {
 }
 
 /// Fields of an `ok` record.
-const OK_FIELDS: [&str; 20] = [
+const OK_FIELDS: [&str; 23] = [
     "status",
     "kernel",
     "nodes",
@@ -372,6 +405,9 @@ const OK_FIELDS: [&str; 20] = [
     "chunks",
     "max_chunk_ms",
     "max_chunk_sweeps",
+    "mean_ms_per_sweep",
+    "worst_ms_per_sweep",
+    "chunk_log",
     "gpu_ms",
     "ns_per_update",
     "wall_ms",
@@ -412,8 +448,62 @@ fn the_harness_writes_one_json_record() {
     assert_eq!(record["sweeps"], 16);
     assert!(record["ns_per_update"].as_f64().unwrap() > 0.0);
     assert!(record["max_chunk_ms"].as_f64().unwrap() > 0.0);
+    assert!(record["worst_ms_per_sweep"].as_f64().unwrap() > 0.0);
+    // The chunk log covers the whole plan.
+    let log = record["chunk_log"].as_array().unwrap();
+    assert_eq!(log.len() as u64, record["chunks"].as_u64().unwrap());
+    let logged: i64 = log.iter().map(|c| c["sweeps"].as_i64().unwrap()).sum();
+    assert_eq!(logged, 16);
+    for field in ["ms", "sweeps", "beta_start", "sweep_start"] {
+        assert!(log[0].get(field).is_some(), "chunk_log lacks {field}");
+    }
     // The storage tier names follow the kernel.
     assert_eq!(Storage::Dense.name(Kernel::Sa), "dense");
+}
+
+fn small(kernel: &str, nodes: usize, degree: Degree, storage: &str, reads: usize) -> Config {
+    Config {
+        kernel: kernel.into(),
+        nodes,
+        degree,
+        precision: Precision::Int8,
+        storage: storage.into(),
+        reads,
+        sweeps: 8,
+    }
+}
+
+#[test]
+fn the_harness_records_a_refusal() {
+    let dev = MetalDevice::open(0).unwrap();
+    // The multi-spin sparse build holds at most 62 neighbours.
+    let record = run_bench(&dev, &small("msa", 300, Degree::Regular(200), "sparse", 64));
+    assert_eq!(record["status"], "refused");
+    assert_eq!(record["kernel"], "msa");
+    assert_eq!(record["degree"], 200);
+    assert!(record["error"].as_str().unwrap().contains("62"), "{record}");
+    assert!(record.get("ns_per_update").is_none());
+}
+
+#[test]
+fn the_harness_forces_storage_and_runs_a_complete_model() {
+    let dev = MetalDevice::open(0).unwrap();
+    let dense = run_bench(&dev, &small("gibbs", 40, Degree::Complete, "dense", 32));
+    assert_eq!(dense["status"], "ok");
+    assert_eq!(dense["degree"], "complete");
+    assert_eq!(dense["edges"], 40 * 39 / 2);
+    assert_eq!(dense["storage"], "dense");
+    let sparse = run_bench(&dev, &small("sa", 40, Degree::Complete, "sparse", 32));
+    assert_eq!(sparse["storage"], "local");
+}
+
+#[test]
+fn the_harness_rounds_reads_to_a_simd_group() {
+    let dev = MetalDevice::open(0).unwrap();
+    let record = run_bench(&dev, &small("sa", 64, Degree::Regular(4), "auto", 33));
+    assert_eq!(record["reads_requested"], 33);
+    assert_eq!(record["reads_dispatched"], 64);
+    assert_eq!(record["reads_returned"], 33);
 }
 
 /// One run, configured by the `QUIP_BENCH_*` variables.
