@@ -378,7 +378,27 @@ fn the_largest_admitted_dense_sweep_runs() {
     .unwrap();
     assert!(out.max_chunk_us < 500_000, "{} us", out.max_chunk_us);
     let (over, _) = planted_complete(LIMIT_NODES + 1, Precision::Int32);
-    let err = sample_ising_tuned(&dev, &over, &p, Kernel::Sa, Tuning::default()).unwrap_err();
+    let err =
+        sample_ising_tuned(&dev, &over, &p, Kernel::Sa, dense(Tuning::default())).unwrap_err();
+    assert!(
+        matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
+        "{err:?}"
+    );
+}
+
+/// A complete model one node past the one-sweep limit cannot plan dense
+/// chunks. Auto routing runs it on the sparse tiers, and forced dense
+/// refuses it.
+#[test]
+fn a_model_past_the_sweep_limit_runs_sparse_unless_forced_dense() {
+    let dev = MetalDevice::open(0).unwrap();
+    let (graph, _) = planted_complete(LIMIT_NODES + 1, Precision::Int32);
+    let p = params(32, 2, 1, 5);
+    let out = run(&dev, &graph, &p, Tuning::default());
+    assert_ne!(out.storage, Storage::Dense);
+    assert_eq!(out.reads.len(), 32);
+    let err =
+        sample_ising_tuned(&dev, &graph, &p, Kernel::Sa, dense(Tuning::default())).unwrap_err();
     assert!(
         matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
         "{err:?}"
@@ -500,6 +520,42 @@ fn dense_rates() {
             writeln!(
                 io::stdout().lock(),
                 "{{\"precision\":\"{precision:?}\",\"nodes\":{nodes},\"sweeps\":{sweeps},\"gpu_ms\":{:.1},\"mcolumns_per_s\":{:.1},\"max_chunk_ms\":{:.1},\"chunks\":{}}}",
+                gpu / 1e3,
+                columns / gpu,
+                out.max_chunk_us as f64 / 1e3,
+                out.plan.len()
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// GPU time of the sparse SA build on the complete models of `dense_rates`,
+/// for the comparison in `docs/perf/2026-11-12-sa-dense.md`. The sparse
+/// build keeps the CSR of every model, so the rate counts the same `n * n`
+/// columns per sweep as the dense rate.
+#[test]
+#[ignore = "minutes of device time: run with --release --ignored --nocapture"]
+fn sparse_rates() {
+    let dev = MetalDevice::open(0).unwrap();
+    let sparse = Tuning {
+        force_sparse: true,
+        ..Tuning::default()
+    };
+    for precision in [Precision::Int8, Precision::Int32] {
+        for (nodes, budget) in [(1_024, 1 << 20), (LIMIT_NODES, 1 << 17), (2_500, 1 << 16)] {
+            let (graph, _) = planted_complete(nodes, precision);
+            let sweeps = (budget / nodes).max(4);
+            let p = params(MAX_READS, sweeps, (sweeps / 64).max(1), 9);
+            let out = run(&dev, &graph, &p, sparse);
+            assert_ne!(out.storage, Storage::Dense);
+            assert_eq!(out.reads.len(), MAX_READS, "{precision:?} {nodes}");
+            let columns = (nodes * sweeps) as f64 * nodes as f64;
+            let gpu = out.gpu_time_us.max(1) as f64;
+            writeln!(
+                io::stdout().lock(),
+                "{{\"storage\":\"{:?}\",\"precision\":\"{precision:?}\",\"nodes\":{nodes},\"sweeps\":{sweeps},\"gpu_ms\":{:.1},\"mcolumns_per_s\":{:.1},\"max_chunk_ms\":{:.1},\"chunks\":{}}}",
+                out.storage,
                 gpu / 1e3,
                 columns / gpu,
                 out.max_chunk_us as f64 / 1e3,

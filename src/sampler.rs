@@ -569,6 +569,9 @@ pub struct Tuning {
     /// model routes it to. A model with a repeated coupler or a self-loop
     /// is refused.
     pub force_dense: bool,
+    /// Keeps a batch on CSR storage whatever tier the capacity model routes
+    /// it to, so tests and measurements can compare the two storages.
+    pub force_sparse: bool,
 }
 
 /// Split a beta schedule into chunks whose dispatches each land near
@@ -1664,16 +1667,30 @@ fn validate_batch_within<'a>(
         }
     }
     .map_err(too_large)?;
+    let mut footprint = footprint;
     if footprint.storage == Storage::Dense {
         // A chunk is at least one sweep, so a dense batch whose one sweep
-        // would pass the limit is refused before any buffer exists. Auto
-        // routing picks dense past the limit only when no sparse tier fits.
+        // would pass the limit cannot be planned. Auto routing then prices
+        // the sparse tiers the kernel runs and takes the cheapest that fits;
+        // forced dense, and a model no sparse tier admits (such as a
+        // multi-spin model past the sparse degree), is refused before any
+        // buffer exists.
         let sweep_ms = matrix_sweep_ms(kernel, n);
         if sweep_ms > MSA_MATRIX_MAX_SWEEP_MS {
-            return Err(SampleError::TooLarge(format!(
-                "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
-                 {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
-            )));
+            let sparse: Vec<Storage> = crate::capacity::runnable_storages(kernel)
+                .iter()
+                .copied()
+                .filter(|&tier| tier != Storage::Dense)
+                .collect();
+            match crate::capacity::footprint_in(kernel, &shape, limits, &sparse) {
+                Ok(fit) if dense == DenseMode::Auto => footprint = fit,
+                _ => {
+                    return Err(SampleError::TooLarge(format!(
+                        "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
+                         {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
+                    )));
+                }
+            }
         }
     }
     if footprint.storage != Storage::Dense {
@@ -2309,6 +2326,7 @@ fn encode_batch_storage(
     let past_k = kernel == Kernel::Msa && graphs.first().is_some_and(|g| g.num_nodes() > k);
     let dense = match dense {
         DenseMode::Auto if tuning.force_dense => DenseMode::Forced,
+        DenseMode::Auto if tuning.force_sparse => DenseMode::Off,
         other => other,
     };
     let ValidBatch {
@@ -3730,16 +3748,20 @@ mod tests {
         // `encode_batch_storage` validates before it touches the device, so
         // a refusal here allocates nothing.
         let above: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_415)));
-        for mode in [DenseMode::Auto, DenseMode::Forced] {
-            let err = admit(above, mode).unwrap_err();
-            assert_eq!(
-                err.to_sample_error(),
-                quip_solver_core::SampleError::Capacity
-            );
-            let message = too_large_msg(err);
-            assert!(message.contains("one dense-matrix sweep"), "{message}");
-            assert!(message.contains("400.445 ms"), "{message}");
-        }
+        // Forced dense is refused. Auto prices the sparse tiers instead, which
+        // fit this model.
+        let err = admit(above, DenseMode::Forced).unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        let message = too_large_msg(err);
+        assert!(message.contains("one dense-matrix sweep"), "{message}");
+        assert!(message.contains("400.445 ms"), "{message}");
+        assert_ne!(
+            admit(above, DenseMode::Auto).unwrap().storage,
+            Storage::Dense
+        );
         // The CSR gates never take dense storage, so the limit does not
         // reach them.
         assert_ne!(
