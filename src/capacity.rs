@@ -601,6 +601,8 @@ fn threadgroup_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     per_instance.extend(output_buffers(shape));
     let mut shared = common_shared(shape);
     if kernel == Kernel::Msa {
+        // Charge the full sparse coupling bytes even if the pool reuses a
+        // buffer. This bounds the job's additional allocation from above.
         per_instance.extend(&csr[2..]);
         shared.extend(&csr[..2]);
     } else {
@@ -853,6 +855,7 @@ pub(crate) fn footprint_in(
             max: MAX_NNZ * COL_IND_ENTRY_BYTES,
         });
     }
+    let tiling = models_per_buffer(kernel, shape.reads);
     let mut admitted: Vec<(Footprint, usize)> = [
         (Storage::Threadgroup, threadgroup_sizes(kernel, shape)),
         (Storage::Spill, spill_sizes(kernel, shape)),
@@ -861,7 +864,6 @@ pub(crate) fn footprint_in(
     .into_iter()
     .filter(|(storage, _)| tiers.contains(storage) && admits(kernel, *storage, shape))
     .map(|(storage, sizes)| {
-        let tiling = models_per_buffer(kernel, shape.reads);
         let footprint = Footprint {
             storage,
             per_instance_bytes: sum(&sizes.per_instance),
@@ -1402,26 +1404,20 @@ mod tests {
 
     #[test]
     fn the_cheaper_route_wins() {
-        // Between the node cap and a dense-friendly size both tiers admit
-        // SA and Gibbs, so the choice is a pure cost comparison.
+        // Each available tier is checked against the same capacity limits.
         let shapes = [unit_shape(), sparse_shape(), complete_shape()];
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             for shape in shapes {
                 let chosen = footprint(kernel, &shape, &ROOMY).unwrap();
                 for storage in [Storage::Threadgroup, Storage::Spill, Storage::Dense] {
-                    if !admits(kernel, storage, &shape) {
+                    let Ok(tier) = footprint_in(kernel, &shape, &ROOMY, &[storage]) else {
                         continue;
-                    }
-                    let sizes = match storage {
-                        Storage::Threadgroup => threadgroup_sizes(kernel, &shape),
-                        Storage::Spill => spill_sizes(kernel, &shape),
-                        Storage::Dense => dense_sizes(kernel, &shape),
                     };
-                    let bytes: usize = sizes.per_instance.iter().sum();
                     assert!(
-                        chosen.per_instance_bytes <= bytes,
-                        "{kernel:?} {storage:?}: {} > {bytes}",
-                        chosen.per_instance_bytes
+                        chosen.per_instance_bytes <= tier.per_instance_bytes,
+                        "{kernel:?} {storage:?}: {} > {}",
+                        chosen.per_instance_bytes,
+                        tier.per_instance_bytes
                     );
                 }
             }
