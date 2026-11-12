@@ -323,20 +323,20 @@ fn a_repeated_coupler_or_a_self_loop_stays_sparse() {
 #[ignore = "host scoring of 256 reads over 13 million couplers: run with --release --ignored"]
 fn the_largest_admitted_dense_sweep_runs() {
     let dev = MetalDevice::open(0).unwrap();
-    let (graph, _) = planted_complete(5_099, Precision::Int32);
+    let (graph, _) = planted_complete(4_898, Precision::Int32);
     let p = params(MAX_READS, 2, 1, 5);
     let out = run(&dev, &graph, &p, Tuning::default());
     assert_eq!(out.storage, Storage::Dense);
     assert_eq!(out.reads.len(), MAX_READS);
     writeln!(
         io::stdout().lock(),
-        "5,099 nodes: {} chunks, longest {:.1} ms",
+        "4,898 nodes: {} chunks, longest {:.1} ms",
         out.plan.len(),
         out.max_chunk_us as f64 / 1e3
     )
     .unwrap();
     assert!(out.max_chunk_us < 500_000, "{} us", out.max_chunk_us);
-    let (over, _) = planted_complete(5_100, Precision::Int32);
+    let (over, _) = planted_complete(4_899, Precision::Int32);
     let err = sample_ising_tuned(&dev, &over, &p, Kernel::Msa, Tuning::default()).unwrap_err();
     assert!(
         matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
@@ -442,7 +442,7 @@ fn dense_rates() {
         (4_096, 1 << 20),
         (4_800, 1 << 17),
         // The largest model whose one sweep the admission accepts.
-        (5_099, 1 << 17),
+        (4_898, 1 << 17),
     ];
     for precision in PRECISIONS {
         for (nodes, budget) in shapes {

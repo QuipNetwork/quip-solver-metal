@@ -201,13 +201,15 @@ const WEIGHTED_MSA_DENSE_COST_FACTOR: f64 = 6.8;
 
 /// Matrix columns one threadgroup of the dense-matrix multi-spin kernel
 /// walks per second: a word update of an `n`-node model walks `n` columns.
-/// It is below every rate measured in `docs/perf/2026-11-12-msa-dense.md`
-/// (M4 Max, 1 to 8 threadgroups), including the slowest single chunk:
+/// The slowest single chunk measured on a quiet GPU in
+/// `docs/perf/2026-11-12-msa-dense.md` (M4 Max, 1 to 8 threadgroups) ran at
 /// 68.2 million columns per second, one sweep of an Int32 model of 6,016
-/// nodes. Each threadgroup is one SIMD group whose column walk is bound by
+/// nodes. This value keeps a margin under it for contention from other GPU
+/// work, which slowed a 5,099-node sweep to 408 and 467 ms. The planner and
+/// the one-sweep admission limit both use it. Each threadgroup is one SIMD group whose column walk is bound by
 /// latency, so the rate scales with the threadgroups and not with the GPU
 /// cores, unlike [`MSA_OCCUPANCY_CURVE`].
-const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 6.5e7;
+const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 6.0e7;
 /// Margin on [`MSA_MATRIX_COLUMNS_PER_SEC`], so a chunk planned at the
 /// 500 ms ceiling runs about 200 ms on the slowest measured shape.
 const MSA_MATRIX_THROUGHPUT_SAFETY: f64 = 0.4;
@@ -1646,7 +1648,7 @@ fn validate_batch_within<'a>(
             sparse.ok_or_else(|| {
                 SampleError::TooLarge(format!(
                     "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
-                     {sweep_ms:.1} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
+                     {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
                 ))
             })?
         }
@@ -3594,20 +3596,20 @@ mod tests {
         IsingGraph::new(vec![0.0; n], j, edges)
     }
 
-    /// One dense-matrix sweep of 5,099 nodes is estimated at 400.0 ms and
-    /// one of 5,100 nodes past it, at any read count. The longer sweep is
+    /// One dense-matrix sweep of 4,898 nodes is estimated at 399.84 ms and
+    /// one of 4,899 nodes at 400.003 ms, at any read count. The longer sweep is
     /// refused before any buffer exists; the shorter one is admitted dense.
     #[test]
     fn a_dense_sweep_past_one_chunk_is_refused_before_allocation() {
-        assert!(msa_matrix_sweep_ms(5_099, 8) <= MSA_MATRIX_MAX_SWEEP_MS);
-        assert!(msa_matrix_sweep_ms(5_100, 8) > MSA_MATRIX_MAX_SWEEP_MS);
-        assert!((msa_matrix_sweep_ms(5_100, 1) - msa_matrix_sweep_ms(5_100, 8)).abs() < 1e-9);
+        assert!(msa_matrix_sweep_ms(4_898, 8) <= MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(msa_matrix_sweep_ms(4_899, 8) > MSA_MATRIX_MAX_SWEEP_MS);
+        assert!((msa_matrix_sweep_ms(4_899, 1) - msa_matrix_sweep_ms(4_899, 8)).abs() < 1e-9);
         let p = SampleParams {
             num_reads: 256,
             num_sweeps: 1,
             ..Default::default()
         };
-        let below = complete_int32(5_099);
+        let below = complete_int32(4_898);
         let admitted = validate_batch_within(
             &[&below],
             &p,
@@ -3625,7 +3627,7 @@ mod tests {
         // `encode_batch_storage` validates before it touches the device, so
         // a refusal here allocates nothing. Device allocations of the
         // parallel tests make a process-wide byte count unusable as a check.
-        let above = complete_int32(5_100);
+        let above = complete_int32(4_899);
         let err = validate_batch_within(
             &[&above],
             &p,
@@ -3642,7 +3644,7 @@ mod tests {
         );
         let message = too_large_msg(err);
         assert!(message.contains("one dense-matrix sweep"), "{message}");
-        assert!(message.contains("400.2 ms"), "{message}");
+        assert!(message.contains("400.003 ms"), "{message}");
         // A forced dense run is refused the same way.
         let err = validate_batch_within(
             &[&above],
