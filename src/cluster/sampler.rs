@@ -50,7 +50,8 @@ const DRAIN_POLL: Duration = Duration::from_millis(10);
 #[doc(hidden)]
 pub trait ClusterBackend: Send + Sync + 'static {
     /// Anneal `params.anneals` copies of `prepared`, as
-    /// [`ClusterDevice::anneal`] does.
+    /// [`ClusterDevice::anneal_reporting`] does: pass the GPU microseconds of
+    /// each command buffer to `busy_us`.
     ///
     /// # Errors
     /// Refusals, cancellation, and device failures.
@@ -59,6 +60,7 @@ pub trait ClusterBackend: Send + Sync + 'static {
         prepared: &PreparedGraph,
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
+        busy_us: &dyn Fn(u64),
     ) -> Result<Vec<Vec<i8>>, ClusterDeviceError>;
 }
 
@@ -68,15 +70,41 @@ impl ClusterBackend for ClusterDevice {
         prepared: &PreparedGraph,
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
+        busy_us: &dyn Fn(u64),
     ) -> Result<Vec<Vec<i8>>, ClusterDeviceError> {
-        Self::anneal(self, prepared, params, stop)
+        self.anneal_reporting(prepared, params, stop, busy_us)
     }
 }
 
+/// The utilization governor as the cluster job sees it.
+#[doc(hidden)]
+pub trait ClusterGovernor {
+    /// Whether the load of other processes asks the cluster job to stop.
+    /// Its own load never does, as with the CUDA governor.
+    fn yields_to_others(&self) -> bool;
+
+    /// Count `us` GPU microseconds of a cluster command buffer as the
+    /// miner's own load.
+    fn record_gpu_busy_us(&self, us: u64);
+}
+
 /// The Metal SA engine of `quip-metal-otsuka`: the sampler of
-/// `quip-metal-sa`. [`Sampler::should_throttle`] reports the IOKit governor,
-/// so a cluster job yields between command buffers.
+/// `quip-metal-sa`, and its IOKit governor for the cluster job.
 pub struct MetalSa(CombinedSampler);
+
+impl ClusterGovernor for MetalSa {
+    fn yields_to_others(&self) -> bool {
+        self.0
+            .governor()
+            .is_some_and(crate::iokit_gov::UtilGovernor::should_yield_to_others)
+    }
+
+    fn record_gpu_busy_us(&self, us: u64) {
+        if let Some(governor) = self.0.governor() {
+            governor.record_gpu_busy_us(us);
+        }
+    }
+}
 
 impl Sampler for MetalSa {
     fn sample(
@@ -109,7 +137,7 @@ impl Sampler for MetalSa {
     }
 
     fn should_throttle(&self) -> bool {
-        self.0.governor_yields()
+        self.0.should_throttle()
     }
 
     fn max_reads(&self) -> u32 {
@@ -204,7 +232,7 @@ impl OtsukaSampler {
     }
 }
 
-impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
+impl<D: ClusterBackend, S: Sampler + ClusterGovernor> OtsukaSampler<D, S> {
     /// Inject a cluster backend and an SA engine.
     #[doc(hidden)]
     #[must_use]
@@ -240,14 +268,17 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
             seed: params.seed,
             ..ClusterParams::default()
         };
-        // A governor yield refuses this job as busy. Only the session token
-        // makes `finish` report Cancelled and drop the result.
-        let stopped = || cancelled() || self.sa.should_throttle();
+        // A governor yield to other processes refuses this job as busy. Only
+        // the session token makes `finish` report Cancelled and drop the
+        // result. The job reports its GPU time, so its own load is not
+        // counted as theirs.
+        let stopped = || cancelled() || self.sa.yields_to_others();
+        let busy_us = |us| self.sa.record_gpu_busy_us(us);
         let _gpu = self.exclusive();
         checkpoint(&stopped).map_err(sample_error)?;
         let spins = self
             .cluster
-            .anneal(prepared, &cluster, &stopped)
+            .anneal(prepared, &cluster, &stopped, &busy_us)
             .map_err(sample_error)?;
         if spins.len() != params.num_reads
             || spins
@@ -373,7 +404,7 @@ fn sample_error(error: ClusterDeviceError) -> SampleError {
     }
 }
 
-impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
+impl<D: ClusterBackend, S: Sampler + ClusterGovernor> Sampler for OtsukaSampler<D, S> {
     fn sample(
         &self,
         graph: &IsingGraph,

@@ -15,10 +15,13 @@ use quip_solver_core::{
 };
 use quip_solver_metal::capacity::{CapacityError, DeviceLimits};
 use quip_solver_metal::cluster::device::{ClusterDeviceError, ClusterParams};
-use quip_solver_metal::cluster::sampler::{ClusterBackend, OtsukaSampler, MAX_READS};
+use quip_solver_metal::cluster::sampler::{
+    ClusterBackend, ClusterGovernor, OtsukaSampler, MAX_READS,
+};
 use quip_solver_metal::cluster::{Model, Motifs, PreparedGraph, Weights};
+use quip_solver_metal::iokit_gov::UtilGovernor;
 use quip_solver_metal::metal_otsuka_identity;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +37,9 @@ const PHASE_LIMIT: Duration = Duration::from_secs(60);
 /// Command buffers of one fake anneal: sweep chunks, then descent passes.
 const SWEEP_CHUNKS: usize = 7;
 const DESCENT_PASSES: usize = 3;
+
+/// GPU microseconds a fake command buffer reports.
+const LAUNCH_US: u64 = 1_000;
 
 /// How long a fake SA job or a fake cluster job holds the fake GPU in the
 /// serialization test.
@@ -71,6 +77,7 @@ impl ClusterBackend for FakeDevice {
         prepared: &PreparedGraph,
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
+        busy_us: &dyn Fn(u64),
     ) -> Result<Vec<Vec<i8>>, ClusterDeviceError> {
         self.calls.lock().unwrap().push(params.clone());
         if self.capacity_for_reads == Some(params.anneals) {
@@ -97,6 +104,7 @@ impl ClusterBackend for FakeDevice {
                 *launches += 1;
                 *launches
             };
+            busy_us(LAUNCH_US);
             if let Some(token) = &self.cancel {
                 if launches >= self.cancel_after {
                     token.cancel_through(1);
@@ -128,6 +136,26 @@ struct FakeSa {
     late_yield: Arc<AtomicBool>,
     streams: Arc<Mutex<usize>>,
     probe: Option<Probe>,
+    governor: Option<Arc<UtilGovernor>>,
+    busy_us: Arc<AtomicU64>,
+}
+
+impl ClusterGovernor for FakeSa {
+    fn yields_to_others(&self) -> bool {
+        self.yielding
+            || self.late_yield.load(Ordering::SeqCst)
+            || self
+                .governor
+                .as_ref()
+                .is_some_and(|g| g.should_yield_to_others())
+    }
+
+    fn record_gpu_busy_us(&self, us: u64) {
+        self.busy_us.fetch_add(us, Ordering::SeqCst);
+        if let Some(governor) = &self.governor {
+            governor.record_gpu_busy_us(us);
+        }
+    }
 }
 
 impl Sampler for FakeSa {
@@ -183,10 +211,6 @@ impl Sampler for FakeSa {
 
     fn declared_stream_width() -> u32 {
         0
-    }
-
-    fn should_throttle(&self) -> bool {
-        self.yielding || self.late_yield.load(Ordering::SeqCst)
     }
 }
 
@@ -432,6 +456,56 @@ fn governor_yield_after_device_completion_keeps_finished_reads() {
         &CancelToken::default(),
     );
     assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+}
+
+/// The miner's own cluster load does not stop a family job: the total load
+/// is above the ceiling, but the load of other processes is below it.
+#[test]
+fn own_gpu_load_above_the_ceiling_does_not_stop_a_family_job() {
+    let device = FakeDevice::default();
+    let sa = FakeSa {
+        governor: Some(Arc::new(UtilGovernor::with_sample_for_test(
+            80, true, 100, 90,
+        ))),
+        ..Default::default()
+    };
+    let sampler = sampler(device.clone(), sa.clone());
+    let result = sampler.sample_prepared_for_test(
+        &job(),
+        &prepared(&HEADLESS_LIMITS),
+        &CancelToken::default(),
+    );
+    assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+    let launches = SWEEP_CHUNKS + DESCENT_PASSES;
+    assert_eq!(*device.launches.lock().unwrap(), launches);
+    // Every command buffer reports its GPU time as the miner's own load.
+    assert_eq!(
+        sa.busy_us.load(Ordering::SeqCst),
+        LAUNCH_US * launches as u64
+    );
+}
+
+/// Load of other processes above the ceiling stops a family job as busy.
+#[test]
+fn foreign_gpu_load_above_the_ceiling_stops_a_family_job() {
+    let device = FakeDevice::default();
+    let sa = FakeSa {
+        governor: Some(Arc::new(UtilGovernor::with_sample_for_test(
+            80, true, 100, 10,
+        ))),
+        ..Default::default()
+    };
+    let sampler = sampler(device.clone(), sa);
+    let result = sampler.sample_prepared_for_test(
+        &job(),
+        &prepared(&HEADLESS_LIMITS),
+        &CancelToken::default(),
+    );
+    assert!(matches!(
+        result.outcome,
+        StreamOutcome::Completed(Err(SampleError::DeviceBusy))
+    ));
+    assert_eq!(*device.launches.lock().unwrap(), 0);
 }
 
 #[test]

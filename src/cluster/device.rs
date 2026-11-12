@@ -310,7 +310,22 @@ impl ClusterDevice {
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
     ) -> Result<Vec<Vec<i8>>, ClusterDeviceError> {
-        self.run(prepared, params, stop, true, None)
+        self.anneal_reporting(prepared, params, stop, &|_| {})
+    }
+
+    /// [`Self::anneal`] that passes the GPU microseconds of each completed
+    /// command buffer to `busy_us`, for the utilization governor.
+    ///
+    /// # Errors
+    /// The errors of [`Self::anneal`].
+    pub fn anneal_reporting(
+        &self,
+        prepared: &PreparedGraph,
+        params: &ClusterParams,
+        stop: &dyn Fn() -> bool,
+        busy_us: &dyn Fn(u64),
+    ) -> Result<Vec<Vec<i8>>, ClusterDeviceError> {
+        self.run(prepared, params, stop, busy_us, true, None)
             .map(|trace| trace.spins)
     }
 
@@ -338,7 +353,14 @@ impl ClusterDevice {
                 "the planning rate must be finite and positive",
             ));
         }
-        self.run(prepared, params, stop, final_descent, planning_rate)
+        self.run(
+            prepared,
+            params,
+            stop,
+            &|_| {},
+            final_descent,
+            planning_rate,
+        )
     }
 
     fn run(
@@ -346,6 +368,7 @@ impl ClusterDevice {
         prepared: &PreparedGraph,
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
+        busy_us: &dyn Fn(u64),
         final_descent: bool,
         planning_rate: Option<f64>,
     ) -> Result<ClusterTrace, ClusterDeviceError> {
@@ -379,7 +402,7 @@ impl ClusterDevice {
                 nsweeps: window_int(count)?,
                 final_pass: 0,
             };
-            let gpu_ms = self.dispatch(&buffers, &args, window, params.anneals)?;
+            let gpu_ms = self.dispatch(&buffers, &args, window, params.anneals, busy_us)?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a sweep count is at most i32::MAX"
@@ -402,7 +425,7 @@ impl ClusterDevice {
                     nsweeps: 0,
                     final_pass: 1,
                 };
-                let gpu_ms = self.dispatch(&buffers, &args, window, params.anneals)?;
+                let gpu_ms = self.dispatch(&buffers, &args, window, params.anneals, busy_us)?;
                 chunks.push(ChunkTiming {
                     sweeps: 0,
                     planned_ms: plan.sweep_ms,
@@ -476,14 +499,15 @@ impl ClusterDevice {
         buffer
     }
 
-    /// Encode, commit, and wait for one command buffer. Returns its GPU
-    /// milliseconds.
+    /// Encode, commit, and wait for one command buffer. Passes its GPU
+    /// microseconds to `busy_us` and returns its GPU milliseconds.
     fn dispatch(
         &self,
         buffers: &Buffers,
         args: &ClusterArgs,
         window: Window,
         anneals: usize,
+        busy_us: &dyn Fn(u64),
     ) -> Result<f64, ClusterDeviceError> {
         let cmd = self.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
@@ -509,11 +533,13 @@ impl ClusterDevice {
         if status != metal::MTLCommandBufferStatus::Completed {
             return Err(ClusterDeviceError::CommandBuffer(format!("{status:?}")));
         }
+        let gpu_us = crate::sampler::gpu_time_us(cmd);
+        busy_us(gpu_us);
         #[expect(
             clippy::cast_precision_loss,
             reason = "GPU microseconds of one command buffer are far below 2^52"
         )]
-        let gpu_ms = crate::sampler::gpu_time_us(cmd) as f64 / 1000.0;
+        let gpu_ms = gpu_us as f64 / 1000.0;
         Ok(gpu_ms)
     }
 }
@@ -699,6 +725,68 @@ mod tests {
             memory_bytes: 1 << 30,
             max_buffer_bytes: 1 << 30,
         }
+    }
+
+    /// A family job at the corner of the `quip-metal-otsuka` box fits the
+    /// cluster budgets on this host: `maxNodes` nodes, a node of degree 128,
+    /// so both ELL tables are 128 slots wide, and 256 anneals. The model is a
+    /// ring with one hub. It passes `check_capacity`, and the default
+    /// schedule plans one sweep within the one-sweep limit.
+    #[test]
+    fn a_family_job_at_the_advertised_corner_fits_the_cluster_budgets() {
+        let limits = crate::sampler::host_device_limits();
+        let identity = crate::metal_otsuka_identity(limits, None).unwrap();
+        let n = identity.max_nodes as usize;
+        let degree = identity.limits.max_degree.unwrap() as usize;
+        let anneals = crate::cluster::sampler::MAX_READS;
+        let mut edges: Vec<(u32, u32)> = (0..n).map(|u| (u as u32, ((u + 1) % n) as u32)).collect();
+        edges.extend((0..degree - 2).map(|k| (0, (2 + 2 * k) as u32)));
+        let j: Vec<i32> = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 500 } else { -500 })
+            .collect();
+        let prepared = PreparedGraph::new(
+            &Model {
+                h_milli: &vec![0; n],
+                edges: &edges,
+                j_milli: &j,
+            },
+            &Motifs {
+                tiles: &[],
+                gauges: &[],
+                pairs: &[],
+            },
+            Weights::FULL,
+            limits,
+            anneals,
+        )
+        .unwrap();
+        assert_eq!(prepared.layout().header[3], degree as i32, "weak width");
+        assert_eq!(prepared.layout().header[4], degree as i32, "all width");
+        check_capacity(&prepared, anneals, limits).unwrap();
+        let params = ClusterParams {
+            anneals,
+            ..ClusterParams::default()
+        };
+        let plan =
+            crate::sampler::cluster_plan(anneals, n, params.sweeps, params.chunk_cost(), None);
+        assert!(
+            plan.sweep_ms <= crate::sampler::ONE_SWEEP_MAX_MS,
+            "{} ms per sweep",
+            plan.sweep_ms
+        );
+        assert!(!plan.windows.is_empty());
+        // The CUDA shape bound: half as many tiles and pairs as nodes, every
+        // node its own color, at full width.
+        let shape = crate::capacity::ClusterShape {
+            nodes: n,
+            tiles: n / 2,
+            links: n / 2,
+            weak_width: degree,
+            all_width: degree,
+            colors: n,
+        };
+        let needed = crate::capacity::cluster_footprint(shape).total(anneals, 1);
+        assert!(needed <= limits.usable_bytes(), "{needed} bytes");
     }
 
     /// The corner-sharing fixture at 250 milli weights, so the residual

@@ -391,11 +391,16 @@ pub fn host_identity(kernel: Kernel, cap: Option<usize>) -> Result<BackendIdenti
         Kernel::Gibbs => metal_gibbs_identity(&limits, cap),
         Kernel::Msa => metal_msa_identity(&limits, cap),
     };
-    config_exit(identity, kernel, cap)
+    let binary = match kernel {
+        Kernel::Sa => "quip-metal-sa",
+        Kernel::Gibbs => "quip-metal-gibbs",
+        Kernel::Msa => "quip-metal-msa",
+    };
+    config_exit(identity, binary, cap)
 }
 
 /// [`host_identity`] for `quip-metal-otsuka`: [`metal_otsuka_identity`] on
-/// this host. Its node limit is the SA limit, so the messages name SA.
+/// this host.
 ///
 /// # Errors
 ///
@@ -403,15 +408,16 @@ pub fn host_identity(kernel: Kernel, cap: Option<usize>) -> Result<BackendIdenti
 pub fn host_otsuka_identity(cap: Option<usize>) -> Result<BackendIdentity, ExitCode> {
     config_exit(
         metal_otsuka_identity(&capacity::host_limits(), cap),
-        Kernel::Sa,
+        "quip-metal-otsuka",
         cap,
     )
 }
 
-/// The identity, or the configuration exit code after a message.
+/// The identity, or the configuration exit code after
+/// [`config_message`] on standard error.
 fn config_exit(
     identity: Result<BackendIdentity, CapacityError>,
-    kernel: Kernel,
+    binary: &str,
     cap: Option<usize>,
 ) -> Result<BackendIdentity, ExitCode> {
     identity.map_err(|e| {
@@ -420,16 +426,21 @@ fn config_exit(
             reason = "the binary exits before the session installs its subscriber"
         )]
         {
-            match (cap, e) {
-                (Some(cap), CapacityError::Nodes { max }) => eprintln!(
-                    "--max-nodes {cap} is outside 1 to {max}, the nodes this host admits for {kernel:?}"
-                ),
-                (_, e) => eprintln!("no {kernel:?} model fits this host: {e}"),
-            }
+            eprintln!("{}", config_message(binary, cap, e));
         }
         let code = quip_solver_core::quip_protocol::session::ExitCode::ConfigInvalid.as_i32();
         ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
     })
+}
+
+/// The configuration error of `binary` for an identity error `e`.
+fn config_message(binary: &str, cap: Option<usize>, e: CapacityError) -> String {
+    match (cap, e) {
+        (Some(cap), CapacityError::Nodes { max }) => format!(
+            "--max-nodes {cap} is outside 1 to {max}, the nodes this host admits for {binary}"
+        ),
+        (_, e) => format!("no model fits this host for {binary}: {e}"),
+    }
 }
 
 /// The couplers the identity of `kernel` advertises on this host, computed
@@ -1275,6 +1286,20 @@ mod tests {
             assert_eq!(capped.max_nodes, 1_000, "{kernel:?}");
             assert_eq!(capped.max_edges, identity.max_edges, "{kernel:?}");
         }
+    }
+
+    /// The configuration error names the binary.
+    #[test]
+    fn the_configuration_error_names_the_binary() {
+        use crate::capacity::CapacityError;
+        assert_eq!(
+            super::config_message("quip-metal-otsuka", Some(70_000), CapacityError::Nodes { max: 60_743 }),
+            "--max-nodes 70000 is outside 1 to 60743, the nodes this host admits for quip-metal-otsuka"
+        );
+        assert_eq!(
+            super::config_message("quip-metal-sa", None, CapacityError::Nodes { max: 0 }),
+            "no model fits this host for quip-metal-sa: 0 nodes is the most a kernel can index"
+        );
     }
 
     /// A `--max-nodes` past the limit fails before any device opens, with

@@ -13,8 +13,8 @@ Build and run on Apple Silicon.
 Energies match consensus `quip_solver_core::quip_protocol::scoring::energy_milli`.
 The multi-spin kernel computes each read's energy on the device in integer
 milli units when every coefficient is a whole number in `i8` range, and the
-host rescores 1 job in 1,000 to check it. The host scores the reads of the other kernels,
-and of graphs with other coefficients.
+host rescores 1 job in 1,000 to check it. The host scores the reads of the
+other kernels, and of graphs with other coefficients.
 
 ## Binaries
 
@@ -71,13 +71,16 @@ the `FamilyBinding` of explicit jobs.
 - Each other job runs on the Metal SA engine of `quip-metal-sa`. For the
   same seed, a plain job returns the same reads on both binaries.
 - The cluster kernel and Metal SA never share the GPU. Each plans its
-  command buffers against the 500 ms ceiling as if it owns the GPU. A family job waits until every plain job ahead of it
-  answers, and no plain job starts while a family job runs.
+  command buffers against the 500 ms ceiling as if it owns the GPU. A family
+  job waits until every plain job ahead of it answers, and no plain job starts
+  while a family job runs.
 - A family job that does not fit the cluster layout, the memory budget, or the
   single-buffer limit gets a `Capacity` reject with one refund, and the
   session goes on. The miner refuses the job before it allocates a buffer.
-- When the IOKit governor asks the miner to yield, a family job stops before
-  its next command buffer, and the miner rejects it as busy.
+- When the GPU load of other processes passes the `--utilization` ceiling
+  with `--yielding` on, a family job stops before its next command buffer,
+  and the miner rejects it as busy. The load of the family job itself does
+  not count, because the job reports its GPU time to the governor.
 
 `tests/cluster_session.rs` checks the routing, the cancellation, the
 refusals, and the job order. `tests/family_compatibility.rs` checks that
@@ -232,7 +235,7 @@ comparison against an inline geometric threshold draw. The kernel drives
 spins one color class at a time, using the Advantage2 four-coloring by
 default and falling back to the greedy coloring the Gibbs kernel uses when
 the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
-or `off` (case-insensitive) to force the greedy colouring. One threadgroup
+or `off` (case-insensitive) to force the greedy coloring. One threadgroup
 anneals one 32-replica word of one problem in
 threadgroup memory. A 128-read job dispatches four threadgroups per problem.
 
