@@ -722,9 +722,9 @@ pub fn footprint(
 ///
 /// # Errors
 ///
-/// The errors of [`footprint`]. A non-candidate that no sparse tier admits,
-/// such as a multi-spin model past the sparse degree, is a
-/// [`CapacityError::Degree`].
+/// The errors of [`footprint`]. A non-candidate uses the sparse tiers and
+/// returns their error, including [`CapacityError::Degree`],
+/// [`CapacityError::Memory`], or [`CapacityError::Buffer`].
 #[cfg(test)]
 pub fn routed_footprint(
     kernel: Kernel,
@@ -749,8 +749,9 @@ pub fn routed_footprint(
 ///
 /// # Errors
 ///
-/// The errors of [`footprint`]. A non-candidate that no sparse tier admits
-/// is a [`CapacityError::Degree`].
+/// The errors of [`footprint`]. A non-candidate uses the sparse tiers and
+/// returns their error, including [`CapacityError::Degree`],
+/// [`CapacityError::Memory`], or [`CapacityError::Buffer`].
 pub fn routed_runnable_footprint(
     kernel: Kernel,
     graph: &IsingGraph,
