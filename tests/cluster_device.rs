@@ -549,3 +549,55 @@ fn cluster_chunks_stay_under_the_ceiling() {
     }
     assert!(worst < 400.0, "a chunk measured {worst:.1} ms");
 }
+
+/// Wall time of one production family job: 256 reads at 2,048 sweeps, one
+/// sweep per beta (the session default), on the Advantage2 instance with
+/// full weights, as `quip-metal-otsuka` runs it.
+#[test]
+#[ignore = "measurement: several seconds of GPU time"]
+#[expect(clippy::print_stderr, reason = "report the measured job time")]
+fn a_production_family_job_time() {
+    let device = device();
+    let instance = advantage2_instance();
+    let graph = quip_solver_core::IsingGraph::new(
+        instance
+            .h()
+            .iter()
+            .map(|&h| f64::from(h) / 1000.0)
+            .collect(),
+        instance
+            .j()
+            .iter()
+            .map(|&j| f64::from(j) / 1000.0)
+            .collect(),
+        instance
+            .edges()
+            .iter()
+            .map(|&(u, v)| (u as usize, v as usize))
+            .collect(),
+    );
+    let params = quip_solver_core::SampleParams {
+        num_reads: 256,
+        num_sweeps: 2048,
+        seed: 3,
+        ..Default::default()
+    };
+    let q = quip_solver_metal::cluster::sampler::cluster_params(&graph, &params).unwrap();
+    let p =
+        PreparedGraph::from_instance(&instance, &TWISTED_DIMER_V1, Weights::FULL, &limits(), 256)
+            .unwrap();
+    let started = std::time::Instant::now();
+    let trace = device
+        .trace_for_test(&p, &q, true, None, &|| false)
+        .unwrap();
+    let wall = started.elapsed().as_secs_f64();
+    let gpu: f64 = trace.chunks.iter().map(|c| c.gpu_ms).sum::<f64>() / 1000.0;
+    let sweeps = trace.chunks.iter().filter(|c| c.sweeps > 0).count();
+    eprintln!(
+        "256 reads, 2048 sweeps: {} command buffers ({sweeps} sweep, {} descent), \
+         wall {wall:.2} s, GPU {gpu:.2} s, {:.3} ms wall per buffer",
+        trace.chunks.len(),
+        trace.chunks.len() - sweeps,
+        wall * 1000.0 / trace.chunks.len() as f64,
+    );
+}

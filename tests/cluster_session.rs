@@ -607,8 +607,9 @@ fn foreign_gpu_load_above_the_ceiling_stops_a_family_job() {
     assert_eq!(*device.launches.lock().unwrap(), 0);
 }
 
-/// An SA engine that does not open is logged at warn, and the cluster job
-/// still runs, with no governor yield.
+/// An SA engine that does not open is logged at warn once per process,
+/// and every cluster job still runs, with no governor yield. No other test
+/// in this binary fails the governor open, so the warning is this test's.
 #[test]
 fn a_missing_governor_is_logged_and_the_job_still_runs() {
     #[derive(Clone)]
@@ -639,22 +640,27 @@ fn a_missing_governor_is_logged_and_the_job_still_runs() {
         ..Default::default()
     };
     let sampler = sampler(device.clone(), sa);
-    let result = tracing::subscriber::with_default(subscriber, || {
-        sampler.sample_prepared_for_test(
-            &job(),
-            &prepared(&HEADLESS_LIMITS),
-            &CancelToken::default(),
-        )
+    let results = tracing::subscriber::with_default(subscriber, || {
+        [0, 1].map(|_| {
+            sampler.sample_prepared_for_test(
+                &job(),
+                &prepared(&HEADLESS_LIMITS),
+                &CancelToken::default(),
+            )
+        })
     });
-    assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+    for result in results {
+        assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+    }
     assert_eq!(
         *device.launches.lock().unwrap(),
-        SWEEP_CHUNKS + DESCENT_PASSES
+        2 * (SWEEP_CHUNKS + DESCENT_PASSES)
     );
     let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(log.contains("WARN"), "{log}");
     assert!(log.contains("scripted open failure"), "{log}");
-    assert!(log.contains("no governor yield"), "{log}");
+    // Two jobs, one warning per process.
+    assert_eq!(log.matches("no governor yield").count(), 1, "{log}");
 }
 
 #[test]

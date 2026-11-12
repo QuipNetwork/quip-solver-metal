@@ -280,12 +280,17 @@ impl<D: ClusterBackend, S: Sampler + ClusterGovernor> OtsukaSampler<D, S> {
             SampleError::Capacity
         })?;
         if let Err(error) = self.sa.open_governor() {
-            // The governor starts with the SA engine. Without it this job
-            // cannot yield to other GPU users, but it still runs.
-            tracing::warn!(
-                %error,
-                "the SA engine did not open; this cluster job runs with no governor yield"
-            );
+            // The governor starts with the SA engine. Without it this job,
+            // and every later one, cannot yield to other GPU users, but it
+            // still runs. The open failure is cached, so it is logged once
+            // per process.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    %error,
+                    "the SA engine did not open; cluster jobs run with no governor yield"
+                );
+            });
         }
         // A governor yield to other processes refuses this job as busy. Only
         // the session token makes `finish` report Cancelled and drop the

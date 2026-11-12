@@ -74,9 +74,12 @@ the `FamilyBinding` of explicit jobs.
 - The cluster kernel and Metal SA never share the GPU. Each plans its
   command buffers against the 500 ms ceiling as if it owns the GPU. A family
   job waits until every plain job ahead of it answers, and no plain job starts
-  while a family job runs. Estimate from the chunk timings in
-  `docs/perf/2026-11-12-otsuka-metal.md`: a 2,048-sweep family job at 256
-  reads on a 4,577-node instance holds the GPU for about 7 seconds.
+  while a family job runs. With one sweep per beta, the ladder runs one
+  command buffer per sweep. One family job at 256 reads and 2,048 sweeps on
+  the 4,577-node Advantage2 instance took 4.05 to 4.28 s in three runs on an
+  Apple M4 Max: 2,050 command buffers, about 2 ms each, of which about
+  1.8 ms is GPU time (`a_production_family_job_time` in
+  `tests/cluster_device.rs`).
 - A family job that does not fit the cluster layout, the memory budget, or the
   single-buffer limit gets a `Capacity` reject with one refund, and the
   session goes on. The miner refuses the job before it allocates a buffer.

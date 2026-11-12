@@ -667,14 +667,6 @@ fn buffer_bytes(prepared: &PreparedGraph, anneals: usize) -> [usize; 16] {
     ]
 }
 
-/// Refuse a launch of `anneals` anneals of `prepared` before any buffer
-/// exists: a `uint` index of the kernel past its range, the total past the
-/// usable memory, or one buffer past the single-buffer limit.
-///
-/// The kernel's `uint` indices: each anneal's region starts at
-/// `anneal * n` in the spins, `parent`, and `acc`; each thread's random
-/// state is `anneal * 512 + thread`; an ELL slot is `slot * n + node`.
-/// Preparation bounds the `int` tile, pair, colour, and ELL counts.
 /// The command buffers of a ladder run: `(first sweep, sweeps, beta)`. Each
 /// rung splits into windows no longer than the longest window of `plan`,
 /// so no command buffer crosses a rung or runs longer than planned.
@@ -701,6 +693,14 @@ fn ladder_windows(
     windows
 }
 
+/// Refuse a launch of `anneals` anneals of `prepared` before any buffer
+/// exists: a `uint` index of the kernel past its range, the total past the
+/// usable memory, or one buffer past the single-buffer limit.
+///
+/// The kernel's `uint` indices: each anneal's region starts at
+/// `anneal * n` in the spins, `parent`, and `acc`; each thread's random
+/// state is `anneal * 512 + thread`; an ELL slot is `slot * n + node`.
+/// Preparation bounds the `int` tile, pair, colour, and ELL counts.
 fn check_capacity(
     prepared: &PreparedGraph,
     anneals: usize,
