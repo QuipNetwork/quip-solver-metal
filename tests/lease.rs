@@ -373,6 +373,75 @@ async fn a_degree_21_lease_runs() {
     assert!(s.log.fatal.is_none());
 }
 
+/// Close a lease whose salts the capacity model refuses, then serve a ring
+/// lease on the same session: the refusal is a zero-salt summary with one
+/// refund, never a fatal error.
+async fn refused_lease_then_ring_lease(s: &mut Session, refused: &[u8]) {
+    s.until("refused lease done", LONG, |log| {
+        log.done(refused).is_some() && log.refunds() >= 1
+    })
+    .await;
+    assert_eq!(s.log.done(refused).expect("LeaseDone").salts_done, 0);
+    assert!(s.log.results_for(refused).is_empty());
+    assert_eq!(s.log.refunds(), 1, "one refund for the refused lease");
+    assert!(s.log.fatal.is_none(), "{:?}", s.log.fatal);
+
+    let (topology, _) = ring(64, RING_B);
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::Job(lease(b"next", 3, RING_B, 0, 8)))
+        .await;
+    s.until("next lease done", LONG, |log| {
+        log.done(b"next").is_some() && log.refunds() >= 2
+    })
+    .await;
+    assert_eq!(s.log.done(b"next").expect("LeaseDone").salts_done, 8);
+    assert_eq!(s.log.results_for(b"next").len(), 8);
+    assert_eq!(s.log.refunds(), 2, "the refused lease and the next lease");
+    assert_eq!(s.shutdown(2_000).await, 0);
+    assert_eq!(s.log.done_count(refused), 1);
+    assert!(s.log.rejects.is_empty(), "{:?}", s.log.rejects);
+    assert!(s.log.fatal.is_none(), "{:?}", s.log.fatal);
+}
+
+/// A port of the CUDA test of the same name. A hub of degree 63 is past the
+/// weighted lanes' 62 neighbours, and a repeated coupler keeps the model off
+/// dense-matrix storage, so the capacity model refuses every salt. The lease
+/// closes with a refund and the session serves the next lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn degree_sixty_three_lease_returns_capacity_without_faulting() {
+    let mut s = Session::start(&msa(), 4, "").await;
+    let (mut topology, _) = ring(64, RING_A);
+    let mut v: Vec<u32> = (1..63).collect();
+    v.push(1);
+    topology.edges = Some(EdgeList { u: vec![0; 63], v });
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    s.send(coord_msg::Msg::Job(lease(b"degree-63", 3, RING_A, 0, 8)))
+        .await;
+    refused_lease_then_ring_lease(&mut s, b"degree-63").await;
+}
+
+/// A model of 5,000 nodes passes the node limit, and its degree-63 hub runs
+/// only on dense-matrix storage, where one sweep of 5,000 * 5,000 columns is
+/// estimated past the one-sweep limit. The lease closes with a refund and
+/// the session serves the next lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_past_the_one_sweep_limit_returns_capacity_without_faulting() {
+    let mut s = Session::start(&msa(), 4, "").await;
+    let (mut topology, _) = ring(5_000, RING_A);
+    topology.edges = Some(EdgeList {
+        u: vec![0; 63],
+        v: (1..64).collect(),
+    });
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    s.send(coord_msg::Msg::Job(lease(b"one-sweep", 3, RING_A, 0, 8)))
+        .await;
+    refused_lease_then_ring_lease(&mut s, b"one-sweep").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_leases_are_rejected_with_refunds() {
     let mut s = Session::start(&msa(), 4, "").await;

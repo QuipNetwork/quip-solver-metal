@@ -424,6 +424,17 @@ impl MetalSampler {
             for outcome in std::iter::once(first).chain(outcomes.try_iter()) {
                 reported += 1;
                 let sent = match outcome {
+                    // Every salt of a lease shares its topology and
+                    // parameters, so a capacity refusal of one salt refuses
+                    // the lease. `Capacity` is not fatal: the session closes
+                    // the lease with a refund and serves the next one.
+                    resident::SaltOutcome::Failed {
+                        index,
+                        error: quip_solver_core::SampleError::Capacity,
+                    } => {
+                        tracing::warn!(index, "lease refused for capacity");
+                        return Err(quip_solver_core::SampleError::Capacity);
+                    }
                     resident::SaltOutcome::Failed { index, error } => {
                         return Err(quip_solver_core::SampleError::DeviceFault(format!(
                             "lease salt {index}: {error}"
