@@ -4292,14 +4292,18 @@ mod tests {
             preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))
         ));
-        input
-            .graph
-            .h
-            .resize(sampler::kernel_max_nodes(Kernel::Msa) + 1, 0.0);
-        assert!(matches!(
-            preparer.prepare(&mut input, CascadeSettings::default(), true),
-            Err(SampleError::TooLarge(_))
-        ));
+        // A weighted model past the unit kernel's nodes, within the degree
+        // budget, takes the batch path's spill build.
+        let n = sampler::kernel_max_nodes(Kernel::Msa) + 1;
+        input.graph = IsingGraph::new(
+            vec![0.5; n],
+            vec![0.5; n],
+            (0..n).map(|i| (i, (i + 1) % n)).collect(),
+        );
+        assert!(preparer
+            .prepare(&mut input, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
