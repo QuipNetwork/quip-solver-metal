@@ -352,6 +352,10 @@ struct StreamCtx<'a> {
     /// Reseed watermark: job watermarks at or below it were abandoned by the
     /// coordinator and must not consume GPU time.
     cancel: &'a CancelToken,
+    /// The job in `pending` fails beside a second batch in flight but may
+    /// pass alone, so it waits for the GPU to empty and runs as the only
+    /// batch.
+    solo_next: bool,
 }
 
 impl StreamCtx<'_> {
@@ -516,6 +520,8 @@ fn fill_batch(
 struct InFlight {
     encoded: sampler::EncodedBatch,
     jobs: Vec<StreamJob>,
+    /// The batch runs alone: the stream forms no second batch beside it.
+    solo: bool,
 }
 
 impl InFlight {
@@ -549,6 +555,7 @@ pub fn run_stream(
         kernel,
         gov,
         cancel,
+        solo_next: false,
     };
 
     // Each batch owns at most one committed chunk. Alternate batches so host
@@ -560,7 +567,7 @@ pub fn run_stream(
     while let Some(mut current) = inflight.pop_front() {
         // Never wait for another seed while a batch holds coordinator credits.
         // During throttling, drain both batches before the next yield gate.
-        if inflight.is_empty() && !ctx.gov.should_throttle() {
+        if inflight.is_empty() && !current.solo && !ctx.gov.should_throttle() {
             if let Some(next) = form_and_commit(device, &mut ctx, Seed::NonBlocking) {
                 inflight.push_back(next);
             }
@@ -599,6 +606,10 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         if ctx.out.is_closed() {
             return None;
         }
+        // A job that must run alone waits until no batch is in flight.
+        if seed == Seed::NonBlocking && ctx.solo_next {
+            return None;
+        }
         // Yield before taking a seed, not after: once a job is dequeued it is ours
         // to answer, and holding it through a pause would stall the coordinator's
         // credit for no benefit.
@@ -607,6 +618,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
             return None;
         }
         let seed_job = next_seed(ctx, seed)?;
+        ctx.solo_next = false;
         // Batch size follows the seed's read count: chromatic Gibbs spends
         // `num_reads` threadgroups per problem, so the same threadgroup budget is a
         // different number of problems at 64 reads than at 256.
@@ -619,15 +631,25 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         let cap = scale_budget(nominal, ctx.gov.budget_scale());
         // Fewer problems when one sweep of the whole batch, beside the other
         // batch in flight, would pass the chunk limit. The rest of the queue
-        // waits for the next batches. A job that fails alone gets a batch of
-        // one, and the admission refuses it.
-        let cap = sampler::one_sweep_problem_cap(
+        // waits for the next batches.
+        let (cap, in_flight) = match sampler::one_sweep_problem_cap(
             &seed_job.graph,
             &seed_job.params,
             ctx.kernel,
             STREAM_IN_FLIGHT,
             cap,
-        );
+        ) {
+            Some(cap) => (cap, STREAM_IN_FLIGHT),
+            // The seed fails beside a second batch. It waits for the batch in
+            // flight to finish, then runs alone, and the admission refuses it
+            // only if it fails alone, as `sample_ising` does.
+            None if seed == Seed::NonBlocking => {
+                *ctx.pending = Some(seed_job);
+                ctx.solo_next = true;
+                return None;
+            }
+            None => (1, 1),
+        };
         // Keep `seed_job` live while `key` borrows its edge list; collect further
         // matches into a side vec, then assemble the full batch.
         let mut matches = Vec::with_capacity(cap.saturating_sub(1));
@@ -665,13 +687,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         }
         let encoded = {
             let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-            sampler::encode_batch(
-                device,
-                &graphs,
-                &batch[0].params,
-                ctx.kernel,
-                STREAM_IN_FLIGHT,
-            )
+            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel, in_flight)
         };
         match encoded {
             Ok(enc) => {
@@ -682,6 +698,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
                 let mut inflight = InFlight {
                     encoded: enc,
                     jobs: batch,
+                    solo: in_flight == 1,
                 };
                 inflight.commit_next(ctx.cancel);
                 return Some(inflight);
@@ -710,7 +727,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
 /// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
 /// batch's overlap with host work on either side.
 fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>, cancel: &CancelToken) -> u64 {
-    let InFlight { encoded, jobs } = inflight;
+    let InFlight { encoded, jobs, .. } = inflight;
 
     encoded.wait_until_completed();
     let device_access_time_us = encoded.gpu_time_us();
@@ -875,6 +892,7 @@ mod tests {
                 let mut inflight = InFlight {
                     encoded,
                     jobs: vec![first, second],
+                    solo: false,
                 };
                 let cancel = CancelToken::default();
                 if committed {
@@ -1020,6 +1038,53 @@ mod tests {
         }
         assert_eq!(completed, jobs);
         assert!(gov.0.get() >= 2, "{} batches", gov.0.get());
+    }
+
+    /// A Gibbs job that fails beside a second batch in flight but passes
+    /// alone (4,800 nodes, mean degree 1,200, 256 reads) waits for the batch
+    /// in flight, runs as the only batch, and completes. The job after it
+    /// streams as before.
+    #[test]
+    fn a_job_that_passes_only_alone_runs_as_the_only_batch() {
+        let n = sampler::kernel_max_nodes(Kernel::Gibbs);
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=600).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j: Vec<f64> = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let dense = IsingGraph::new(vec![0.0; n], j, edges);
+        let small = IsingGraph::new(vec![1.0; 1024], vec![], vec![]);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(3);
+        job_tx
+            .blocking_send(job(b"before", small.clone(), 64, 64, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"alone", dense, 256, 4, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"after", small, 64, 32, 1))
+            .unwrap();
+        drop(job_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(3);
+        let device = MetalDevice::open(0).unwrap();
+        run_stream(
+            &device,
+            Kernel::Gibbs,
+            job_rx,
+            &out_tx,
+            &NoGovernor,
+            &CancelToken::default(),
+        );
+        for (id, reads) in [(&b"before"[..], 64), (b"alone", 256), (b"after", 64)] {
+            let result = out_rx.try_recv().unwrap();
+            assert_eq!(result.job_id, id);
+            let StreamOutcome::Completed(Ok(samples)) = result.outcome else {
+                panic!("{} was not completed", String::from_utf8_lossy(id));
+            };
+            assert_eq!(samples.len(), reads);
+        }
+        assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -1336,6 +1401,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         // Empty job is answered inline; channel then closes → None.
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
@@ -1379,6 +1445,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
 
@@ -1449,6 +1516,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         assert!(next_seed(&mut ctx, Seed::NonBlocking).is_none());
     }
@@ -1469,6 +1537,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         let Some(got) = next_seed(&mut ctx, Seed::Blocking) else {
             assert_eq!("got", "in-range seed job");

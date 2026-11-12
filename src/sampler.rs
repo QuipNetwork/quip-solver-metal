@@ -533,14 +533,16 @@ fn check_one_sweep(shape: &SweepShape) -> Result<(), SampleError> {
 /// at most `max` and at least 1, so that [`one_sweep_ms`] of the whole batch
 /// with `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`]. The stream
 /// caps its batches with it, so a batch is never refused when its jobs pass
-/// alone. A job that fails alone gets 1, and the admission refuses it.
+/// alone. `None` when one problem of `graph` fails with `in_flight` batches:
+/// the stream then runs it as the only batch on the GPU, where the admission
+/// applies the rule of [`sample_ising`].
 pub(crate) fn one_sweep_problem_cap(
     graph: &IsingGraph,
     params: &SampleParams,
     kernel: Kernel,
     in_flight: usize,
     max: usize,
-) -> usize {
+) -> Option<usize> {
     let max = max.max(1);
     let Ok(batch) = validate_batch_within(
         &[graph],
@@ -552,7 +554,7 @@ pub(crate) fn one_sweep_problem_cap(
         DenseMode::Off,
         in_flight,
     ) else {
-        return 1;
+        return None;
     };
     let fits = |problems: usize| {
         one_sweep_ms(&SweepShape {
@@ -576,7 +578,7 @@ pub(crate) fn one_sweep_problem_cap(
             hi = mid - 1;
         }
     }
-    lo
+    Some(lo)
 }
 
 /// Mean GPU time per spin update relative to degree 20, for the SA chunk
@@ -4665,7 +4667,7 @@ mod tests {
         let graph = circulant_int32(SA_MAX_NODES, 150);
         assert!(close(mean_degree(&graph), 150.0));
         validate_batch(&[&graph], &p, Kernel::Sa).unwrap();
-        let cap = one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 240);
+        let cap = one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 240).unwrap();
         assert!((1..240).contains(&cap), "{cap}");
         assert!(240_usize.div_ceil(cap) >= 2, "{cap}");
         let admit = |problems: usize| {
@@ -4687,12 +4689,38 @@ mod tests {
             err.to_sample_error(),
             quip_solver_core::SampleError::Capacity
         );
-        // The cap never reaches 0: a job that fails alone gets a batch of
-        // one, which the admission refuses.
-        let complete = complete_int32(1_500);
-        validate_batch(&[&complete], &p, Kernel::Sa).unwrap_err();
-        assert_eq!(one_sweep_problem_cap(&complete, &p, Kernel::Sa, 2, 240), 1);
-        assert_eq!(one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 0), 1);
+        // The cap never reaches 0.
+        assert_eq!(one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 0), Some(1));
+    }
+
+    /// The three outcomes of the stream's cap for one Gibbs job of 256
+    /// reads on the shared build: it fits beside a second batch in flight,
+    /// it fits only alone (the stream runs it as the only batch), or it fails
+    /// alone (the admission refuses it, as `sample_ising` does).
+    #[test]
+    fn the_stream_cap_runs_alone_a_job_that_fails_only_beside_a_second_batch() {
+        let p = SampleParams {
+            num_reads: 256,
+            num_sweeps: 16,
+            ..Default::default()
+        };
+        let cap = |graph: &IsingGraph, in_flight| {
+            one_sweep_problem_cap(graph, &p, Kernel::Gibbs, in_flight, 3)
+        };
+        let fits = circulant_int32(GIBBS_MAX_NODES, 200);
+        assert_eq!(cap(&fits, 2), Some(3));
+        let solo = circulant_int32(GIBBS_MAX_NODES, 1_200);
+        assert_eq!(cap(&solo, 2), None);
+        assert_eq!(cap(&solo, 1), Some(1));
+        validate_batch(&[&solo], &p, Kernel::Gibbs).unwrap();
+        let fails = circulant_int32(GIBBS_MAX_NODES, 2_400);
+        assert_eq!(cap(&fails, 2), None);
+        assert_eq!(cap(&fails, 1), None);
+        let err = validate_batch(&[&fails], &p, Kernel::Gibbs).unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
     }
 
     /// Two batches in flight count the reads of both, so one batch of a
@@ -4749,7 +4777,7 @@ mod tests {
                 // the batch size.
                 assert_eq!(
                     one_sweep_problem_cap(&graph, &p, kernel, 2, problems),
-                    problems,
+                    Some(problems),
                     "{kernel:?} {reads}"
                 );
                 sizes.push((kernel, reads, problems));
