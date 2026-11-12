@@ -40,7 +40,7 @@ struct Cli {
     /// Print the largest model each connectivity and precision admits, then exit. Opens no device.
     /// The probe applies the memory model only. A running session also applies the one-sweep
     /// limit and `maxDegree`.
-    #[arg(long, conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve"])]
+    #[arg(long, conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve", "ane_worker"])]
     probe_capacity: bool,
     /// Print the probe as JSON. Only with `--probe-capacity`.
     #[arg(long, requires = "probe_capacity")]
@@ -74,4 +74,19 @@ fn main() -> ExitCode {
         cli.utilization,
         cli.yielding,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_probe_conflicts_with_ane_worker() {
+        let error =
+            Cli::try_parse_from(["quip-metal-msa", "--probe-capacity", "--ane-worker", "1"]).err();
+        assert_eq!(
+            error.map(|error| error.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+    }
 }
