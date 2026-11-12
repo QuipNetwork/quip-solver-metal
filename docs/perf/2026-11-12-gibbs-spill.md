@@ -78,3 +78,7 @@ The pm1 digests in the table below come from `cargo test --release --test pm1_ra
 | ±1, unit multi-spin | `6ec8d35ff7c9f123` |
 | ±1.5, weighted multi-spin | `4ee84dd42f5d5ade` |
 | ±1.0005, Float32 multi-spin | `c103cce43c429e4b` |
+
+## Digests after the sweep change of November 12
+
+QUI-2265 (merge request !33 on main) changes the SA and MSA sweeps, and the Gibbs kernel stays the same. After the merge of `feat/msa-spill` into `feat/sa-gibbs-spill`, the three Gibbs digests in the preceding table kept their values: `bc085a7fc384f073`, `e9069459b5895d15`, and `eabc348f9005570c`. The unit SA digest is now `e5ba74a87a6dadad`, the unit multi-spin digest `a68757003e4eac09`, the weighted multi-spin digest `be4c5e92185633b9`, and the Float32 multi-spin digest `af08be780113298d`.
