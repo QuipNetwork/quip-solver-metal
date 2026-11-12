@@ -753,13 +753,28 @@ Five verification runs passed 400 ms. Their constants rose, and the runs repeate
 - SA global at degree 4 and 196,343 nodes took 408.4 ms in its first chunk. The point rose from 6.92 to 8.13 ns.
 - Gibbs shared on a complete `binary` model of 3,098 nodes took 785.8 ms, with 11 chunks past 600 ms. The complete points from 2,000 nodes up now come from runs of 16 one-sweep chunks at 2,000, 2,500, 2,700 and 2,900 nodes, and the point at degree 3,097 is 991 ns. These runs are in `docs/perf/2026-11-metal-capacity-5.3b.jsonl`, after the grid rerun. In the same file, the `int32` run at 3,098 nodes reached 534.7 ms, and the tightened limit of 2,915 nodes now refuses that model.
 
-The device tests `the_largest_admitted_high_degree_sweeps_stay_under_400_ms` in `tests/sa_capacity.rs` and `tests/gibbs_capacity.rs`, and `the_largest_admitted_spill_sweep_stays_under_400_ms` in `tests/msa_spill.rs`, run the high-degree limits with the production planner. They assert that the longest chunk is below 400 ms and that the admission refuses one node more:
+The device tests `the_largest_admitted_high_degree_sweeps_stay_under_400_ms` in `tests/sa_capacity.rs` and `tests/gibbs_capacity.rs`, and `the_largest_admitted_spill_sweep_stays_under_400_ms` in `tests/msa_spill.rs`, run the high-degree limits with the production planner. They assert that the longest chunk is below 400 ms and that the admission refuses one node more. These tests are valid on a quiet GPU only:
 
 ```sh
 cargo test --release --test sa_capacity the_largest_admitted -- --ignored --nocapture
 cargo test --release --test gibbs_capacity the_largest_admitted -- --ignored --nocapture
 cargo test --release --test msa_spill the_largest_admitted -- --ignored --nocapture
 ```
+
+The 400 ms target is for runs on a quiet GPU. Other GPU work on a loaded host can make a chunk longer than 400 ms, and the 500 ms planning ceiling with its margin under the GPU watchdog covers that case.
+
+During Task 5.3b fix round 2, other sessions loaded the host. Six runs of the Gibbs limit test passed 400 ms. The load average is the one that `uptime` printed before the run.
+
+| Shape | Longest chunk (ms) | Load average (1, 5 and 15 minutes) |
+|---|---|---|
+| Gibbs spill, degree 200, 107,927 nodes, `int32` | 508.6 | 16.24, 10.80, 11.50 |
+| Gibbs spill, degree 200, 107,927 nodes, `int32` | 405.4 | 5.79, 9.35, 10.88 |
+| Gibbs spill, degree 200, 107,927 nodes, `int32` | 408.2 | 7.51, 8.70, 10.40 |
+| Gibbs spill, degree 200, 107,927 nodes, `int32` | 497.8 | 13.59, 13.53, 12.03 |
+| Gibbs spill, degree 62, 358,494 nodes, `int32` | 470.2 | 8.47, 8.91, 10.08 |
+| Gibbs spill, degree 62, 358,494 nodes, `int32` | 707.5 | 19.66, 12.10, 11.12 |
+
+The same test at the earlier commit `84d6715` failed in the same way under that load, with 454.7 and 406.4 ms. The constants stay as they are.
 
 ### Grid rerun
 

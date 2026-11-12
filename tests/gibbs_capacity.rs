@@ -282,7 +282,7 @@ fn complete(n: usize, path: Path) -> IsingGraph {
 /// refused as a capacity error. The limits are those of
 /// `docs/perf/2026-11-metal-capacity.md` on a 40-core GPU.
 #[test]
-#[ignore = "device timing: run with --release --ignored --nocapture"]
+#[ignore = "device timing, valid on a quiet GPU: run with --release --ignored --nocapture"]
 fn the_largest_admitted_high_degree_sweeps_stay_under_400_ms() {
     let dev = MetalDevice::open(0).unwrap();
     let p = params(256, 16, 1, 9);

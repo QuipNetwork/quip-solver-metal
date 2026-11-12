@@ -327,7 +327,7 @@ fn spill_layout_rates() {
 /// chunk stays below 400 ms, and one node more is refused as a capacity
 /// error. The limit is that of `docs/perf/2026-11-metal-capacity.md`.
 #[test]
-#[ignore = "device timing: run with --release --ignored --nocapture"]
+#[ignore = "device timing, valid on a quiet GPU: run with --release --ignored --nocapture"]
 fn the_largest_admitted_spill_sweep_stays_under_400_ms() {
     let dev = MetalDevice::open(0).unwrap();
     let p = params(256, 16, 1, 9);
