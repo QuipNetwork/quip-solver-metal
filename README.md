@@ -92,24 +92,52 @@ admission applies the same capacity model and the same one-sweep rule, so
   `2 * maxEdges / maxNodes`.
 - Both corners hold at every read count from 32 to 256, at 64 betas, and on
   every coefficient layout that the kernel runs.
-- `--max-nodes N` lowers `maxNodes`. A value past the limit is a
+- Every binary advertises `maxDegree` 62, the sparse degree limit of the
+  weighted multi-spin kernel (`sampler::MSA_SPARSE_MAX_DEG`).
+- `--max-nodes N` lowers `maxNodes`. A value of 0 or past the limit is a
   configuration error (exit code 64), and the binary opens nothing.
-- MSA advertises no degree limit, because a model past the sparse degree
-  limit runs on dense-matrix storage.
 
 On the calibration host, an Apple M4 Max with a 40-core GPU and 128 GB of
 memory, the limits are:
 
-| Binary | `maxNodes` | `maxEdges` | Reference degree |
-|---|---:|---:|---:|
-| `quip-metal-sa` | 41,647 | 998,991 | 48.0 |
-| `quip-metal-gibbs` | 5,684,919 | 1,398,628 | 0.49 |
-| `quip-metal-msa` | 13,724,198 | 11,992,753 | 1.75 |
+| Binary | `maxNodes` | `maxEdges` | Reference degree | `maxDegree` |
+|---|---:|---:|---:|---:|
+| `quip-metal-sa` | 41,647 | 998,991 | 48.0 | 62 |
+| `quip-metal-gibbs` | 5,684,919 | 1,398,628 | 0.49 | 62 |
+| `quip-metal-msa` | 13,724,198 | 11,992,753 | 1.75 | 62 |
 
-The session can refuse some models inside both limits. A model just past
-the largest complete model takes dense-matrix storage, so the one-sweep
-limit refuses it. That refusal is a non-fatal `Capacity` reject with one
-refund.
+The session admits every model inside `maxNodes`, `maxEdges` and
+`maxDegree`. The test `every_shape_in_the_advertised_box_is_admitted`
+checks a grid over that box. The harness refuses a model with a node past
+degree 62, which removes two kinds of refusal from inside the box:
+
+- A model past degree 62 runs only on dense-matrix storage. The one-sweep
+  limit holds a dense model to 1,414 nodes on SA, 1,673 on Gibbs and 4,898
+  on MSA, so the session refused a larger model past that degree.
+- The SA CSR one-sweep estimate refuses high mean degrees well below the
+  dense size: it refuses 7,025 nodes at a mean degree of 284.
+
+The memory model can still refuse a job at a corner while the multi-spin
+slot pools hold memory. That refusal is a non-fatal `Capacity` reject with
+one refund.
+
+The complete models that set `maxEdges` pass degree 62. They run only
+through the library API (`sample_ising`), not through a session.
+
+The largest admitted node count at a fixed regular degree, measured on this
+host by a probe of the session admission in 1 percent steps (Task 5.4b
+review), is:
+
+| Binary | Degree 4 | Degree 20 | Degree 62 | Degree 200 |
+|---|---:|---:|---:|---:|
+| `quip-metal-sa` | 101,532 | 88,572 | 32,906 | 9,322 |
+| `quip-metal-gibbs` | 5,684,919 | 978,887 | 358,494 | 91,959 |
+| `quip-metal-msa` | 13,724,198 | 6,932,120 | 1,433,223 | 4,898 (dense) |
+
+The degree-200 column passes `maxDegree`, so it applies to the library API
+only. The Gibbs and MSA node limits extrapolate from the degree-4 points of
+the sweep-time tables. No measurement exists at 5,684,919 or 13,724,198
+nodes.
 
 The sweep-time tables come from that one GPU
 (`docs/perf/2026-11-metal-capacity.md`). On another chip, the limits scale

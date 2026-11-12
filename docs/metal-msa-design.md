@@ -258,7 +258,7 @@ and returns each job's credit after its committed chunk finishes.
   `capacity::advertised_nodes` and `max_edges` is
   `capacity::advertised_couplers`. Both come from the unified memory of the
   host and the one-sweep limit, as the README section "Advertised limits"
-  describes. The identity states no degree limit. Adapt
+  describes. The degree bound is `sampler::MSA_SPARSE_MAX_DEG` (62). Adapt
   envelope `4096..14336` sweeps, with `64` reads fixed at two words.
   On the same fixture and machine, the 2026-09-15 reference reached 1.02
   jobs/s at 2048 sweeps and 256 reads, using its production T=6.

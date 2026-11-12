@@ -8,6 +8,7 @@ use quip_solver_conformance::driver::{
 };
 use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_proto::v1::RejectReason;
+use quip_solver_metal::sampler::MSA_SPARSE_MAX_DEG;
 use quip_solver_metal::{host_identity, Kernel};
 use std::process::Command;
 
@@ -267,22 +268,28 @@ async fn assert_solve_conformant(bin: &str, limit_cases: &[&str]) {
     }
 }
 
-const FIELD_LIMIT_CASES: &[&str] = &["field-limit-inside", "field-limit-outside"];
+/// Every identity advertises a degree bound and a field bound, so every
+/// kernel runs all four limit cases.
+const LIMIT_CASES: &[&str] = &[
+    "degree-limit-inside",
+    "degree-limit-outside",
+    "field-limit-inside",
+    "field-limit-outside",
+];
 
 #[tokio::test]
 async fn quip_metal_sa_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-sa", FIELD_LIMIT_CASES).await;
+    assert_solve_conformant("quip-metal-sa", LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_gibbs_passes_solve_conformance() {
-    assert_solve_conformant("quip-metal-gibbs", FIELD_LIMIT_CASES).await;
+    assert_solve_conformant("quip-metal-gibbs", LIMIT_CASES).await;
 }
 
 #[tokio::test]
 async fn quip_metal_msa_passes_solve_conformance() {
-    // MSA advertises no degree limit: dense-matrix storage runs any degree.
-    assert_solve_conformant("quip-metal-msa", FIELD_LIMIT_CASES).await;
+    assert_solve_conformant("quip-metal-msa", LIMIT_CASES).await;
 }
 
 #[test]
@@ -297,7 +304,7 @@ fn capabilities_and_version_and_check() {
         ("quip-metal-gibbs", "gibbs", Kernel::Gibbs),
     ] {
         let identity = host_identity(kernel, None).unwrap();
-        let (degree, field, resolution) = (0, 268_435_000, 1);
+        let (degree, field, resolution) = (MSA_SPARSE_MAX_DEG, 268_435_000, 1);
         let path = profile_bin(bin);
 
         let out = Command::new(&path).arg("--capabilities").output().unwrap();

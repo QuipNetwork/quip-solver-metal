@@ -165,9 +165,10 @@ const FEATURES: &[&str] = &[
 ];
 
 /// SA's model limits. A model the int8 kernel cannot hold runs on the wide
-/// kernel, which keeps milli units in `int`, so the bound is the wide path's.
+/// kernel, which keeps milli units in `int`, so the field bound is the wide
+/// path's. The degree bound is [`ADVERTISED_MAX_DEGREE`].
 pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
-    max_degree: Some(0),
+    max_degree: Some(ADVERTISED_MAX_DEGREE),
     max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
     exact_resolution_milli: Some(1),
 };
@@ -175,15 +176,23 @@ pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::Mod
 /// Gibbs's model limits, the same wide bound as [`METAL_SA_LIMITS`].
 pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = METAL_SA_LIMITS;
 
-/// MSA's model limits. A unit model runs on the unit kernel (or the ANE) up
-/// to `sampler::MSA_UNIT_MAX_DEG` neighbours, a weighted model on the
-/// weighted kernel up to `sampler::MSA_SPARSE_MAX_DEG`, and a denser model of
-/// either kind on dense-matrix storage, so no degree limit is advertised. The
-/// field bound is the wide SA path's.
-pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
-    max_degree: Some(0),
-    max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
-    exact_resolution_milli: Some(1),
+/// MSA's model limits, the same as [`METAL_SA_LIMITS`]. A unit model runs on
+/// the unit kernel (or the ANE) up to `sampler::MSA_UNIT_MAX_DEG`
+/// neighbours, and any other model on the weighted kernel up to
+/// `sampler::MSA_SPARSE_MAX_DEG`.
+pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = METAL_SA_LIMITS;
+
+/// The degree bound every identity advertises: the weighted multi-spin
+/// kernel's sparse limit, `sampler::MSA_SPARSE_MAX_DEG`. Under it the
+/// session admits every shape inside `max_nodes` and `max_edges`. Past it, a
+/// model runs only on dense-matrix storage, which holds a few thousand nodes
+/// (`capacity::advertised_couplers`), and the CSR one-sweep limit refuses
+/// SA rows far shorter than the dense size. A denser model, a complete one
+/// included, still runs through the library API (`sample_ising`) when the
+/// session admission accepts it.
+const ADVERTISED_MAX_DEGREE: u32 = {
+    assert!(crate::sampler::MSA_SPARSE_MAX_DEG <= u32::MAX as usize);
+    crate::sampler::MSA_SPARSE_MAX_DEG as u32
 };
 
 /// The identity of `kernel` on a device with `limits`: `max_nodes` is
@@ -1134,7 +1143,7 @@ mod tests {
     fn identities_advertise_linear_schedule_and_their_limits() {
         use quip_solver_core::ModelLimits;
         let limits = ModelLimits {
-            max_degree: Some(0),
+            max_degree: Some(crate::sampler::MSA_SPARSE_MAX_DEG as u32),
             max_local_field_milli: Some(268_435_000),
             exact_resolution_milli: Some(1),
         };
@@ -1217,6 +1226,105 @@ mod tests {
         }
     }
 
+    /// `count` values from 1 to `max`, spaced evenly on a log scale, with
+    /// `max` itself.
+    fn log_grid(max: usize, count: u32) -> Vec<usize> {
+        let mut values: Vec<usize> = (0..count)
+            .map(|k| {
+                (max as f64)
+                    .powf(f64::from(k) / f64::from(count - 1))
+                    .round() as usize
+            })
+            .chain([max])
+            .collect();
+        values.dedup();
+        values
+    }
+
+    /// Every shape inside the advertised box is admitted: each node count
+    /// up to `max_nodes` with each coupler count up to `max_edges` whose mean
+    /// degree the advertised degree bound allows (a graph's mean degree is at
+    /// most its largest). A coarse log grid covers the box, including its
+    /// edges. With no degree bound the grid reaches the dense and high-degree
+    /// shapes that the session refuses.
+    #[test]
+    fn every_shape_in_the_advertised_box_is_admitted() {
+        use crate::capacity::session_admits;
+        let limits = crate::sampler::host_device_limits();
+        for (kernel, identity) in host_identities() {
+            let bound = identity
+                .limits
+                .max_degree
+                .filter(|&d| d != 0)
+                .map(|d| d as usize);
+            let mut refused = Vec::new();
+            for nodes in log_grid(identity.max_nodes as usize, 48) {
+                let complete = nodes * (nodes - 1) / 2;
+                let most = bound.map_or(complete, |d| complete.min(nodes * d / 2));
+                let most = most.min(identity.max_edges as usize);
+                for edges in log_grid(most.max(1), 24) {
+                    if edges <= most && !session_admits(kernel, nodes, edges, limits) {
+                        refused.push((nodes, edges));
+                    }
+                }
+            }
+            assert!(
+                refused.is_empty(),
+                "{kernel:?}: {} refused shapes, first {:?}",
+                refused.len(),
+                &refused[..refused.len().min(4)]
+            );
+        }
+    }
+
+    /// The harness refuses a node past the advertised degree bound, and the
+    /// session admits a multi-spin model whose hub reaches it: a ring of
+    /// 20,000 nodes with one hub of degree 62 is admitted, and the same ring
+    /// with a hub of degree 63 is refused by the identity. The session
+    /// refuses it too: no sparse multi-spin tier walks the row, and the
+    /// model is too large for dense-matrix storage.
+    #[test]
+    fn a_multi_spin_hub_at_the_degree_bound_is_admitted() {
+        use quip_solver_core::SampleParams;
+        let [_, _, (_, msa)] = host_identities();
+        let bound = msa.limits.max_degree.unwrap() as usize;
+        assert_eq!(bound, crate::sampler::MSA_SPARSE_MAX_DEG);
+        let hub = |degree: usize| {
+            let n = 20_000;
+            let mut edges: Vec<(usize, usize)> = (0..n).map(|u| (u, (u + 1) % n)).collect();
+            // Node 0 already has two ring neighbours, 1 and n - 1.
+            edges.extend((0..degree - 2).map(|k| (0, 2 + 2 * k)));
+            let j = (0..edges.len())
+                .map(|k| if k % 2 == 0 { 1.0 } else { -1.0 })
+                .collect();
+            super::IsingGraph::new(vec![0.0; n], j, edges)
+        };
+        let max_degree = |graph: &super::IsingGraph| {
+            let mut degree = vec![0usize; graph.num_nodes()];
+            for &(u, v) in graph.edges.iter() {
+                degree[u] += 1;
+                degree[v] += 1;
+            }
+            degree.into_iter().max().unwrap()
+        };
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let at = hub(bound);
+        assert_eq!(max_degree(&at), bound);
+        crate::sampler::admit_one(&at, &params, super::Kernel::Msa).unwrap();
+        let past = hub(bound + 1);
+        assert!(max_degree(&past) > bound, "the identity refuses it");
+        assert_eq!(
+            crate::sampler::admit_one(&past, &params, super::Kernel::Msa)
+                .map(|_| ())
+                .map_err(|e| e.to_sample_error()),
+            Err(quip_solver_core::SampleError::Capacity)
+        );
+    }
+
     /// `nodes` nodes with `edges` couplers: every pair when `edges` is the
     /// complete count, else circulant offsets 1, 2, ... in turn. `coupling`
     /// gives coupler `k` its value.
@@ -1246,7 +1354,9 @@ mod tests {
     /// The advertised corners run through the session admission
     /// (`sampler::admit_one`): `max_nodes` with `max_edges` couplers, at the
     /// reference degree `2 * max_edges / max_nodes`, and the complete model
-    /// of `max_edges` couplers. Both are admitted on unit and on wide
+    /// of `max_edges` couplers. The harness refuses the complete model, whose
+    /// degree passes the advertised bound, so it runs only through the
+    /// library API. Both are admitted on unit and on wide
     /// coefficients, at the smallest and the largest read count, and one
     /// node more is refused as a capacity error.
     #[test]
