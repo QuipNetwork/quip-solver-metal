@@ -83,8 +83,10 @@ def results(records, kernel, min_nodes=0, refused=True):
         seen.add(key)
         reason = r["error"].replace("job exceeds Metal backend capacity: ", "")
         reason = re.sub(
-            r"\w+ model of \d+ nodes: one dense-matrix sweep is estimated at ([\d.]+) ms, past the 400 ms limit of one chunk",
-            lambda m: f"one dense sweep costs an estimated {float(m.group(1)):.0f} ms, over the 400 ms limit",
+            r"\w+ model of \d+ nodes: one ([\w-]+) sweep is estimated at ([\d.]+) ms"
+            r"(?: for \d+ problems of \d+ reads)?, past the 400 ms limit of one chunk",
+            lambda m: f"one {m.group(1).replace('dense-matrix', 'dense')} sweep costs an estimated "
+            f"{float(m.group(2)):.0f} ms, over the 400 ms limit",
             reason,
         )
         reason = re.sub(

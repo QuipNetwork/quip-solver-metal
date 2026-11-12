@@ -250,3 +250,72 @@ fn global_state_rates() {
         }
     }
 }
+
+/// A named model builder, the node count it runs at, and its path.
+type Shape = (&'static str, fn(usize, Path) -> IsingGraph, usize, Path);
+
+/// A complete graph on `n` nodes with couplings of `path`.
+fn complete(n: usize, path: Path) -> IsingGraph {
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for u in 0..n {
+        for v in u + 1..n {
+            edges.push((u, v));
+            j.push(coefficient(path, u * 7 + v, false));
+        }
+    }
+    let h = (0..n).map(|i| coefficient(path, i, true)).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// The worst admitted high-degree CSR shapes of SA, one problem of 256
+/// reads: the global build at degree 200 at its one-sweep limit of 9,322
+/// nodes, and a complete model on CSR storage at the local build's limit of
+/// 1,476 nodes. Each anneal's longest chunk stays below 400 ms, and one node
+/// more is refused as a capacity error. The limits are those of
+/// `docs/perf/2026-11-metal-capacity.md` on a 40-core GPU.
+#[test]
+#[ignore = "device timing: run with --release --ignored --nocapture"]
+fn the_largest_admitted_high_degree_sweeps_stay_under_400_ms() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(256, 16, 1, 9);
+    let sparse = Tuning {
+        force_sparse: true,
+        ..Tuning::default()
+    };
+    let shapes: [Shape; 4] = [
+        (
+            "global degree 200",
+            |n, path| circulant(n, 200, path),
+            9_322,
+            Path::Unit,
+        ),
+        (
+            "global degree 200",
+            |n, path| circulant(n, 200, path),
+            9_322,
+            Path::Int,
+        ),
+        ("local complete", complete, 1_476, Path::Unit),
+        ("local complete", complete, 1_476, Path::Int),
+    ];
+    for (name, build, limit, path) in shapes {
+        let out = run(&dev, &build(limit, path), &p, sparse);
+        let max_ms = out.max_chunk_us as f64 / 1e3;
+        let chunks: Vec<f64> = out.chunk_us.iter().map(|&us| us as f64 / 1e3).collect();
+        writeln!(
+            io::stdout().lock(),
+            "{{\"shape\":\"{name}\",\"nodes\":{limit},\"path\":\"{path:?}\",\"storage\":\"{:?}\",\"chunks\":{},\"max_chunk_ms\":{max_ms:.1},\"chunk_ms\":{chunks:.1?}}}",
+            out.storage,
+            out.plan.len(),
+        )
+        .unwrap();
+        assert!(max_ms < 400.0, "{name} {path:?}: {max_ms} ms");
+        let err =
+            sample_ising_tuned(&dev, &build(limit + 1, path), &p, Kernel::Sa, sparse).unwrap_err();
+        assert!(
+            matches!(&err, SampleError::TooLarge(m) if m.contains("past the 400 ms limit of one chunk")),
+            "{name} {path:?}: {err:?}"
+        );
+    }
+}

@@ -320,3 +320,46 @@ fn spill_layout_rates() {
         }
     }
 }
+
+/// The worst admitted shape of the multi-spin spill build, one problem of
+/// 256 reads: degree 62, the most the kernel walks, at its one-sweep limit
+/// of 1,433,223 nodes, extrapolated past the grid. The anneal's longest
+/// chunk stays below 400 ms, and one node more is refused as a capacity
+/// error. The limit is that of `docs/perf/2026-11-metal-capacity.md`.
+#[test]
+#[ignore = "device timing: run with --release --ignored --nocapture"]
+fn the_largest_admitted_spill_sweep_stays_under_400_ms() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(256, 16, 1, 9);
+    let limit = 1_433_223;
+    let out = sample_ising_tuned(
+        &dev,
+        &circulant(limit, 62, Path::Int),
+        &p,
+        Kernel::Msa,
+        Tuning::default(),
+    )
+    .unwrap();
+    let max_ms = out.max_chunk_us as f64 / 1e3;
+    let chunks: Vec<f64> = out.chunk_us.iter().map(|&us| us as f64 / 1e3).collect();
+    writeln!(
+        io::stdout().lock(),
+        "{{\"shape\":\"spill degree 62\",\"nodes\":{limit},\"storage\":\"{:?}\",\"chunks\":{},\"max_chunk_ms\":{max_ms:.1},\"chunk_ms\":{chunks:.1?}}}",
+        out.storage,
+        out.plan.len(),
+    )
+    .unwrap();
+    assert!(max_ms < 400.0, "{max_ms} ms");
+    let err = sample_ising_tuned(
+        &dev,
+        &circulant(limit + 1, 62, Path::Int),
+        &p,
+        Kernel::Msa,
+        Tuning::default(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("past the 400 ms limit of one chunk"),
+        "{err:?}"
+    );
+}

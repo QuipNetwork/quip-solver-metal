@@ -532,7 +532,9 @@ fn dense_rates() {
 /// GPU time of the sparse SA build on the complete models of `dense_rates`,
 /// for the comparison in `docs/perf/2026-11-12-sa-dense.md`. The sparse
 /// build keeps the CSR of every model, so the rate counts the same `n * n`
-/// columns per sweep as the dense rate.
+/// columns per sweep as the dense rate. A complete model of 2,500 nodes is
+/// past the one-sweep limit of the CSR local build (1,476 nodes), so the
+/// admission refuses it.
 #[test]
 #[ignore = "minutes of device time: run with --release --ignored --nocapture"]
 fn sparse_rates() {
@@ -542,7 +544,20 @@ fn sparse_rates() {
         ..Tuning::default()
     };
     for precision in [Precision::Int8, Precision::Int32] {
-        for (nodes, budget) in [(1_024, 1 << 20), (LIMIT_NODES, 1 << 17), (2_500, 1 << 16)] {
+        let (past, _) = planted_complete(2_500, precision);
+        let err = sample_ising_tuned(
+            &dev,
+            &past,
+            &params(MAX_READS, 16, 1, 9),
+            Kernel::Sa,
+            sparse,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SampleError::TooLarge(m) if m.contains("one local sweep")),
+            "{err:?}"
+        );
+        for (nodes, budget) in [(1_024, 1 << 20), (LIMIT_NODES, 1 << 17)] {
             let (graph, _) = planted_complete(nodes, precision);
             let sweeps = (budget / nodes).max(4);
             let p = params(MAX_READS, sweeps, (sweeps / 64).max(1), 9);

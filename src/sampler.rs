@@ -219,10 +219,11 @@ const MSA_MATRIX_THROUGHPUT_SAFETY: f64 = 0.4;
 /// threadgroups at once can saturate the GPU, which the linear rate does not
 /// model.
 const MSA_MATRIX_MEASURED_GROUPS: usize = MAX_READS / MSA_LANES;
-/// Longest single sweep a dense-matrix batch may plan, in milliseconds. A
-/// chunk is at least one sweep, so the planner cannot split a longer sweep,
-/// and a measured chunk must stay below 400 ms.
-const MSA_MATRIX_MAX_SWEEP_MS: f64 = 400.0;
+/// Longest single sweep any batch may plan, in milliseconds. A chunk is at
+/// least one sweep, so the planner cannot split a longer sweep, and a
+/// measured chunk must stay below 400 ms. [`check_one_sweep`] applies it to
+/// every build.
+const ONE_SWEEP_MAX_MS: f64 = 400.0;
 
 /// Planned column updates per second of `groups` dense-matrix threadgroups
 /// that share the GPU with `in_flight` batches of the same shape.
@@ -266,7 +267,7 @@ const GIBBS_MATRIX_COLUMNS_PER_SEC: f64 = 7.0e6;
 /// The dense-matrix Gibbs kernel keeps its spins in the 4,800-spin
 /// threadgroup array, so the one-sweep limit must admit fewer nodes.
 const _: () = assert!(
-    GIBBS_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_MAX_SWEEP_MS / 1000.0
+    GIBBS_MATRIX_COLUMNS_PER_SEC * ONE_SWEEP_MAX_MS / 1000.0
         < (GIBBS_MAX_NODES * GIBBS_MAX_NODES) as f64,
     "the dense Gibbs sweep limit must stay below the threadgroup spin array"
 );
@@ -277,18 +278,285 @@ fn gibbs_matrix_rate(in_flight: usize) -> f64 {
     GIBBS_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_THROUGHPUT_SAFETY / in_flight.max(1) as f64
 }
 
-/// The estimated GPU time of one sweep of an `n`-node dense-matrix batch, in
-/// milliseconds: the planner's column count at the kernel's rate, without
-/// the planning margin. Every threadgroup (multi-spin) or SIMD group (SA)
-/// walks its `n * n` columns at once, so the estimate does not depend on the
-/// read count.
-fn matrix_sweep_ms(kernel: Kernel, n: usize) -> f64 {
-    let rate = match kernel {
-        Kernel::Sa => SA_MATRIX_COLUMNS_PER_SEC,
-        Kernel::Gibbs => GIBBS_MATRIX_COLUMNS_PER_SEC,
-        Kernel::Msa => MSA_MATRIX_COLUMNS_PER_SEC,
+/// The batch shape [`one_sweep_ms`] estimates one sweep of.
+#[derive(Clone, Copy, Debug)]
+struct SweepShape {
+    kernel: Kernel,
+    /// The storage tier the batch runs on: [`Storage::Threadgroup`] is the
+    /// SA local, Gibbs shared and multi-spin shared build, and
+    /// [`Storage::Spill`] the SA global, Gibbs spill and multi-spin spill
+    /// build.
+    storage: Storage,
+    nodes: usize,
+    /// Mean CSR degree, `2 * edges / nodes` ([`mean_degree`]).
+    degree: f64,
+    problems: usize,
+    /// Dispatched reads per problem ([`simd_rounded_reads`]).
+    reads: usize,
+    /// GPU cores of the device.
+    cores: usize,
+}
+
+/// Margin on the worst measured sparse sweep, for contention from other GPU
+/// work: the estimate is the worst one-sweep chunk times 1.15, so its rate
+/// is 13 percent under the worst measured rate, as the dense column rates
+/// keep about 13 percent under theirs ([`SA_MATRIX_COLUMNS_PER_SEC`]).
+const SPARSE_SWEEP_MARGIN: f64 = 1.15;
+
+/// Worst GPU time of one sweep per spin update, in nanoseconds, of one
+/// problem of [`MAX_READS`] reads on the SA local build, by mean degree.
+/// Source: `docs/perf/2026-11-metal-capacity.jsonl` (M4 Max, crate commit
+/// `7a03688`), the largest `worst_ms_per_sweep / (256 * nodes)` over the
+/// `local` rows of each degree, times 1.3. The grid ran these rows in
+/// chunks of several sweeps, and the first chunk of a run initializes the
+/// state: a one-sweep first chunk measured 1.26 to 1.30 times the next
+/// chunk (`batch_sweep_probe` at 4,500 nodes and degree 200, and at 1,414
+/// and 2,000 nodes and degrees 1,412 and 1,998). Points: degree 4 (6.29 ns,
+/// 1,000 nodes `int8`), 20 (6.23 ns, 4,500 nodes `int8`; held at the degree
+/// 4 value), 62 (18.38 ns, 1,000 nodes `int8` sparse), 200 (75.71 ns, 4,500
+/// nodes `int8`), 999 (477.4 ns, complete 1,000 nodes `int32` sparse), and
+/// 2,499 (1,058.1 ns, complete 2,500 nodes `int8` sparse). The points at
+/// 1,412 and 1,998 are the measured one-sweep first chunks, 320.1 and
+/// 625.9 ms.
+const SA_LOCAL_SWEEP_NS: [(f64, f64); 8] = [
+    (4.0, 8.2),
+    (20.0, 8.2),
+    (62.0, 23.9),
+    (200.0, 98.4),
+    (999.0, 620.6),
+    (1412.0, 884.0),
+    (1998.0, 1222.0),
+    (2499.0, 1375.5),
+];
+/// [`SA_LOCAL_SWEEP_NS`] for the SA global build. Source: the `global` rows
+/// of the same file, which ran one sweep per chunk from 10,000 nodes up, so
+/// the first chunk is in the worst value. Points: degree 4 (8.13 ns, the
+/// worst one-sweep chunk of a `batch_sweep_probe` run at 196,343 nodes,
+/// 408.4 ms, above the grid's 6.92 ns at 40,000 nodes `int32`), 20 (40,000 nodes `float`), 62 (20,000 nodes `int32`, the
+/// largest of three repeats), and 200 (10,000 nodes `int32`).
+const SA_GLOBAL_SWEEP_NS: [(f64, f64); 4] =
+    [(4.0, 8.13), (20.0, 15.34), (62.0, 41.29), (200.0, 145.75)];
+/// [`SA_LOCAL_SWEEP_NS`] for the Gibbs shared build. Source: the `shared`
+/// rows; the first chunk of a Gibbs run is not slower than the rest. Points:
+/// degree 4 (2,000 nodes `int32`), 20 (2,000 nodes `float`), 62 (1,000
+/// nodes `int8`), 200 (1,000 nodes `int32`), and the complete models forced
+/// sparse at 1,000 (`int8`) and 1,414 (`int32`) nodes. The complete points
+/// from 2,000 nodes up are the worst one-sweep chunks of 16-sweep runs in
+/// `docs/perf/2026-11-metal-capacity-5.3b.jsonl` (2,000 nodes `binary`,
+/// 2,500 nodes `binary`, 2,700 nodes `int8`, 2,900 nodes `int32`), and at
+/// 3,098 nodes the 785.8 ms chunk of a `binary` run of
+/// `the_largest_admitted_high_degree_sweeps_stay_under_400_ms`. That run
+/// shared the GPU, but its chunks stayed past 600 ms for 11 sweeps, so the
+/// point keeps it.
+const GIBBS_SHARED_SWEEP_NS: [(f64, f64); 11] = [
+    (4.0, 0.121),
+    (20.0, 0.182),
+    (62.0, 0.766),
+    (200.0, 4.458),
+    (999.0, 103.8),
+    (1413.0, 165.8),
+    (1999.0, 290.0),
+    (2499.0, 392.0),
+    (2699.0, 410.0),
+    (2899.0, 420.0),
+    (3097.0, 991.0),
+];
+/// [`SA_LOCAL_SWEEP_NS`] for the Gibbs spill build. The cost per update of
+/// this build grows with the node count, and its late sweeps run slower than
+/// its first ones, so the grid, which ran few sweeps at large sizes, misses
+/// the worst sweep. The points come from `batch_sweep_probe` runs of 16
+/// one-sweep chunks (M4 Max, Int8 coefficients): degree 4 (0.239 ns, the
+/// worst chunk at 8,335,556 nodes, 509.6 ms in the second of two runs), 20 (1.388 ns, the worst chunk
+/// at 1,170,280 nodes, 415.8 ms), and 62 (3.79 ns, the worst chunk of
+/// `the_largest_admitted_high_degree_sweeps_stay_under_400_ms`
+/// at 553,665 nodes, which took 537.3 ms). Degree 200 is the grid's worst
+/// (400,000 nodes `int32`, the largest of three repeats), above the 10.6 ns of
+/// 16 sweeps at 107,927 nodes. The grid has no spill row past degree 200, so
+/// the points past it are the shared build's: a spill update is never
+/// cheaper than a shared one at the measured degrees.
+const GIBBS_SPILL_SWEEP_NS: [(f64, f64); 11] = [
+    (4.0, 0.239),
+    (20.0, 1.388),
+    (62.0, 3.79),
+    (200.0, 12.589),
+    (999.0, 103.8),
+    (1413.0, 165.8),
+    (1999.0, 290.0),
+    (2499.0, 392.0),
+    (2699.0, 410.0),
+    (2899.0, 420.0),
+    (3097.0, 991.0),
+];
+/// [`SA_LOCAL_SWEEP_NS`] for the multi-spin shared build, per replica (one
+/// read is one of the 32 replicas of a word). Source: the `shared` rows.
+/// Points: degree 4 (1,000 nodes `int8`), 20 (1,000 nodes `float`; held at
+/// the degree 4 value), and 62 (1,000 nodes `int8` sparse). The kernel walks
+/// at most [`MSA_SPARSE_MAX_DEG`] neighbours.
+const MSA_SHARED_SWEEP_NS: [(f64, f64); 3] = [(4.0, 0.399), (20.0, 0.399), (62.0, 7.859)];
+/// [`MSA_SHARED_SWEEP_NS`] for the multi-spin spill build. Source: the
+/// `spill` rows. Points: degree 4 (8,000 nodes `int8`), 20 (40,000 nodes
+/// `float`), and 62 (400,000 nodes `int32`, the largest of three repeats,
+/// which ran one sweep per chunk).
+const MSA_SPILL_SWEEP_NS: [(f64, f64); 3] = [(4.0, 0.099), (20.0, 0.196), (62.0, 0.948)];
+
+/// Reads per GPU core that run side by side at the time of one problem of
+/// [`MAX_READS`] reads. Measured with `batch_sweep_probe` on the M4 Max (40
+/// cores), one sweep per chunk: SA runs one 256-read problem per core (the
+/// worst chunk of 40 problems of 256 reads at 10,000 nodes and degree 62
+/// took 108.9 ms against 100.5 ms for two problems; 120 problems took
+/// 218.5 ms). Gibbs is saturated at one problem of 256 reads, so its
+/// 6.4 reads per core are 256 reads on 40 cores. The multi-spin kernel runs
+/// one 32-replica word per core (5 problems of 256 reads at 100,000 nodes
+/// and degree 62 took 35.0 ms against 34.0 ms for one).
+const fn parallel_reads_per_core(kernel: Kernel) -> f64 {
+    match kernel {
+        Kernel::Sa => 256.0,
+        Kernel::Gibbs => 6.4,
+        Kernel::Msa => 32.0,
+    }
+}
+
+/// How much more a sweep of a batch of several problems past the parallel
+/// reads costs than its reads alone say: the problems of a batch hold their
+/// own couplings, so they compete for the cache where the reads of one
+/// problem share them. Measured with `batch_sweep_probe`: Gibbs at 100,000
+/// nodes and degree 62 took 258.0 ms for 3 problems of 256 reads, 5.2 times
+/// one problem, and 237.1 ms for 10 problems of 64 reads, 4.8 times; the
+/// multi-spin kernel took 265.6 ms for 20 problems of 256 reads, 7.6 times
+/// one problem at 4 times the parallel reads. SA grew less than its reads
+/// (2.2 times at 3 times the parallel reads).
+const fn crowd_factor(kernel: Kernel) -> f64 {
+    match kernel {
+        Kernel::Sa => 1.0,
+        Kernel::Gibbs | Kernel::Msa => 2.0,
+    }
+}
+
+/// `points` at `x`: linear between points, the first value below the first
+/// point, and along the last segment past the last point.
+fn piecewise_linear(points: &[(f64, f64)], x: f64) -> f64 {
+    let (first_x, first_y) = points[0];
+    if x <= first_x || points.len() == 1 {
+        return first_y;
+    }
+    let hi = points
+        .iter()
+        .position(|&(px, _)| px >= x)
+        .unwrap_or(points.len() - 1);
+    let (x0, y0) = points[hi - 1];
+    let (x1, y1) = points[hi];
+    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+}
+
+/// The mean CSR degree of `graph`, `2 * edges / nodes`: the neighbours a
+/// sweep walks per spin update.
+fn mean_degree(graph: &IsingGraph) -> f64 {
+    2.0 * graph.edges.len() as f64 / graph.num_nodes().max(1) as f64
+}
+
+/// The estimated GPU time of the longest one-sweep chunk of a batch of
+/// `shape`, in milliseconds. A chunk is at least one sweep, so the
+/// admission refuses a batch whose estimate passes [`ONE_SWEEP_MAX_MS`].
+///
+/// A dense-matrix batch walks `n * n` columns per sweep at the kernel's
+/// column rate, whatever its read count; the dense path runs one problem.
+/// A CSR batch costs one problem of [`MAX_READS`] reads at the worst
+/// measured time per spin update of its build and mean degree, times
+/// [`SPARSE_SWEEP_MARGIN`]. A batch whose reads pass
+/// [`parallel_reads_per_core`] times the GPU cores costs that many units of
+/// one problem, times [`crowd_factor`] when it holds several problems. Fewer
+/// reads than one unit cost a whole unit, as measured: one SA problem of 64
+/// reads takes about as long as one of 256.
+fn one_sweep_ms(shape: &SweepShape) -> f64 {
+    let n = shape.nodes as f64;
+    let table: &[(f64, f64)] = match (shape.kernel, shape.storage) {
+        (kernel, Storage::Dense) => {
+            let rate = match kernel {
+                Kernel::Sa => SA_MATRIX_COLUMNS_PER_SEC,
+                Kernel::Gibbs => GIBBS_MATRIX_COLUMNS_PER_SEC,
+                Kernel::Msa => MSA_MATRIX_COLUMNS_PER_SEC,
+            };
+            return n * n / rate * 1000.0;
+        }
+        (Kernel::Sa, Storage::Threadgroup) => &SA_LOCAL_SWEEP_NS,
+        (Kernel::Sa, Storage::Spill) => &SA_GLOBAL_SWEEP_NS,
+        (Kernel::Gibbs, Storage::Threadgroup) => &GIBBS_SHARED_SWEEP_NS,
+        (Kernel::Gibbs, Storage::Spill) => &GIBBS_SPILL_SWEEP_NS,
+        (Kernel::Msa, Storage::Threadgroup) => &MSA_SHARED_SWEEP_NS,
+        (Kernel::Msa, Storage::Spill) => &MSA_SPILL_SWEEP_NS,
     };
-    n as f64 * n as f64 / rate * 1000.0
+    let unit_ms = MAX_READS as f64 * n * piecewise_linear(table, shape.degree) / 1e6;
+    let parallel = parallel_reads_per_core(shape.kernel) * shape.cores.max(1) as f64;
+    let units = ((shape.problems * shape.reads) as f64 / parallel).max(1.0);
+    let crowd = if shape.problems > 1 && units > 1.0 {
+        crowd_factor(shape.kernel)
+    } else {
+        1.0
+    };
+    unit_ms * units * crowd * SPARSE_SWEEP_MARGIN
+}
+
+/// Refuse a batch of `shape` whose one sweep [`one_sweep_ms`] estimates past
+/// [`ONE_SWEEP_MAX_MS`], as [`SampleError::TooLarge`].
+fn check_one_sweep(shape: &SweepShape) -> Result<(), SampleError> {
+    let sweep_ms = one_sweep_ms(shape);
+    if sweep_ms <= ONE_SWEEP_MAX_MS {
+        return Ok(());
+    }
+    let tier = match shape.storage {
+        Storage::Dense => "dense-matrix",
+        storage => storage.name(shape.kernel),
+    };
+    Err(SampleError::TooLarge(format!(
+        "{:?} model of {} nodes: one {tier} sweep is estimated at {sweep_ms:.3} ms for {} \
+         problems of {} reads, past the {ONE_SWEEP_MAX_MS:.0} ms limit of one chunk",
+        shape.kernel, shape.nodes, shape.problems, shape.reads
+    )))
+}
+
+/// Mean GPU time per spin update relative to degree 20, for the SA chunk
+/// planner, by mean degree. The planner's rates were calibrated near degree
+/// 20, so the factor is 1 up to it. Source: `docs/perf/2026-11-metal-capacity.jsonl`,
+/// the largest ratio of `ns_per_update` at a degree to `ns_per_update` at
+/// degree 20 of the same nodes, precision and tier: degree 62 (2.94, global
+/// 80,000 nodes `int8` against 40,000 nodes), 200 (10.65, local 2,000 nodes
+/// `int32`), and the complete models forced sparse against degree 20 at
+/// 1,000 nodes `int32` (76), at 1,414 nodes `int32` against 1,000 nodes
+/// (116), and at 2,500 nodes `int32` against 1,000 nodes (290).
+const SA_DEGREE_FACTOR: [(f64, f64); 6] = [
+    (20.0, 1.0),
+    (62.0, 3.0),
+    (200.0, 10.6),
+    (999.0, 76.0),
+    (1413.0, 116.0),
+    (2499.0, 290.0),
+];
+/// [`SA_DEGREE_FACTOR`] for the Gibbs chunk planner. Source: the same file,
+/// the shared and spill rows: degree 62 (4.25, shared 4,700 nodes `int32`),
+/// 200 (29.7, shared 1,000 nodes `int32`), and the complete models forced
+/// sparse against degree 20 at 1,000 nodes (570, `int8`), at 1,414 nodes
+/// (1,100, `int32`), and at 2,500 nodes (2,500, `int8` against 2,000 nodes).
+/// A small model of high degree has few nodes in each colour class, so its
+/// sweep is bound by the class steps and the ratio grows as the nodes fall.
+const GIBBS_DEGREE_FACTOR: [(f64, f64); 6] = [
+    (20.0, 1.0),
+    (62.0, 4.3),
+    (200.0, 29.7),
+    (999.0, 570.0),
+    (1413.0, 1100.0),
+    (2499.0, 2500.0),
+];
+
+/// How much a CSR spin update at mean `degree` costs the chunk planner
+/// beyond one at degree 20: [`SA_DEGREE_FACTOR`] or [`GIBBS_DEGREE_FACTOR`].
+/// The multi-spin planner models degree in [`msa_row_chunks`], so its
+/// factor is 1.
+fn sweep_degree_factor(kernel: Kernel, degree: f64) -> f64 {
+    match kernel {
+        Kernel::Sa => piecewise_linear(&SA_DEGREE_FACTOR, degree),
+        Kernel::Gibbs => piecewise_linear(&GIBBS_DEGREE_FACTOR, degree),
+        Kernel::Msa => 1.0,
+    }
 }
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
@@ -1698,23 +1966,24 @@ fn validate_batch_within<'a>(
         }
     }
     .map_err(too_large)?;
-    if footprint.storage == Storage::Dense {
-        // A chunk is at least one sweep, so a dense batch whose one sweep
-        // would pass the limit is refused before any buffer exists, under
-        // Auto and Forced alike.
-        let sweep_ms = matrix_sweep_ms(kernel, n);
-        if sweep_ms > MSA_MATRIX_MAX_SWEEP_MS {
-            return Err(SampleError::TooLarge(format!(
-                "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
-                 {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
-            )));
-        }
-    }
     if footprint.storage != Storage::Dense {
         if let Some(message) = over_budget {
             return Err(SampleError::TooLarge(message));
         }
     }
+    // A chunk is at least one sweep, so a batch whose one sweep would pass
+    // the limit is refused before any buffer exists, on every tier and under
+    // every dense mode. The tier is the one the footprint chose: a model
+    // that fails it has no other tier to fall back to.
+    check_one_sweep(&SweepShape {
+        kernel,
+        storage: footprint.storage,
+        nodes: n,
+        degree: mean_degree(first),
+        problems: graphs.len(),
+        reads: simd_rounded_reads(params.num_reads),
+        cores: crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1),
+    })?;
     Ok(ValidBatch {
         first,
         n,
@@ -2716,6 +2985,12 @@ fn encode_batch_storage(
         GIBBS_SPILL_COST_FACTOR
     } else {
         1.0
+    } * if matrix {
+        1.0
+    } else {
+        // A CSR update walks the node's row, so its cost grows with the
+        // degree past the degree 20 the rates were measured at.
+        sweep_degree_factor(kernel, mean_degree(first))
     };
     let plan = match plan_override {
         Some(p) => p
@@ -3476,6 +3751,114 @@ mod tests {
         }
     }
 
+    /// A circulant model for the device probes: node `i` links to the next
+    /// `degree / 2` nodes, with random-sign couplings of `scale` and `2 *
+    /// scale`. `seed` changes the signs, so the problems of a batch differ.
+    fn probe_circulant(n: usize, degree: usize, scale: f64, seed: usize) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=degree / 2).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j = (0..edges.len())
+            .map(|e| {
+                let hash = (e as u64 + 1)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(seed as u64);
+                let magnitude = if hash >> 63 == 0 { scale } else { 2.0 * scale };
+                if (hash >> 40) & 1 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })
+            .collect();
+        IsingGraph::new(vec![0.0; n], j, edges)
+    }
+
+    /// The time of a one-sweep chunk of a batch of several problems, for the
+    /// problems and reads terms of [`one_sweep_ms`]. Every chunk is one sweep
+    /// of a one-sweep rung, so the worst chunk is the worst sweep. The
+    /// `QUIP_PROBE_*` variables pick the shape: `KERNEL` (`sa`, `gibbs` or
+    /// `msa`), `NODES`, `DEGREE`, `PROBLEMS`, `READS`, `SWEEPS` (default 8),
+    /// and `SCALE` (default 1.0; 1.5 gives `int32` coefficients). Each run
+    /// prints one JSON line. Run:
+    /// `QUIP_PROBE_KERNEL=sa QUIP_PROBE_NODES=4577 QUIP_PROBE_DEGREE=20
+    /// QUIP_PROBE_PROBLEMS=8 QUIP_PROBE_READS=64 cargo test --release --lib
+    /// batch_sweep_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "device timing; see the doc comment"]
+    #[expect(clippy::print_stdout, reason = "report the measured chunk times")]
+    fn batch_sweep_probe() {
+        let var = |name: &str| std::env::var(format!("QUIP_PROBE_{name}")).ok();
+        let number = |name: &str, default: Option<usize>| -> usize {
+            var(name).map_or_else(
+                || default.unwrap_or_else(|| panic!("QUIP_PROBE_{name} is required")),
+                |text| text.parse().unwrap(),
+            )
+        };
+        let kernel = match var("KERNEL").as_deref() {
+            Some("sa") => Kernel::Sa,
+            Some("gibbs") => Kernel::Gibbs,
+            Some("msa") => Kernel::Msa,
+            other => panic!("QUIP_PROBE_KERNEL: {other:?}"),
+        };
+        let n = number("NODES", None);
+        let degree = number("DEGREE", None);
+        let problems = number("PROBLEMS", Some(1));
+        let reads = number("READS", Some(MAX_READS));
+        let sweeps = number("SWEEPS", Some(8));
+        let scale = var("SCALE").map_or(1.0, |text| text.parse().unwrap());
+        let graphs: Vec<IsingGraph> = (0..problems)
+            .map(|seed| probe_circulant(n, degree, scale, seed))
+            .collect();
+        let refs: Vec<&IsingGraph> = graphs.iter().collect();
+        let params = SampleParams {
+            num_reads: reads,
+            num_sweeps: sweeps,
+            sweeps_per_beta: 1,
+            seed: 5,
+            ..Default::default()
+        };
+        let plan: Vec<(i32, i32)> = (0..sweeps as i32).map(|rung| (rung, 1)).collect();
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let estimate = validate_batch_within(
+            &refs,
+            &params,
+            kernel,
+            host_device_limits(),
+            true,
+            None,
+            DenseMode::Off,
+        )
+        .map_or_else(|e| format!("\"{e:?}\""), |b| format!("\"{:?}\"", b.storage));
+        let mut batch = encode_batch_storage(
+            &dev,
+            &refs,
+            &params,
+            kernel,
+            1,
+            Some(&plan),
+            None,
+            true,
+            Tuning::default(),
+            DenseMode::Off,
+        )
+        .unwrap();
+        while batch.commit_next(|| false) {
+            batch.wait_until_completed();
+        }
+        assert!(batch.failed_status().is_none());
+        let chunk_ms: Vec<f64> = batch
+            .chunk_us()
+            .iter()
+            .map(|&us| us as f64 / 1000.0)
+            .collect();
+        let worst = chunk_ms.iter().copied().fold(0.0, f64::max);
+        let mean = chunk_ms.iter().sum::<f64>() / chunk_ms.len() as f64;
+        println!(
+            "{{\"kernel\":\"{kernel:?}\",\"nodes\":{n},\"degree\":{degree},\"problems\":{problems},\"reads\":{reads},\"scale\":{scale},\"admission\":{estimate},\"mean_ms\":{mean:.3},\"worst_ms\":{worst:.3},\"chunk_ms\":{chunk_ms:.1?}}}"
+        );
+    }
+
     #[test]
     fn msa_non_unit_graph_falls_back_to_host_scoring() {
         if crate::metal_device::MetalDevice::device_count() == 0 {
@@ -3712,13 +4095,19 @@ mod tests {
         IsingGraph::new(vec![0.0; n], j, edges)
     }
 
+    /// One problem of 256 reads of a complete `n`-node model on dense-matrix
+    /// storage.
+    fn dense_shape(kernel: Kernel, n: usize) -> SweepShape {
+        sweep_shape(kernel, Storage::Dense, n, n as f64 - 1.0, 1, 256)
+    }
+
     /// One dense-matrix sweep of 4,898 nodes is estimated at 399.84 ms and
     /// one of 4,899 nodes at 400.003 ms, at any read count. The longer sweep is
     /// refused before any buffer exists; the shorter one is admitted dense.
     #[test]
     fn a_dense_sweep_past_one_chunk_is_refused_before_allocation() {
-        assert!(matrix_sweep_ms(Kernel::Msa, 4_898) <= MSA_MATRIX_MAX_SWEEP_MS);
-        assert!(matrix_sweep_ms(Kernel::Msa, 4_899) > MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Msa, 4_898)) <= ONE_SWEEP_MAX_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Msa, 4_899)) > ONE_SWEEP_MAX_MS);
         let p = SampleParams {
             num_reads: 256,
             num_sweeps: 1,
@@ -3780,8 +4169,8 @@ mod tests {
     /// one is admitted dense.
     #[test]
     fn a_dense_sa_sweep_past_one_chunk_is_refused_before_allocation() {
-        assert!(matrix_sweep_ms(Kernel::Sa, 1_414) <= MSA_MATRIX_MAX_SWEEP_MS);
-        assert!(matrix_sweep_ms(Kernel::Sa, 1_415) > MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Sa, 1_414)) <= ONE_SWEEP_MAX_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Sa, 1_415)) > ONE_SWEEP_MAX_MS);
         let p = SampleParams {
             num_reads: 256,
             num_sweeps: 1,
@@ -3832,8 +4221,8 @@ mod tests {
     /// no fall back to CSR storage; the shorter one is admitted dense.
     #[test]
     fn a_dense_gibbs_sweep_past_one_chunk_is_refused_before_allocation() {
-        assert!(matrix_sweep_ms(Kernel::Gibbs, 1_673) <= MSA_MATRIX_MAX_SWEEP_MS);
-        assert!(matrix_sweep_ms(Kernel::Gibbs, 1_674) > MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Gibbs, 1_673)) <= ONE_SWEEP_MAX_MS);
+        assert!(one_sweep_ms(&dense_shape(Kernel::Gibbs, 1_674)) > ONE_SWEEP_MAX_MS);
         let p = SampleParams {
             num_reads: 256,
             num_sweeps: 1,
@@ -3873,6 +4262,341 @@ mod tests {
             admit(above, DenseMode::Off).unwrap().storage,
             Storage::Dense
         );
+    }
+
+    /// A sweep shape of `problems` problems of `reads` reads on 40 GPU
+    /// cores, the M4 Max of the calibration.
+    fn sweep_shape(
+        kernel: Kernel,
+        storage: Storage,
+        nodes: usize,
+        degree: f64,
+        problems: usize,
+        reads: usize,
+    ) -> SweepShape {
+        SweepShape {
+            kernel,
+            storage,
+            nodes,
+            degree,
+            problems,
+            reads,
+            cores: 40,
+        }
+    }
+
+    fn close(got: f64, want: f64) -> bool {
+        (got - want).abs() <= 1e-9 * want.abs().max(1.0)
+    }
+
+    #[test]
+    fn the_planner_degree_factor_is_one_up_to_degree_20() {
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            for degree in [0.0, 4.0, 18.14, 20.0] {
+                assert_eq!(
+                    sweep_degree_factor(kernel, degree),
+                    1.0,
+                    "{kernel:?} {degree}"
+                );
+            }
+        }
+        // The multi-spin planner models degree in its row chunks.
+        assert_eq!(sweep_degree_factor(Kernel::Msa, 62.0), 1.0);
+    }
+
+    #[test]
+    fn the_planner_degree_factor_matches_the_calibration_points() {
+        let points: [(Kernel, f64, f64); 10] = [
+            (Kernel::Sa, 62.0, 3.0),
+            (Kernel::Sa, 200.0, 10.6),
+            (Kernel::Sa, 999.0, 76.0),
+            (Kernel::Sa, 1413.0, 116.0),
+            (Kernel::Sa, 2499.0, 290.0),
+            (Kernel::Gibbs, 62.0, 4.3),
+            (Kernel::Gibbs, 200.0, 29.7),
+            (Kernel::Gibbs, 999.0, 570.0),
+            (Kernel::Gibbs, 1413.0, 1100.0),
+            (Kernel::Gibbs, 2499.0, 2500.0),
+        ];
+        for (kernel, degree, factor) in points {
+            let got = sweep_degree_factor(kernel, degree);
+            assert!(close(got, factor), "{kernel:?} {degree}: {got}");
+        }
+        // Linear between points, and past the last along its last segment.
+        assert!(close(sweep_degree_factor(Kernel::Sa, 131.0), 6.8));
+        assert!(close(
+            sweep_degree_factor(Kernel::Sa, 3585.0),
+            290.0 + 174.0 / 1086.0 * 1086.0
+        ));
+    }
+
+    #[test]
+    fn one_sweep_estimates_match_the_calibration_points() {
+        // One problem of 256 reads: 256 * n updates at the table's worst
+        // ns per update, with the contention margin.
+        let unit = |ns: f64, n: f64| 256.0 * n * ns * 1e-6 * SPARSE_SWEEP_MARGIN;
+        let points: [(Kernel, Storage, f64, f64); 8] = [
+            (Kernel::Sa, Storage::Threadgroup, 200.0, 98.4),
+            (Kernel::Sa, Storage::Threadgroup, 1412.0, 884.0),
+            (Kernel::Sa, Storage::Spill, 62.0, 41.29),
+            (Kernel::Sa, Storage::Spill, 200.0, 145.75),
+            (Kernel::Gibbs, Storage::Threadgroup, 2499.0, 392.0),
+            (Kernel::Gibbs, Storage::Spill, 62.0, 3.79),
+            (Kernel::Gibbs, Storage::Spill, 200.0, 12.589),
+            (Kernel::Msa, Storage::Spill, 62.0, 0.948),
+        ];
+        for (kernel, storage, degree, ns) in points {
+            let got = one_sweep_ms(&sweep_shape(kernel, storage, 1000, degree, 1, 256));
+            assert!(
+                close(got, unit(ns, 1000.0)),
+                "{kernel:?} {storage:?} {degree}: {got}"
+            );
+        }
+        // The dense paths keep their column rates.
+        let dense =
+            |kernel| one_sweep_ms(&sweep_shape(kernel, Storage::Dense, 1414, 1413.0, 1, 256));
+        assert!(close(dense(Kernel::Sa), 1414.0 * 1414.0 / 5.0e6 * 1000.0));
+        assert!(close(
+            dense(Kernel::Gibbs),
+            1414.0 * 1414.0 / 7.0e6 * 1000.0
+        ));
+        assert!(close(dense(Kernel::Msa), 1414.0 * 1414.0 / 6.0e7 * 1000.0));
+    }
+
+    #[test]
+    fn one_sweep_grows_with_the_problems_past_the_parallel_reads() {
+        let ms = |kernel, storage, n, degree, problems, reads| {
+            one_sweep_ms(&sweep_shape(kernel, storage, n, degree, problems, reads))
+        };
+        // SA runs one 256-read problem per core side by side.
+        let sa = ms(Kernel::Sa, Storage::Spill, 10_000, 62.0, 1, 256);
+        assert!(sa > 0.0);
+        assert!(close(
+            ms(Kernel::Sa, Storage::Spill, 10_000, 62.0, 1, 64),
+            sa
+        ));
+        assert!(close(
+            ms(Kernel::Sa, Storage::Spill, 10_000, 62.0, 40, 256),
+            sa
+        ));
+        assert!(close(
+            ms(Kernel::Sa, Storage::Spill, 10_000, 62.0, 120, 256),
+            3.0 * sa
+        ));
+        // Gibbs is saturated at one problem of 256 reads, and the problems of
+        // a larger batch compete for the cache.
+        let gibbs = ms(Kernel::Gibbs, Storage::Spill, 100_000, 62.0, 1, 256);
+        assert!(close(
+            ms(Kernel::Gibbs, Storage::Spill, 100_000, 62.0, 1, 64),
+            gibbs
+        ));
+        assert!(close(
+            ms(Kernel::Gibbs, Storage::Spill, 100_000, 62.0, 2, 256),
+            4.0 * gibbs
+        ));
+        assert!(close(
+            ms(Kernel::Gibbs, Storage::Spill, 100_000, 62.0, 10, 64),
+            5.0 * gibbs
+        ));
+        // The multi-spin kernel runs one word per core side by side.
+        let msa = ms(Kernel::Msa, Storage::Spill, 100_000, 62.0, 1, 256);
+        assert!(close(
+            ms(Kernel::Msa, Storage::Spill, 100_000, 62.0, 5, 256),
+            msa
+        ));
+        assert!(close(
+            ms(Kernel::Msa, Storage::Spill, 100_000, 62.0, 20, 256),
+            8.0 * msa
+        ));
+        // The dense paths run one problem.
+        let dense = ms(Kernel::Sa, Storage::Dense, 1000, 999.0, 1, 256);
+        assert!(close(
+            ms(Kernel::Sa, Storage::Dense, 1000, 999.0, 1, 64),
+            dense
+        ));
+    }
+
+    /// The largest node count whose one sweep the admission accepts, for one
+    /// problem of 256 reads at a regular `degree`, or at `n - 1` when
+    /// `degree` is `None` (a complete model).
+    fn one_sweep_limit(kernel: Kernel, storage: Storage, degree: Option<f64>) -> usize {
+        let fits = |n: usize| {
+            let d = degree.unwrap_or(n as f64 - 1.0);
+            check_one_sweep(&sweep_shape(kernel, storage, n, d, 1, 256)).is_ok()
+        };
+        let (mut lo, mut hi) = (1, 100_000_000);
+        assert!(!fits(hi), "{kernel:?} {storage:?} {degree:?} has no limit");
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    /// The one-sweep limits of `docs/perf/2026-11-metal-capacity.md`, one
+    /// problem of 256 reads on 40 cores. Each build admits its limit and
+    /// refuses one node more as `Capacity`.
+    #[test]
+    fn each_build_refuses_one_node_past_its_one_sweep_limit() {
+        let limits: [(Kernel, Storage, Option<f64>, usize); 16] = [
+            (Kernel::Sa, Storage::Threadgroup, None, 1_476),
+            (Kernel::Sa, Storage::Spill, Some(4.0), 167_121),
+            (Kernel::Sa, Storage::Spill, Some(20.0), 88_572),
+            (Kernel::Sa, Storage::Spill, Some(62.0), 32_906),
+            (Kernel::Sa, Storage::Spill, Some(200.0), 9_322),
+            (Kernel::Gibbs, Storage::Threadgroup, None, 2_915),
+            (Kernel::Gibbs, Storage::Spill, Some(4.0), 5_684_919),
+            (Kernel::Gibbs, Storage::Spill, Some(20.0), 978_887),
+            (Kernel::Gibbs, Storage::Spill, Some(62.0), 358_494),
+            (Kernel::Gibbs, Storage::Spill, Some(200.0), 107_927),
+            (Kernel::Msa, Storage::Spill, Some(4.0), 13_724_198),
+            (Kernel::Msa, Storage::Spill, Some(20.0), 6_932_120),
+            (Kernel::Msa, Storage::Spill, Some(62.0), 1_433_223),
+            (Kernel::Sa, Storage::Dense, None, 1_414),
+            (Kernel::Gibbs, Storage::Dense, None, 1_673),
+            (Kernel::Msa, Storage::Dense, None, 4_898),
+        ];
+        for (kernel, storage, degree, limit) in limits {
+            assert_eq!(
+                one_sweep_limit(kernel, storage, degree),
+                limit,
+                "{kernel:?} {storage:?} {degree:?}"
+            );
+            let at = |n: usize| {
+                sweep_shape(kernel, storage, n, degree.unwrap_or(n as f64 - 1.0), 1, 256)
+            };
+            check_one_sweep(&at(limit)).unwrap();
+            let err = check_one_sweep(&at(limit + 1)).unwrap_err();
+            assert_eq!(
+                err.to_sample_error(),
+                quip_solver_core::SampleError::Capacity
+            );
+            let message = too_large_msg(err);
+            assert!(
+                message.contains("past the 400 ms limit of one chunk"),
+                "{message}"
+            );
+        }
+        // The threadgroup tiers hold too few nodes to reach the limit at a
+        // regular degree up to 200, and the multi-spin threadgroup tier at
+        // any degree it admits.
+        for (kernel, cap) in [(Kernel::Sa, SA_MAX_NODES), (Kernel::Gibbs, GIBBS_MAX_NODES)] {
+            check_one_sweep(&sweep_shape(
+                kernel,
+                Storage::Threadgroup,
+                cap,
+                200.0,
+                1,
+                256,
+            ))
+            .unwrap();
+        }
+        check_one_sweep(&sweep_shape(
+            Kernel::Msa,
+            Storage::Threadgroup,
+            MSA_MAX_NODES,
+            MSA_SPARSE_MAX_DEG as f64,
+            1,
+            256,
+        ))
+        .unwrap();
+    }
+
+    /// A circulant of `degree` on `n` nodes with Int32 couplings.
+    fn circulant_int32(n: usize, degree: usize) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=degree / 2).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        IsingGraph::new(vec![0.0; n], j, edges)
+    }
+
+    /// The CSR gates, which the resident, slot, and streaming paths use
+    /// (`validate_batch` and [`DenseMode::Off`]), refuse a sweep past one
+    /// chunk too, before any buffer exists. An SA model past the global
+    /// limit at degree 200 is refused, and a batch of many problems is
+    /// refused where one problem of the same model is admitted.
+    #[test]
+    fn the_csr_gates_refuse_a_sweep_past_one_chunk() {
+        let p = SampleParams {
+            num_reads: 256,
+            num_sweeps: 1,
+            ..Default::default()
+        };
+        let cores = crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1);
+        let limit = one_sweep_limit(Kernel::Sa, Storage::Spill, Some(200.0));
+        let above = circulant_int32(limit + 2, 200);
+        let err = validate_batch(&[&above], &p, Kernel::Sa).unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        assert!(too_large_msg(err).contains("one global sweep"));
+        let below = circulant_int32(limit - 2, 200);
+        validate_batch(&[&below], &p, Kernel::Sa).unwrap();
+
+        // A batch of one problem per core and more: one problem passes, and
+        // three times the parallel reads triple the estimate past the limit.
+        let model = circulant_int32(20_000, 62);
+        validate_batch(&[&model], &p, Kernel::Sa).unwrap();
+        let batch: Vec<&IsingGraph> = vec![&model; 3 * cores];
+        let err = validate_batch(&batch, &p, Kernel::Sa).unwrap_err();
+        assert!(too_large_msg(err).contains("one global sweep"));
+
+        // A complete model past the CSR limit of the SA threadgroup tier is
+        // refused on CSR storage, and the batch path refuses it on dense
+        // storage with no fall back to CSR.
+        let complete = complete_int32(1_500);
+        let err = validate_batch(&[&complete], &p, Kernel::Sa).unwrap_err();
+        assert!(too_large_msg(err).contains("one local sweep"));
+        let err = validate_batch_within(
+            &[&complete],
+            &p,
+            Kernel::Sa,
+            host_device_limits(),
+            true,
+            None,
+            DenseMode::Auto,
+        )
+        .unwrap_err();
+        assert!(too_large_msg(err).contains("one dense-matrix sweep"));
+    }
+
+    /// The Advantage2 path is admitted at every batch size the stream
+    /// forms, at 64 and 256 reads.
+    #[test]
+    fn advantage2_batches_pass_the_one_sweep_check() {
+        let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| {
+                let mut it = l.split_whitespace().map(|t| t.parse::<usize>().unwrap());
+                (it.next().unwrap(), it.next().unwrap())
+            })
+            .collect();
+        let j = (0..edges.len())
+            .map(|k| if k % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let graph = IsingGraph::new(vec![1.0; 4577], j, edges);
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            for reads in [64, 256] {
+                let p = SampleParams {
+                    num_reads: reads,
+                    num_sweeps: 4096,
+                    ..Default::default()
+                };
+                let problems = crate::streaming::batch_size_for_reads(kernel, reads);
+                let batch: Vec<&IsingGraph> = vec![&graph; problems];
+                validate_batch(&batch, &p, kernel)
+                    .unwrap_or_else(|e| panic!("{kernel:?} {problems} x {reads}: {e:?}"));
+            }
+        }
     }
 
     #[test]

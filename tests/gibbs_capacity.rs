@@ -256,3 +256,79 @@ fn spill_rates() {
         }
     }
 }
+
+/// A named model builder, the node count it runs at, and its path.
+type Shape = (&'static str, fn(usize, Path) -> IsingGraph, usize, Path);
+
+/// A complete graph on `n` nodes with couplings of `path`.
+fn complete(n: usize, path: Path) -> IsingGraph {
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for u in 0..n {
+        for v in u + 1..n {
+            edges.push((u, v));
+            j.push(coefficient(path, u * 7 + v, false));
+        }
+    }
+    let h = (0..n).map(|i| coefficient(path, i, true)).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// The worst admitted high-degree CSR shapes of Gibbs, one problem of 256
+/// reads: the spill build at its one-sweep limits of 107,927 nodes at degree
+/// 200 and 358,494 nodes at degree 62 (extrapolated past the grid), and a
+/// complete model on CSR storage at the shared build's limit of 2,915 nodes.
+/// Each anneal's longest chunk stays below 400 ms, and one node more is
+/// refused as a capacity error. The limits are those of
+/// `docs/perf/2026-11-metal-capacity.md` on a 40-core GPU.
+#[test]
+#[ignore = "device timing: run with --release --ignored --nocapture"]
+fn the_largest_admitted_high_degree_sweeps_stay_under_400_ms() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(256, 16, 1, 9);
+    let sparse = Tuning {
+        force_sparse: true,
+        ..Tuning::default()
+    };
+    let shapes: [Shape; 5] = [
+        (
+            "spill degree 200",
+            |n, path| circulant(n, 200, path),
+            107_927,
+            Path::Unit,
+        ),
+        (
+            "spill degree 200",
+            |n, path| circulant(n, 200, path),
+            107_927,
+            Path::Int,
+        ),
+        (
+            "spill degree 62",
+            |n, path| circulant(n, 62, path),
+            358_494,
+            Path::Int,
+        ),
+        ("shared complete", complete, 2_915, Path::Unit),
+        ("shared complete", complete, 2_915, Path::Int),
+    ];
+    for (name, build, limit, path) in shapes {
+        let out = run(&dev, &build(limit, path), &p, sparse);
+        let max_ms = out.max_chunk_us as f64 / 1e3;
+        let chunks: Vec<f64> = out.chunk_us.iter().map(|&us| us as f64 / 1e3).collect();
+        writeln!(
+            io::stdout().lock(),
+            "{{\"shape\":\"{name}\",\"nodes\":{limit},\"path\":\"{path:?}\",\"storage\":\"{:?}\",\"chunks\":{},\"max_chunk_ms\":{max_ms:.1},\"chunk_ms\":{chunks:.1?}}}",
+            out.storage,
+            out.plan.len(),
+        )
+        .unwrap();
+        assert!(max_ms < 400.0, "{name} {path:?}: {max_ms} ms");
+        let err = sample_ising_tuned(&dev, &build(limit + 1, path), &p, Kernel::Gibbs, sparse)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("past the 400 ms limit of one chunk"),
+            "{name} {path:?}: {err:?}"
+        );
+    }
+}

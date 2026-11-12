@@ -669,6 +669,117 @@ The table lists every point with a run whose longest chunk passed 400 ms, sorted
 | gibbs | auto | 200 | int8 | 100000 | spill | 3 | 2 | 4 | 278.388 | 440.676 | 139.194 |
 | sa | auto | 62 | int32 | 40000 | global | 1 | 158 | 158 | 416.839 | 416.839 | 416.839 |
 
+## Calibration of the planner and the one-sweep refusal
+
+Task 5.3b uses these measurements in two places in `src/sampler.rs`. The SA and Gibbs chunk planners multiply their cost per spin update by a degree factor. The admission refuses any batch whose estimated one-sweep chunk passes 400 ms, on every tier. The doc comment of each constant names its source rows.
+
+### Degree factor of the planner
+
+The planner rates come from runs near degree 20, so the factor is 1 up to degree 20. Past degree 20, `sweep_degree_factor` interpolates `SA_DEGREE_FACTOR` and `GIBBS_DEGREE_FACTOR` on the mean degree, `2 * edges / nodes`. Each point is the largest ratio of the mean ns per update at a degree to the mean at degree 20, at the same nodes, precision, and tier.
+
+| Mean degree | SA factor | Gibbs factor |
+|---|---|---|
+| 20 or less | 1 | 1 |
+| 62 | 3.0 | 4.3 |
+| 200 | 10.6 | 29.7 |
+| 999 | 76 | 570 |
+| 1,413 | 116 | 1,100 |
+| 2,499 | 290 | 2,500 |
+
+Past the last point, the factor follows the last segment. The Gibbs factor grows faster because a small model of high degree has few nodes in each color class, so the class steps bound its sweep. The multi-spin planner keeps its row chunks and color steps. The grid shows no planned multi-spin chunk past 160 ms, so Task 5.3b does not change it. The Advantage2 topology has a mean degree of 18.1, so its plans do not change.
+
+### One-sweep estimate
+
+`one_sweep_ms` covers every build. A dense-matrix sweep walks `n * n` columns at the kernel's column rate: 5.0 million per second for SA, 7.0 million for Gibbs and 60 million for MSA. These are the rates of the earlier dense checks, so the dense limits stay at 1,414, 1,673 and 4,898 nodes. A CSR sweep costs one problem of 256 reads at the worst measured ns per update of its build and mean degree. The table points are in `SA_LOCAL_SWEEP_NS`, `SA_GLOBAL_SWEEP_NS`, `GIBBS_SHARED_SWEEP_NS`, `GIBBS_SPILL_SWEEP_NS`, `MSA_SHARED_SWEEP_NS` and `MSA_SPILL_SWEEP_NS`. The estimate multiplies that cost by 1.15 for contention from other GPU work.
+
+The grid ran most rows in chunks of 4 to 32 sweeps, and that hides two costs of a one-sweep chunk:
+
+- The first chunk of an anneal initializes the state. On the SA local build, a one-sweep first chunk took 1.26 to 1.30 times the next chunk. The SA local points are the grid values times 1.3.
+- The late sweeps of a Gibbs spill anneal run slower than the first ones, up to 2.2 times, and the cost per update grows with the node count. The grid ran 1 to 7 sweeps at large sizes. The Gibbs spill points at degrees 4, 20 and 62 come from runs of 16 one-sweep chunks instead.
+
+The GPU runs a fixed number of reads side by side: one problem of 256 reads per core for SA, 6.4 reads per core for Gibbs, and one 32-replica word per core for MSA. Past that count, the estimate grows with the reads of the batch. Past it, a batch of two or more problems costs 2 times more on Gibbs and MSA. Every problem has a copy of its couplings, and the copies compete for the cache. A batch of fewer than 256 reads costs as much as 256 reads. One SA problem of 64 reads took about as long as one of 256.
+
+The multi-problem and first-chunk runs come from the ignored test `batch_sweep_probe` in `src/sampler.rs`. Every chunk of that test is one sweep. Its records are in `docs/perf/2026-11-metal-sweep-probe.jsonl`, and the `run` field names the batch of runs. The command for one run is:
+
+```sh
+QUIP_PROBE_KERNEL=gibbs QUIP_PROBE_NODES=358494 QUIP_PROBE_DEGREE=62 \
+  QUIP_PROBE_PROBLEMS=1 QUIP_PROBE_READS=256 QUIP_PROBE_SWEEPS=16 \
+  cargo test --release --lib batch_sweep_probe -- --ignored --nocapture
+```
+
+The probes ran on the same M4 Max as the grid, with other sessions on the machine. On small models, the first chunk of a run on an idle GPU took up to 38 ms more than later chunks, a cost that the estimate does not model and that matters only far below 400 ms.
+
+### One-sweep limits
+
+The table gives the largest node count that the admission accepts for one problem of 256 reads on 40 GPU cores. The test `each_build_refuses_one_node_past_its_one_sweep_limit` checks every row. "Measured" means that the grid or a probe has a point at or past the limit. "Extrapolated" means that the limit lies past the largest measured size, so one run at the limit verified it. The longest chunk column gives that run, with 16 sweeps of one sweep each.
+
+| Build | Degree | Limit (nodes) | Basis | Longest chunk at the limit (ms) |
+|---|---|---|---|---|
+| SA local | complete | 1,476 | measured (1,414 and 2,000 nodes) | 347.6 (`int8`), 346.9 (`int32`) |
+| SA global | 4 | 167,121 | extrapolated | 382.9, 301.0 |
+| SA global | 20 | 88,572 | extrapolated | 293.4 |
+| SA global | 62 | 32,906 | measured (20,000 and 40,000 nodes) | 362.7, 290.7 |
+| SA global | 200 | 9,322 | measured (4,700 and 10,000 nodes) | 376.2 (`int8`), 340.9 (`int32`) |
+| Gibbs shared | complete | 2,915 | measured (2,000 to 3,098 nodes) | 293.0 and 287.4 (`binary`), 251.5 and 261.8 (`int32`) |
+| Gibbs spill | 4 | 5,684,919 | extrapolated | 365.4, 248.9 |
+| Gibbs spill | 20 | 978,887 | extrapolated | 288.7, 301.3 |
+| Gibbs spill | 62 | 358,494 | measured (400,000 nodes) | 288.3, 249.3, 346.0, 317.9, 305.1 (`int32`) |
+| Gibbs spill | 200 | 107,927 | measured (100,000 and 200,000 nodes) | 286.3, 258.9 and 386.3 (`binary`), 293.9, 306.6, 277.4 and 331.0 (`int32`) |
+| MSA spill | 4 | 13,724,198 | extrapolated | 357.0, 340.5 |
+| MSA spill | 20 | 6,932,120 | extrapolated | 343.7 |
+| MSA spill | 62 | 1,433,223 | extrapolated | 277.9 (`int32`) |
+| SA dense | complete | 1,414 | measured | 344.7 (grid rerun) |
+| Gibbs dense | complete | 1,673 | measured | 263.7 (grid rerun) |
+| MSA dense | complete | 4,898 | measured | 358.1 (grid rerun) |
+
+The SA local, Gibbs shared and multi-spin shared builds reach no limit at a regular degree up to 200, or up to 62 for the multi-spin kernel, below their node caps of 4,593, 4,800 and 6,016.
+
+Five verification runs passed 400 ms. Their constants rose, and the runs repeated at the new limits:
+
+- Gibbs spill at degree 62 and 553,665 nodes took 537.3 ms in its seventh chunk. The point rose from 2.454 to 3.79 ns.
+- Gibbs spill at degree 20 and 1,170,280 nodes took 415.8 ms, and at degree 4 and 8,335,556 nodes it took 509.6 ms in the second of two runs. The points rose to 1.388 and 0.239 ns.
+- SA global at degree 4 and 196,343 nodes took 408.4 ms in its first chunk. The point rose from 6.92 to 8.13 ns.
+- Gibbs shared on a complete `binary` model of 3,098 nodes took 785.8 ms, with 11 chunks past 600 ms. The complete points from 2,000 nodes up now come from runs of 16 one-sweep chunks at 2,000, 2,500, 2,700 and 2,900 nodes, and the point at degree 3,097 is 991 ns. These runs are in `docs/perf/2026-11-metal-capacity-5.3b.jsonl`, after the grid rerun.
+
+The device tests `the_largest_admitted_high_degree_sweeps_stay_under_400_ms` in `tests/sa_capacity.rs` and `tests/gibbs_capacity.rs`, and `the_largest_admitted_spill_sweep_stays_under_400_ms` in `tests/msa_spill.rs`, run the high-degree limits with the production planner. They assert that the longest chunk is below 400 ms and that the admission refuses one node more:
+
+```sh
+cargo test --release --test sa_capacity the_largest_admitted -- --ignored --nocapture
+cargo test --release --test gibbs_capacity the_largest_admitted -- --ignored --nocapture
+cargo test --release --test msa_spill the_largest_admitted -- --ignored --nocapture
+```
+
+### Grid rerun
+
+The auto, complete, sparse and spill series ran again with the new planner and refusal. The records are in `docs/perf/2026-11-metal-capacity-5.3b.jsonl`, from the crate at `ef26712` with the Task 5.3b changes in the working tree. The command was:
+
+```sh
+tests/capacity_bench_grid.sh docs/perf/2026-11-metal-capacity-5.3b.jsonl auto complete sparse spill
+```
+
+No admitted run has a chunk past 400 ms. The longest chunk is 358.1 ms, one sweep of the dense MSA build at 4,898 nodes. The longest chunk that holds more than one sweep is 148.1 ms. The table compares the longest chunk of the high-degree rows that passed 400 ms before.
+
+| Kernel | Storage | Degree | Precision | Nodes | Tier | Before (ms, chunks) | After (ms, chunks) |
+|---|---|---|---|---|---|---|---|
+| sa | sparse | complete | int8 | 2,500 | local | 10,157.9 (2) | refused |
+| sa | sparse | complete | int8 | 1,414 | local | 6,631.7 (2) | 340.5 (49) |
+| sa | sparse | complete | int32 | 1,000 | local | 4,766.2 (3) | 165.1 (99) |
+| gibbs | sparse | complete | int8 | 2,500 | shared | 3,499.4 (1) | 208.6 (16) |
+| gibbs | sparse | complete | int32 | 1,000 | shared | 2,027.9 (1) | 48.0 (99) |
+| sa | auto | 200 | int32 | 40,000 | global | 1,373.1 (49) | refused |
+| gibbs | auto | 200 | int32 | 400,000 | spill | 1,289.2 (1) | refused |
+| sa | auto | 200 | int8 | 4,500 | local | 697.7 (32) | 131.0 (256) |
+| sa | auto | 62 | int8 | 80,000 | global | 689.3 (19) | refused |
+| sa | auto | 200 | int32 | 4,700 | global | 655.2 (64) | 175.9 (256) |
+| gibbs | auto | 200 | int32 | 40,000 | spill | 645.8 (9) | 84.3 (49) |
+| sa | sparse | 200 | int8 | 1,000 | local | 643.1 (8) | 59.3 (128) |
+| gibbs | auto | 200 | int32 | 200,000 | spill | 626.2 (2) | refused |
+| gibbs | auto | 200 | int8 | 10,000 | spill | 543.0 (8) | 14.1 (198) |
+| gibbs | auto | 200 | int8 | 2,000 | shared | 448.6 (1) | 18.7 (22) |
+| sa | auto | 62 | int32 | 40,000 | global | 416.8 (158) | refused |
+
+A chunk count of 1 means that the old plan ran the whole anneal in one command buffer. The refusal also takes three rows that ran below 400 ms before, which are SA global at degree 200 and 10,000 nodes (373.1 ms before, estimated at 429.1 ms), SA global at degree 62 and 40,000 nodes `int8` (355.7 ms), and Gibbs spill at degree 62 and 400,000 nodes (197.1 ms over three sweeps, estimated at 446.3 ms).
+
 ## Limits of these measurements
 
 - A point ran once, except the boundary rows and the spill rows, which ran three times. The load of the shared machine adds noise, which is larger for runs of a few milliseconds.
