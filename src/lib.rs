@@ -47,6 +47,7 @@ compile_error!(
 );
 
 pub mod capacity;
+pub mod cluster;
 pub mod probe;
 pub mod sampler;
 

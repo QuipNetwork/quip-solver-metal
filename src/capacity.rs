@@ -253,6 +253,78 @@ impl Footprint {
     }
 }
 
+/// Threads per cluster anneal: one threadgroup of this size runs each anneal.
+pub const CLUSTER_THREADS: usize = 512;
+
+/// Bytes of per-thread state per cluster anneal (two `uint` of random state
+/// per thread, as the CUDA layout counts it).
+const CLUSTER_THREAD_STATE_BYTES: usize = 8;
+
+/// Device bytes per node and anneal: the `parent` and `acc` ints (4 bytes
+/// each) and one spin byte. Metal keeps all three in device buffers, one
+/// region per anneal, so none counts against threadgroup memory.
+const CLUSTER_ANNEAL_BYTES_PER_NODE: usize = 9;
+
+/// Sizes of the prepared cluster arrays. ELL widths count padded slots per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterShape {
+    /// Number of nodes.
+    pub nodes: usize,
+    /// Number of four-node tiles.
+    pub tiles: usize,
+    /// Number of pair links.
+    pub links: usize,
+    /// Maximum nonzero residual degree.
+    pub weak_width: usize,
+    /// Maximum nonzero original degree.
+    pub all_width: usize,
+    /// Number of contiguous color ranges.
+    pub colors: usize,
+}
+
+/// Device memory of the Otsuka cluster solver for `shape`.
+///
+/// `shared_bytes` counts the uploaded arrays that every anneal reads: tiles,
+/// gauges, pairs, both degree and ELL tables, colour offsets, fields, and the
+/// two weight arrays. Each empty upload reserves one element. Permutations
+/// and the original graph stay on the host. `per_instance_bytes` counts the
+/// device regions of one anneal: `parent`, `acc`, the spins, and the
+/// per-thread random state. The tier is [`Storage::Spill`] because no anneal
+/// state lives in threadgroup memory. The CUDA pool allowance, the CUDA
+/// shared-memory constants, and the shared-memory refusal do not apply on
+/// Metal. The caller passes `batches = 1` to [`Footprint::total`].
+#[must_use]
+pub fn cluster_footprint(shape: ClusterShape) -> Footprint {
+    let n = shape.nodes;
+    let t = shape.tiles;
+    let p = shape.links;
+    let int_bytes = |count: usize| count.max(1).saturating_mul(4);
+    let mut uploads = 0_usize;
+    for count in [
+        t.saturating_mul(4),
+        p.saturating_mul(2),
+        n,
+        n.saturating_mul(shape.weak_width),
+        n,
+        n.saturating_mul(shape.all_width),
+        shape.colors.saturating_add(1),
+        n,
+        t,
+        p,
+    ] {
+        uploads = uploads.saturating_add(int_bytes(count));
+    }
+    // One gauge byte per tile position.
+    uploads = uploads.saturating_add(t.saturating_mul(4).max(1));
+    Footprint {
+        storage: Storage::Spill,
+        per_instance_bytes: n
+            .saturating_mul(CLUSTER_ANNEAL_BYTES_PER_NODE)
+            .saturating_add(CLUSTER_THREADS.saturating_mul(CLUSTER_THREAD_STATE_BYTES)),
+        shared_bytes: uploads,
+    }
+}
+
 /// Why a model does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CapacityError {
@@ -1071,6 +1143,39 @@ mod tests {
             betas: 64,
             reads: 100,
         }
+    }
+
+    #[test]
+    fn cluster_footprint_at_advantage2_size_counts_uploads_and_anneal_state() {
+        let shape = ClusterShape {
+            nodes: 4_577,
+            tiles: 1_000,
+            links: 800,
+            weak_width: 6,
+            all_width: 15,
+            colors: 10,
+        };
+        let footprint = cluster_footprint(shape);
+        // Ints, four bytes each: 4 000 tile nodes, 1 600 pair nodes,
+        // 4 577 weak degrees, 4 577 * 6 weak ELL slots, 4 577 all degrees,
+        // 4 577 * 15 all ELL slots, 11 colour offsets, 4 577 fields,
+        // 1 000 tile weights, and 800 link weights. Then 4 000 gauge bytes.
+        let int_entries =
+            4_000 + 1_600 + 4_577 + 4_577 * 6 + 4_577 + 4_577 * 15 + 11 + 4_577 + 1_000 + 800;
+        assert_eq!(int_entries, 117_259);
+        assert_eq!(footprint.shared_bytes, int_entries * 4 + 4_000);
+        assert_eq!(footprint.shared_bytes, 473_036);
+        // One anneal: parent and acc (8 bytes) plus one spin byte per node,
+        // and 512 threads of 8 bytes of random state.
+        assert_eq!(footprint.per_instance_bytes, 4_577 * 9 + 512 * 8);
+        assert_eq!(footprint.per_instance_bytes, 45_289);
+        assert_eq!(footprint.storage, Storage::Spill);
+        assert_eq!(footprint.total(3, 1), 473_036 + 3 * 45_289);
+        let huge = ClusterShape {
+            nodes: usize::MAX,
+            ..shape
+        };
+        assert_eq!(cluster_footprint(huge).total(usize::MAX, 1), usize::MAX);
     }
 
     #[test]
