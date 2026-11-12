@@ -817,3 +817,7 @@ A chunk count of 1 means that the old plan ran the whole anneal in one command b
 - The circulant graph has a regular neighbour pattern with good memory locality. A graph with random neighbours may cost more per update on the global and spill tiers.
 - The harness measures `Tuning::default` planning, which is the production planner on this host.
 - MSA ns per update counts one replica of a word as one read, so the value is far smaller than for SA and Gibbs.
+
+## The sweep change of November 12
+
+The grid predates QUI-2265 (merge request !33 on main) and was not run again. Since that change, every SA and MSA sweep of an anneal except the last leaves one node out. The change removes at most one spin update per sweep, so the SA and MSA times per update and per sweep in this file still bound the cost of a sweep. The Gibbs kernels stay the same.

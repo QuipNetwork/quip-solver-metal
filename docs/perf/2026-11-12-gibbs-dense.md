@@ -113,3 +113,7 @@ QUIP_PM1_SCALE=float cargo test --release --test pm1_rates -- --ignored --nocapt
 | Unit multi-spin | `6ec8d35ff7c9f123` |
 | Weighted multi-spin | `4ee84dd42f5d5ade` |
 | Float32 multi-spin | `c103cce43c429e4b` |
+
+## Digests after the sweep change of November 12
+
+QUI-2265 (merge request !33 on main) makes every SA and MSA sweep of an anneal except the last leave one node out, so the SA and multi-spin digests in the preceding table come from the kernels before that change. The Gibbs kernels do not change, and the three Gibbs digests keep their values. After the merge of `feat/sa-gibbs-spill` into `feat/dense-kernels`, the unit SA digest is `e5ba74a87a6dadad`, the unit multi-spin digest `a68757003e4eac09`, the weighted multi-spin digest `be4c5e92185633b9`, and the Float32 multi-spin digest `af08be780113298d`.
