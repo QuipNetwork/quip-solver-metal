@@ -206,9 +206,10 @@ const WEIGHTED_MSA_DENSE_COST_FACTOR: f64 = 6.8;
 /// 68.2 million columns per second, one sweep of an Int32 model of 6,016
 /// nodes. This value keeps a margin under it for contention from other GPU
 /// work, which slowed a 5,099-node sweep to 408 and 467 ms. The planner and
-/// the one-sweep admission limit both use it. Each threadgroup is one SIMD group whose column walk is bound by
-/// latency, so the rate scales with the threadgroups and not with the GPU
-/// cores, unlike [`MSA_OCCUPANCY_CURVE`].
+/// the one-sweep admission limit both use it. Each threadgroup is one SIMD
+/// group whose column walk is bound by latency, so the rate scales with the
+/// threadgroups and not with the GPU cores, unlike
+/// [`MSA_OCCUPANCY_CURVE`].
 const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 6.0e7;
 /// Margin on [`MSA_MATRIX_COLUMNS_PER_SEC`], so a chunk planned at the
 /// 500 ms ceiling runs about 200 ms on the slowest measured shape.
@@ -234,15 +235,13 @@ fn msa_matrix_rate(groups: usize, in_flight: usize) -> f64 {
         / in_flight.max(1) as f64
 }
 
-/// The estimated GPU time of one sweep of an `n`-node dense-matrix batch
-/// of `groups` threadgroups, in milliseconds: the planner's column count at
+/// The estimated GPU time of one sweep of an `n`-node dense-matrix batch, in
+/// milliseconds: the planner's column count at
 /// [`MSA_MATRIX_COLUMNS_PER_SEC`], without the planning margin. Every
-/// threadgroup walks its rows at once, so the estimate is `n * n` columns
-/// at the rate of one threadgroup, whatever the read count.
-fn msa_matrix_sweep_ms(n: usize, groups: usize) -> f64 {
-    let groups = groups.max(1) as f64;
-    let columns = groups * n as f64 * n as f64;
-    columns / (MSA_MATRIX_COLUMNS_PER_SEC * groups) * 1000.0
+/// threadgroup walks its `n * n` columns at once, so the estimate does not
+/// depend on the read count.
+fn msa_matrix_sweep_ms(n: usize) -> f64 {
+    n as f64 * n as f64 / MSA_MATRIX_COLUMNS_PER_SEC * 1000.0
 }
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
@@ -1625,36 +1624,18 @@ fn validate_batch_within<'a>(
         }
     }
     .map_err(too_large)?;
-    let footprint = if footprint.storage == Storage::Dense {
-        // A chunk is at least one sweep. A dense batch whose one sweep would
-        // pass the ceiling takes a sparse tier that fits, or is refused
-        // before any buffer exists.
-        let groups = graphs.len() * simd_rounded_reads(params.num_reads) / MSA_LANES;
-        let sweep_ms = msa_matrix_sweep_ms(n, groups);
-        if sweep_ms <= MSA_MATRIX_MAX_SWEEP_MS {
-            footprint
-        } else {
-            let sparse = (dense == DenseMode::Auto)
-                .then(|| {
-                    crate::capacity::footprint_in(
-                        kernel,
-                        &shape,
-                        limits,
-                        &[Storage::Threadgroup, Storage::Spill],
-                    )
-                    .ok()
-                })
-                .flatten();
-            sparse.ok_or_else(|| {
-                SampleError::TooLarge(format!(
-                    "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
-                     {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
-                ))
-            })?
+    if footprint.storage == Storage::Dense {
+        // A chunk is at least one sweep, so a dense batch whose one sweep
+        // would pass the limit is refused before any buffer exists. Auto
+        // routing picks dense past the limit only when no sparse tier fits.
+        let sweep_ms = msa_matrix_sweep_ms(n);
+        if sweep_ms > MSA_MATRIX_MAX_SWEEP_MS {
+            return Err(SampleError::TooLarge(format!(
+                "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
+                 {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
+            )));
         }
-    } else {
-        footprint
-    };
+    }
     if footprint.storage != Storage::Dense {
         if let Some(message) = over_budget {
             return Err(SampleError::TooLarge(message));
@@ -3601,9 +3582,8 @@ mod tests {
     /// refused before any buffer exists; the shorter one is admitted dense.
     #[test]
     fn a_dense_sweep_past_one_chunk_is_refused_before_allocation() {
-        assert!(msa_matrix_sweep_ms(4_898, 8) <= MSA_MATRIX_MAX_SWEEP_MS);
-        assert!(msa_matrix_sweep_ms(4_899, 8) > MSA_MATRIX_MAX_SWEEP_MS);
-        assert!((msa_matrix_sweep_ms(4_899, 1) - msa_matrix_sweep_ms(4_899, 8)).abs() < 1e-9);
+        assert!(msa_matrix_sweep_ms(4_898) <= MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(msa_matrix_sweep_ms(4_899) > MSA_MATRIX_MAX_SWEEP_MS);
         let p = SampleParams {
             num_reads: 256,
             num_sweeps: 1,
