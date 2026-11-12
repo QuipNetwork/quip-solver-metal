@@ -3604,30 +3604,6 @@ pub fn sample_ising(
     sample_planned(device, graph, params, kernel, None, true)
 }
 
-/// [`sample_ising`] with the beta schedule split into chunks of
-/// `rungs_per_chunk` rungs, so tests can compare a chunked anneal with an
-/// unchunked one of the same seed.
-///
-/// # Errors
-///
-/// The same as [`sample_ising`].
-#[doc(hidden)]
-pub fn sample_ising_chunked(
-    device: &crate::metal_device::MetalDevice,
-    graph: &IsingGraph,
-    params: &SampleParams,
-    kernel: Kernel,
-    rungs_per_chunk: usize,
-) -> Result<Vec<SamplerResult>, SampleError> {
-    let num_betas = (params.num_sweeps / params.sweeps_per_beta.max(1)).max(1);
-    let step = rungs_per_chunk.clamp(1, num_betas);
-    let plan: Vec<(i32, i32)> = (0..num_betas)
-        .step_by(step)
-        .map(|start| (start as i32, step.min(num_betas - start) as i32))
-        .collect();
-    sample_planned(device, graph, params, kernel, Some(&plan), true)
-}
-
 /// The reads of [`sample_ising_tuned`] and how its anneal was split.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -6325,6 +6301,71 @@ mod tests {
                 };
             }
             prop_assert_eq!(cursor, (cover, 0), "plan does not cover full schedule");
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_chunk_tests {
+    use super::*;
+
+    fn twelve_node_model() -> IsingGraph {
+        let n = 12;
+        let mut edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        edges.extend((0..n / 2).map(|i| (i, i + n / 2)));
+        let palette = [0.37, -1.25e-3, -0.8125, 0.0421, 1.3333, -0.5005];
+        let j = (0..edges.len())
+            .map(|k| palette[k % palette.len()])
+            .collect();
+        let h = (0..n)
+            .map(|i| palette[(i * 5 + 1) % palette.len()] * 0.5)
+            .collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    fn complete_real_model() -> IsingGraph {
+        let n = 32;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let palette = [0.37, -1.25e-3, -0.8125, 0.0421, 1.3333, -0.5005];
+        let j = (0..edges.len())
+            .map(|k| palette[(k * 7 + 3) % palette.len()] * 0.1)
+            .collect();
+        let h = (0..n).map(|i| palette[i % palette.len()]).collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    fn chunked_and_unchunked_real_anneals_match(kernel: Kernel) {
+        let Ok(dev) = crate::metal_device::MetalDevice::open(0) else {
+            return;
+        };
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 96,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.1, 3.0)),
+            seed: 9,
+            ..Default::default()
+        };
+        // The complete model has degree 31, two row chunks in the multi-spin
+        // float lane.
+        for graph in [twelve_node_model(), complete_real_model()] {
+            let whole = sample_ising(&dev, &graph, &params, kernel).unwrap();
+            let plan: Vec<_> = (0..params.num_sweeps as i32)
+                .map(|rung| (rung, 1))
+                .collect();
+            let split = sample_planned(&dev, &graph, &params, kernel, Some(&plan), true).unwrap();
+            assert_eq!(whole, split, "{} nodes", graph.num_nodes());
+            // The anneal moved: the reads are not all one state.
+            assert!(whole.iter().any(|r| r.spins != whole[0].spins));
+        }
+    }
+
+    #[test]
+    fn chunked_and_unchunked_float_anneals_match() {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            chunked_and_unchunked_real_anneals_match(kernel);
         }
     }
 }
