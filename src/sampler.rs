@@ -1360,7 +1360,7 @@ struct ValidBatch<'a> {
 }
 
 /// Memory limits of this host, computed once.
-fn host_device_limits() -> &'static DeviceLimits {
+pub(crate) fn host_device_limits() -> &'static DeviceLimits {
     static LIMITS: std::sync::OnceLock<DeviceLimits> = std::sync::OnceLock::new();
     LIMITS.get_or_init(host_limits)
 }

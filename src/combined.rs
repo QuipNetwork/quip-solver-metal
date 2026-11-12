@@ -353,8 +353,16 @@ fn eligibility(
         return [false, false];
     }
     let n = graph.h.len();
+    // An MSA model past the unit kernel's nodes runs on the batch path's
+    // spill build, which the resident runner bounds by its capacity
+    // footprint. Metal takes such a model only when the ANE cannot.
+    let spill = kernel == Kernel::Msa && n > crate::sampler::kernel_max_nodes(kernel);
+    let metal_nodes = match kernel {
+        Kernel::Msa => crate::capacity::MAX_NODES,
+        Kernel::Sa | Kernel::Gibbs => crate::sampler::kernel_max_nodes(kernel),
+    };
     let mut metal = cfg.enable_metal
-        && n <= crate::sampler::kernel_max_nodes(kernel)
+        && n <= metal_nodes
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
     metal &= crate::sampler::kernel_representation(graph, kernel).is_ok();
@@ -408,7 +416,7 @@ fn eligibility(
             }
         }
     }
-    [metal, ane]
+    [metal && !(spill && ane), ane]
 }
 
 trait StreamEngine: Sync {
@@ -1305,16 +1313,42 @@ mod tests {
             [true, false]
         );
         j.params.num_reads = 128;
+        // Past the unit kernel's nodes, Metal takes the batch path's spill
+        // build, but only a model the ANE cannot take.
         j.graph = IsingGraph::new(vec![0.0; crate::sampler::MSA_MAX_NODES + 1], vec![], vec![]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, true]
         );
+        assert_eq!(
+            eligibility(
+                Kernel::Msa,
+                &j.graph,
+                &j.params,
+                config(true, false),
+                &mut facts
+            ),
+            [true, false]
+        );
         j.graph = IsingGraph::new(vec![0.0; 16_385], vec![], vec![]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
+        j.graph = IsingGraph::new(vec![0.5; 20_000], vec![], vec![]);
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, false]
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let n = crate::sampler::kernel_max_nodes(kernel) + 1;
+            j.graph = IsingGraph::new(vec![0.0; n], vec![], vec![]);
+            assert_eq!(
+                eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                [false, false],
+                "{kernel:?}"
+            );
+        }
         j.graph = IsingGraph::new(
             vec![0.0; 22],
             vec![1.0; 21],

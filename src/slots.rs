@@ -384,6 +384,13 @@ impl SlotPool {
     pub(crate) fn capacity(&self) -> usize {
         self.slots.len()
     }
+    /// Bytes of the device buffers this pool rents.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|(_, buffer)| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
+    }
     /// The span of the last retired step command, once.
     pub(crate) fn take_span(&mut self) -> Option<StepSpan> {
         self.span.take()

@@ -519,12 +519,16 @@ impl Pool {
     }
 }
 
+/// Bounds every resident job. The node count is not bounded here: a job past
+/// the unit kernel's nodes takes the batch path, whose spill build the
+/// capacity footprint bounds ([`admit_batch`]). The edge bound is the one the
+/// backend identity advertises.
 fn validate(job: &StreamJob) -> Result<(), SampleError> {
-    if job.graph.num_nodes() > sampler::kernel_max_nodes(Kernel::Msa)
+    if job.graph.edges.len() > crate::DEFAULT_MAX_EDGES as usize
         || job.params.num_sweeps > sampler::MAX_SWEEPS
     {
         return Err(SampleError::TooLarge(
-            "resident job exceeds node or sweep limit".into(),
+            "resident job exceeds edge or sweep limit".into(),
         ));
     }
     if job.graph.j.len() != job.graph.edges.len() {
@@ -755,10 +759,12 @@ impl Preparer {
             return Ok(None);
         }
         validate(job)?;
-        // Slots run the unit kernel only. Weighted models, and refusals,
-        // take the batch path, which classifies them again.
-        let unit = crate::representation::classify_msa(&job.graph)
-            == Ok(crate::representation::Representation::Binary);
+        // Slots run the unit kernel only. Weighted models, models past the
+        // unit kernel's nodes, and refusals take the batch path, which
+        // classifies them again.
+        let unit = job.graph.num_nodes() <= sampler::kernel_max_nodes(Kernel::Msa)
+            && crate::representation::classify_msa(&job.graph)
+                == Ok(crate::representation::Representation::Binary);
         if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
@@ -1381,16 +1387,53 @@ fn reject_preparation(
     reject_tail(pending, jobs, salts, out, error, cancel);
 }
 
+/// Refuse a batch job whose buffers, together with the `reserved_bytes` the
+/// slot pools hold, exceed `usable_bytes`. The job's own bytes are its
+/// capacity footprint for the jobs the runner holds at once, as
+/// `capacity::footprint` counts them.
+fn admit_batch(
+    job: &StreamJob,
+    reserved_bytes: usize,
+    usable_bytes: usize,
+) -> Result<(), SampleError> {
+    let footprint = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)?;
+    let needed = footprint
+        .total(crate::capacity::instances(
+            Kernel::Msa,
+            job.params.num_reads,
+        ))
+        .saturating_add(reserved_bytes);
+    if needed > usable_bytes {
+        let error = crate::capacity::CapacityError::Memory {
+            needed,
+            usable: usable_bytes,
+        };
+        return Err(SampleError::TooLarge(format!(
+            "Msa batch job of {} nodes beside the slot pools: {error}",
+            job.graph.num_nodes()
+        )));
+    }
+    Ok(())
+}
+
+/// Run one job on the batch path. `reserved_bytes` is the memory the slot
+/// pools hold; see [`admit_batch`].
 fn run_fallback(
     device: &MetalDevice,
     job: StreamJob,
     origin: Origin,
+    reserved_bytes: usize,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
     cancel: &CancelToken,
 ) -> Result<(), SampleError> {
     let mut device_access_time_us = 0;
     let result = (|| {
+        admit_batch(
+            &job,
+            reserved_bytes,
+            sampler::host_device_limits().usable_bytes(),
+        )?;
         let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
         for _ in 0..batch.chunk_count() {
             if out.is_closed() || abandoned(cancel, &job, &origin) {
@@ -1576,8 +1619,13 @@ fn admit_unit(
                     data: Ok(None),
                 });
             }
+            let reserved = pools.as_ref().map_or(0, |ps| {
+                ps.iter()
+                    .map(|p| p.slots.allocated_bytes())
+                    .fold(0, usize::saturating_add)
+            });
             let started = Instant::now();
-            let result = run_fallback(device, job, origin, out, gov, cancel);
+            let result = run_fallback(device, job, origin, reserved, out, gov, cancel);
             // Fallback time belongs to the governor, not cascade load.
             *window += started.elapsed();
             if let Err(error) = result {
@@ -4393,6 +4441,75 @@ mod tests {
         invalid.graph.j.pop();
         invalid.graph.j.push(-1.0);
         validate(&invalid).unwrap();
+    }
+
+    /// A unit ring of `n` nodes, for the node-count routing tests.
+    fn unit_ring(n: usize) -> StreamJob {
+        StreamJob {
+            job_id: b"ring".to_vec(),
+            graph: IsingGraph::new(
+                vec![1.0; n],
+                vec![-1.0; n],
+                (0..n).map(|i| (i, (i + 1) % n)).collect(),
+            ),
+            params: SampleParams {
+                num_reads: 32,
+                num_sweeps: 32,
+                ..Default::default()
+            },
+            watermark: None,
+        }
+    }
+
+    #[test]
+    fn a_unit_job_past_the_unit_kernel_nodes_takes_the_batch_path() {
+        let mut large = unit_ring(sampler::kernel_max_nodes(Kernel::Msa) + 1);
+        validate(&large).unwrap();
+        let mut preparer = Preparer::default();
+        assert!(preparer
+            .prepare(&mut large, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
+        let mut fits = unit_ring(sampler::kernel_max_nodes(Kernel::Msa));
+        assert!(preparer
+            .prepare(&mut fits, CascadeSettings::default(), true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn validate_refuses_more_edges_than_advertised() {
+        let mut edges = unit_ring(1 << 20);
+        assert!(edges.graph.edges.len() > crate::DEFAULT_MAX_EDGES as usize);
+        assert_eq!(
+            validate(&edges).unwrap_err().to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        edges = unit_ring(crate::DEFAULT_MAX_EDGES as usize);
+        validate(&edges).unwrap();
+    }
+
+    #[test]
+    fn admit_batch_counts_the_slot_pools_against_usable_memory() {
+        let job = unit_ring(20_000);
+        let needed = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)
+            .unwrap()
+            .total(crate::capacity::instances(Kernel::Msa, 32));
+        admit_batch(&job, 0, needed).unwrap();
+        admit_batch(&job, 1_000, needed + 1_000).unwrap();
+        let refused = admit_batch(&job, 1_000, needed + 999).unwrap_err();
+        assert!(
+            matches!(&refused, SampleError::TooLarge(message) if message.contains("bytes usable")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        assert!(matches!(
+            admit_batch(&job, usize::MAX, usize::MAX - 1),
+            Err(SampleError::TooLarge(_))
+        ));
     }
 
     #[test]

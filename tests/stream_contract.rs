@@ -341,3 +341,132 @@ fn stream_width_matches_the_declared_width() {
         assert_eq!(sampler.stream_width(), expected, "{kernel:?}");
     });
 }
+
+/// Every log line any test of this binary emits, from every thread.
+static LOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Appends to [`LOG`].
+struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Route the INFO log of every thread to [`LOG`]. The resident runner logs
+/// on its preparation workers, so a thread-local subscriber misses it.
+fn capture_log() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(|| LogWriter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+    });
+}
+
+/// The Advantage2 System 1 working graph with couplings and fields of ±1
+/// drawn by a fixed xorshift stream: a unit model for the slot kernel.
+fn advantage2_unit() -> IsingGraph {
+    let edges: Vec<(usize, usize)> = include_str!("fixtures/advantage2-system1.edges")
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let mut it = l.split_whitespace().map(|t| t.parse::<usize>().unwrap());
+            (it.next().unwrap(), it.next().unwrap())
+        })
+        .collect();
+    let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut sign = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if x & 1 == 1 {
+            1.0
+        } else {
+            -1.0
+        }
+    };
+    let h = (0..4577).map(|_| sign()).collect();
+    let j = edges.iter().map(|_| sign()).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// A circulant graph of `n` nodes and degree 20 with milli-grid couplings
+/// and fields: a weighted model.
+fn weighted_circulant(n: usize) -> IsingGraph {
+    let couplings = [-1.3, 0.127, 2.0];
+    let fields = [-0.5, 0.0, 0.75];
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for i in 0..n {
+        for d in 1..=10 {
+            edges.push((i, (i + d) % n));
+            j.push(couplings[(i * 7 + d) % couplings.len()]);
+        }
+    }
+    let h = (0..n).map(|i| fields[i % fields.len()]).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// A weighted job of 20,000 nodes, past the 6,016 spin words the multi-spin
+/// kernel keeps in threadgroup memory, runs on the batch path's spill build
+/// in the same session as a unit job on the resident slots.
+#[test]
+fn a_spill_job_and_a_unit_job_share_a_session() {
+    capture_log();
+    let Some(sampler) = open(Kernel::Msa) else {
+        return;
+    };
+    let unit = advantage2_unit();
+    let spill = weighted_circulant(20_000);
+    let graphs = [("unit", &unit), ("spill", &spill)];
+    let jobs = graphs
+        .iter()
+        .zip(1u64..)
+        .map(|((id, graph), seed)| job(id, (*graph).clone(), params(32, 64, seed), None))
+        .collect();
+    let results = stream(&sampler, jobs, &CancelToken::default(), || {});
+    assert_eq!(results.len(), graphs.len());
+    for result in &results {
+        let id = id_of(result);
+        let graph = graphs
+            .iter()
+            .find(|(name, _)| *name == id)
+            .map(|(_, graph)| *graph)
+            .expect("a known job id");
+        let reads = match &result.outcome {
+            StreamOutcome::Completed(Ok(reads)) => reads,
+            StreamOutcome::Completed(Err(e)) => panic!("{id}: {e:?}"),
+            StreamOutcome::Cancelled => panic!("{id}: cancelled"),
+        };
+        assert_eq!(reads.len(), 32, "{id}");
+        for read in reads {
+            assert_eq!(read.spins.len(), graph.num_nodes(), "{id}");
+            assert_eq!(
+                read.energy_milli,
+                energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges),
+                "{id}: energy is not the host score"
+            );
+        }
+    }
+    let log = String::from_utf8_lossy(
+        &LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("cascade topology prepared") && line.contains("nodes=4577")),
+        "the unit job's cascade line is missing from the log:\n{log}"
+    );
+}
