@@ -11,7 +11,7 @@
 //!
 //! - [`Storage::Threadgroup`]: spin state lives in threadgroup memory. Only
 //!   models up to the kernel node cap fit, and multi-spin also needs degree
-//!   at most [`MSA_MAX_DEG`]. The sizes come from the buffers that
+//!   at most [`MSA_MAX_DEG`], or [`MSA_SPARSE_MAX_DEGREE`] for Float32. The sizes come from the buffers that
 //!   `sampler::encode_batch` allocates.
 //! - [`Storage::Spill`]: the threadgroup-tier buffers, plus a device buffer
 //!   for the spin state of the nodes past the threadgroup cap. This kernel
@@ -299,8 +299,15 @@ const fn node_cap(kernel: Kernel) -> usize {
 fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
     match storage {
         Storage::Threadgroup => {
+            // `sampler::msa_max_degree`: the float lane walks rows up to the
+            // sparse limit, the other lanes one chunk of MSA_MAX_DEG.
+            let msa_degree = if shape.precision == Precision::Float32 {
+                MSA_SPARSE_MAX_DEGREE
+            } else {
+                MSA_MAX_DEG
+            };
             shape.nodes <= node_cap(kernel)
-                && (kernel != Kernel::Msa || shape.max_degree <= MSA_MAX_DEG)
+                && (kernel != Kernel::Msa || shape.max_degree <= msa_degree)
         }
         Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEGREE,
         Storage::Dense => true,

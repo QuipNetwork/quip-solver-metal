@@ -1289,11 +1289,11 @@ mod tests {
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
-        // Off the milli grid: neither engine represents it.
+        // Off the milli grid: only the Metal float lane represents it.
         j.graph.j[0] = 0.0005;
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
         j.graph.j[0] = 1.0;
         j.params.num_reads = 129;
@@ -1344,12 +1344,13 @@ mod tests {
         };
         let mut facts = EdgeFactsCache::default();
         let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        let non_finite = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
         assert_eq!(
-            eligibility(Kernel::Msa, &off_step, &params, cfg, &mut facts),
+            eligibility(Kernel::Msa, &non_finite, &params, cfg, &mut facts),
             [false, false]
         );
-        // SA and Gibbs run an off-step model on their Float32 builds.
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        // Every kernel runs an off-step model on its Float32 build.
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             assert_eq!(
                 eligibility(kernel, &off_step, &params, cfg, &mut facts),
                 [true, false],

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! QUI-78 acceptance cases on Metal: exact or refused, never quantized. SA
-//! anneals a model off the milli grid in `f32` and scores it exactly on the host.
+//! QUI-78 acceptance cases on Metal: exact or refused, never quantized. Each
+//! kernel anneals a model off the milli grid in `f32` and the host scores it
+//! exactly.
 
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::SampleParams;
@@ -92,17 +93,14 @@ fn large_and_wide_range_coefficients_are_solved_or_refused() {
             "{kernel:?}"
         );
     }
-    // Past the wide bound, SA and Gibbs run their Float32 builds; MSA has
-    // none yet.
-    for kernel in [Kernel::Sa, Kernel::Gibbs] {
+    // Past the wide bound, every kernel runs its Float32 build.
+    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
         assert_eq!(
             best(&dev, &too_wide, kernel, 500),
             brute_force_min(&too_wide),
             "{kernel:?}"
         );
     }
-    let err = sample_ising(&dev, &too_wide, &params(16), Kernel::Msa).unwrap_err();
-    assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
 }
 
 #[test]
@@ -150,21 +148,15 @@ fn a_non_representable_model_is_refused_as_capacity() {
     let Some(dev) = device() else { return };
     let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
     let non_finite = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
-    for (graph, kernel) in [
-        (&off_step, Kernel::Msa),
-        (&non_finite, Kernel::Sa),
-        (&non_finite, Kernel::Gibbs),
-        (&non_finite, Kernel::Msa),
-    ] {
-        let err = sample_ising(&dev, graph, &params(16), kernel).unwrap_err();
+    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+        let err = sample_ising(&dev, &non_finite, &params(16), kernel).unwrap_err();
         assert!(
             matches!(err, SampleError::TooLarge(_)),
             "{kernel:?}: {err:?}"
         );
+        // Every kernel runs the off-step model on its Float32 build.
+        best(&dev, &off_step, kernel, 64);
     }
-    // SA and Gibbs run the off-step model on their Float32 builds.
-    best(&dev, &off_step, Kernel::Sa, 64);
-    best(&dev, &off_step, Kernel::Gibbs, 64);
 }
 
 #[test]

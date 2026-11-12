@@ -30,6 +30,16 @@ using namespace metal;
 // against a host-built integer threshold row (`wide_tables::metropolis_rows`),
 // so it holds any model whose local fields fit `WIDE_MAX_FIELD_MILLI`; the
 // host scores its energies.
+// The QUIP_FLOAT build of `msa_anneal_weighted` (the float lane, after
+// quip-solver-cuda's QUIP_MSA_COEF_F32 lane) reads `float` coefficients,
+// sums each lane's local field in `float`, and walks CSR rows of up to
+// MSA_FLOAT_MAX_DEG neighbours in chunks of MSA_MAX_DEG. Each lane draws its
+// own uniform: one xoshiro128** draw per word update, as in the int lane,
+// hashed with the lane index. A lane flips where its energy change `de` is
+// at most zero or `beta * de < -log(u)`, the log form of `u < exp(-beta de)`,
+// so no `exp` sees an infinite argument. It has no threshold rows, and the
+// host scores its energies. Only the batch path sends it models; the slot
+// entry runs unit models only.
 // The batch entry writes each read's energy on the last chunk;
 // slot steps write it at flagged checkpoints, in milli units to final_energies.
 // The value equals energy_milli whenever every
@@ -41,6 +51,9 @@ using namespace metal;
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
 #define MSA_MAX_DEG    20
+// Neighbours per spin the float lane walks, in chunks of MSA_MAX_DEG. Must
+// equal `capacity::MSA_SPARSE_MAX_DEGREE`, CUDA's MSA_MAX_DEG.
+#define MSA_FLOAT_MAX_DEG 62
 // Threshold entries per rung for the weighted entry. Must equal
 // `wide_tables::WIDE_ROW`.
 #define WIDE_ROW       2048
@@ -194,6 +207,14 @@ struct ScreenCouplings {
     }
 };
 
+#ifdef QUIP_FLOAT
+// One model per word with `float` couplings and fields (the float lane).
+struct WeightedCouplings {
+    device const float* j;
+    device const float* h;
+};
+typedef float weighted_coef_t;
+#else
 // One model per word with milli `int` couplings and fields, plus the
 // batch's Metropolis threshold rows: one row of WIDE_ROW milli thresholds
 // per rung, accepting an uphill change `de` when `de <= entry`.
@@ -202,6 +223,8 @@ struct WeightedCouplings {
     device const int* h;
     device const int* rows;
 };
+typedef int weighted_coef_t;
+#endif
 
 // Per-lane energy in milli of the spin words in `state` for the nodes this
 // thread owns (var = tid, tid + gsz, ...). h*spin*1000 per node plus one
@@ -362,6 +385,79 @@ inline uint flip_mask(
     return (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
 }
 
+#ifdef QUIP_FLOAT
+// The float lane's uniform for `lane`: a splitmix32 finaliser of the word
+// update's draw and the lane, so the 32 lanes draw independently (CUDA
+// 66d4b30: shared draws let real-valued replicas collapse into one minimum)
+// while the RNG stream advances once per word update. 23 bits keep
+// `k + 0.5f` exact, so u lies in (0, 1) (CUDA 02b5ac7).
+inline float lane_uniform(uint draw, int lane) {
+    uint z = (draw ^ uint(lane)) + 0x9e3779b9u;
+    z = (z ^ (z >> 16)) * 0x85ebca6bu;
+    z = (z ^ (z >> 13)) * 0xc2b2ae35u;
+    z ^= z >> 16;
+    return (float(z >> 9) + 0.5f) * 1.1920929e-7f;
+}
+
+// The float lane: each lane's local field sums `h` and then the CSR row in
+// order, in `float`. A lane with spin s flips where `s * field >= 0`
+// (`de = 2 s field <= 0`) or `two_beta * (s * field) < -log(u)`, which is
+// `beta * de < -log(u)` with one product of two finite values. The host
+// refuses a beta past half of f32::MAX, so `two_beta` is finite, and a
+// field whose `2 * field` overflows, so the product is never `inf * 0`.
+// The product may round to infinity, and an infinite product only rejects
+// (or, for a negative beta, accepts) the flip, as `exp` would.
+inline uint flip_mask(
+    WeightedCouplings couplings,
+    device const int* my_csr_row_ptr,
+    device const int* my_csr_col_ind,
+    threadgroup const uint* state,
+    int var, int beta_idx, float two_beta,
+    thread RngState& rng
+) {
+    int pstart = my_csr_row_ptr[var];
+    int pend = my_csr_row_ptr[var + 1];
+    float field[MSA_LANES];
+    float h = couplings.h[var];
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        field[lane] = h;
+    }
+    for (int base = pstart; base < pend; base += MSA_MAX_DEG) {
+        float jj[MSA_MAX_DEG];
+        uint sw[MSA_MAX_DEG];
+        #pragma unroll
+        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+            int p = base + q;
+            bool ok = p < pend;
+            jj[q] = ok ? couplings.j[p] : 0.0f;
+            sw[q] = state[ok ? my_csr_col_ind[p] : 0];
+        }
+        for (int lane = 0; lane < MSA_LANES; ++lane) {
+            float f = field[lane];
+            #pragma unroll
+            for (int q = 0; q < MSA_MAX_DEG; ++q) {
+                // Spin bit 1 is -1. Missing neighbours have J = 0.
+                f += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
+            }
+            field[lane] = f;
+        }
+    }
+    uint bi = state[var];
+    uint draw = xoshiro128starstar(rng);
+
+    uint accept = 0u;
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        // s * field, with s = -1 where bit 1 is set: de = -2 s field.
+        float uphill = ((bi >> uint(lane)) & 1u) ? field[lane] : -field[lane];
+        bool ok = uphill <= 0.0f;
+        if (!ok) {
+            ok = two_beta * uphill < -log(lane_uniform(draw, lane));
+        }
+        accept |= uint(ok) << uint(lane);
+    }
+    return accept;
+}
+#else
 // The weighted overload sums each lane's local field in milli and flips where
 // the energy change `de = -2 s field` is at most one threshold drawn from the
 // rung's row, shared by the word's 32 lanes as the unit draw is. Every entry
@@ -406,6 +502,7 @@ inline uint flip_mask(
     }
     return accept;
 }
+#endif
 
 // ==============================================================================
 // Kernel
@@ -658,11 +755,12 @@ kernel void msa_anneal(
 #ifndef QUIP_MSA_DIAGNOSTICS
 // `msa_anneal` for weighted models: buffers 2 and 15 hold milli `int`
 // coefficients and buffer 25 the Metropolis rows, [num_betas * WIDE_ROW].
+// The QUIP_FLOAT build reads `float` coefficients and binds no buffer 25.
 // Energies are left to the host.
 kernel void msa_anneal_weighted(
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
-    device const int* csr_J_vals [[buffer(2)]],
+    device const weighted_coef_t* csr_J_vals [[buffer(2)]],
     device const int* row_ptr_offsets [[buffer(3)]], // unused: the CSR structure is shared
     device const int* col_ind_offsets [[buffer(4)]],
 
@@ -680,7 +778,7 @@ kernel void msa_anneal_weighted(
     constant int& num_problems [[buffer(13)]],
     constant int& num_reads [[buffer(14)]],
 
-    device const int* csr_h_vals [[buffer(15)]],
+    device const weighted_coef_t* csr_h_vals [[buffer(15)]],
 
     device const int* color_block_starts [[buffer(16)]],
     device const int* color_block_counts [[buffer(17)]],
@@ -693,7 +791,9 @@ kernel void msa_anneal_weighted(
     constant int& beta_count [[buffer(22)]],
     device uint* persistent_state [[buffer(23)]],
     device uint* persistent_rng [[buffer(24)]],
+#ifndef QUIP_FLOAT
     device const int* wide_rows [[buffer(25)]],
+#endif
     threadgroup uint* state [[threadgroup(0)]],
 
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -711,8 +811,13 @@ kernel void msa_anneal_weighted(
     uint w = tg - problem_id * uint(words);
     int beta_end = min(beta_start + beta_count, num_betas);
     uint init_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u);
+#ifdef QUIP_FLOAT
+    WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
+                                &csr_h_vals[problem_id * uint(N)]};
+#else
     WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                                 &csr_h_vals[problem_id * uint(N)], wide_rows};
+#endif
     msa_body(csr_row_ptr, csr_col_ind, couplings, beta_schedule,
              &persistent_state[tg * uint(N)], &persistent_state[tg * uint(N)],
              &persistent_rng[(tg * gsz + tid) * 4], &persistent_rng[(tg * gsz + tid) * 4],

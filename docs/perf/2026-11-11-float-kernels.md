@@ -125,3 +125,77 @@ The int8 digests for SA, Gibbs, and MSA equal the digests that the SA section re
 ### Cost ratio
 
 Float32 Gibbs divided by int8 Gibbs is `0.6207 / 0.5024 = 1.2355`. Rounded up to one decimal, this sets `FLOAT_GIBBS_COST_FACTOR` to `1.3`. A Gibbs job takes about half a second on these jobs, so the ratio is less precise than the SA ratio. The Float32 SA ratio of 1.2446 agrees with it. The mean best energy of the Float32 jobs is not comparable with the int8 value, because every coefficient is 1.0005 times larger.
+
+## Multi-spin
+
+Float32 multi-spin annealing (MSA) takes 1.50 times the time of the weighted MSA lane per job on the same Advantage2 jobs. The weighted lane is the milli `int` build of `msa_anneal_weighted`. `FLOAT_MSA_COST_FACTOR` is 5.3: the measured ratio, 1.50, times `WEIGHTED_MSA_COST_FACTOR`, 3.5, rounded up to one decimal. Like `WEIGHTED_MSA_COST_FACTOR`, the factor is relative to the unit MSA kernel. The Float32 time is 5.05 times the unit time, so the factor is also larger than the direct ratio.
+
+The Float32 build is the `QUIP_FLOAT` build of `msa_anneal_weighted` in `kernels/msa.metal`. It has `float` coefficients, a `float` local field for each lane, and a separate uniform draw for each of the 32 lanes. It has no threshold rows.
+
+### Host and load
+
+The host was an Apple M4 Max with 16 logical CPUs and 128 GiB of memory. Other sessions were active on the host, so other GPU and CPU work possibly ran during the timed runs.
+
+Each script runs the unit, weighted, and Float32 jobs in sequence. `uptime` immediately before each timed run reported:
+
+| Run | Uptime output |
+| --- | --- |
+| Unit ±1, first run | `19:09  up 20 days,  5:16, 5 users, load averages: 10.90 7.97 9.75` |
+| Weighted ±1.5, first run | `19:09  up 20 days,  5:16, 5 users, load averages: 10.90 7.97 9.75` |
+| Float32 ±1.0005, first run | `19:09  up 20 days,  5:16, 5 users, load averages: 10.35 7.90 9.71` |
+| Unit ±1, second run | `19:10  up 20 days,  5:16, 5 users, load averages: 8.34 7.60 9.56` |
+| Weighted ±1.5, second run | `19:10  up 20 days,  5:16, 5 users, load averages: 7.83 7.50 9.52` |
+| Float32 ±1.0005, second run | `19:10  up 20 days,  5:16, 5 users, load averages: 7.36 7.41 9.47` |
+
+The load averages before the weighted and the Float32 runs differ by less than 0.6 in each script.
+
+### Commands and method
+
+The working tree was `4f0aabf` with this change applied. The method is the method of the Simulated annealing section, with one addition. `QUIP_PM1_KERNEL=Msa` runs only the MSA kernel. `QUIP_PM1_SCALE=wide` multiplies every coefficient by 1.5, so the jobs run on the weighted lane. `QUIP_PM1_SCALE=float` multiplies every coefficient by 1.0005, so the jobs run on the Float32 build.
+
+```sh
+cargo test --release --test pm1_rates --no-run
+uptime
+QUIP_PM1_KERNEL=Msa cargo test --release --test pm1_rates -- --ignored --nocapture pm1_rates
+uptime
+QUIP_PM1_SCALE=wide QUIP_PM1_KERNEL=Msa cargo test --release --test pm1_rates -- --ignored --nocapture pm1_rates
+uptime
+QUIP_PM1_SCALE=float QUIP_PM1_KERNEL=Msa cargo test --release --test pm1_rates -- --ignored --nocapture pm1_rates
+```
+
+The script ran twice in sequence.
+
+### Raw measurements
+
+First run:
+
+```json
+{"kernel":"Msa","scale":1,"median_s":0.1585,"mean_best_milli":-14961000.0,"digest":"6ec8d35ff7c9f123"}
+{"kernel":"Msa","scale":1.5,"median_s":0.5337,"mean_best_milli":-22436250.0,"digest":"4ee84dd42f5d5ade"}
+{"kernel":"Msa","scale":1.0005,"median_s":0.8007,"mean_best_milli":-14971206.2,"digest":"c103cce43c429e4b"}
+```
+
+Second run:
+
+```json
+{"kernel":"Msa","scale":1,"median_s":0.1585,"mean_best_milli":-14961000.0,"digest":"6ec8d35ff7c9f123"}
+{"kernel":"Msa","scale":1.5,"median_s":0.5342,"mean_best_milli":-22436250.0,"digest":"4ee84dd42f5d5ade"}
+{"kernel":"Msa","scale":1.0005,"median_s":0.8008,"mean_best_milli":-14971206.2,"digest":"c103cce43c429e4b"}
+```
+
+### Identical unit and weighted reads
+
+The same script ran at `4f0aabf` before the kernel change, with only the `QUIP_PM1_KERNEL` filter added to `tests/pm1_rates.rs`. The load average before its unit run was 8.11. The Float32 run failed there, because the MSA kernel then had no Float32 build.
+
+```json
+{"kernel":"Msa","scale":1,"median_s":0.1586,"mean_best_milli":-14961000.0,"digest":"6ec8d35ff7c9f123"}
+{"kernel":"Msa","scale":1.5,"median_s":0.5334,"mean_best_milli":-22436250.0,"digest":"4ee84dd42f5d5ade"}
+```
+
+The unit digest `6ec8d35ff7c9f123` and the weighted digest `4ee84dd42f5d5ade` are the same before and after the change. The unit digest also equals the MSA digest of the Simulated annealing section. The two Float32 runs have the same digest, `c103cce43c429e4b`.
+
+### Cost ratio
+
+Float32 MSA divided by weighted MSA is `0.8007 / 0.5337 = 1.5003` in the first run and `0.8008 / 0.5342 = 1.4991` in the second run. The factor is `1.5 * 3.5 = 5.25`, rounded up to `5.3`. Both times are wall time and include the host scoring of every read, because neither lane writes device energies.
+
+The Float32 lane costs more than the weighted lane for two reasons. It takes a logarithm for each lane that moves uphill, where the weighted lane reads one threshold for the whole word. It also keeps 32 `float` fields while it walks the row in chunks of 20 neighbours. The mean best energy of the Float32 jobs is not comparable with the other values, because every coefficient is 1.0005 times larger.

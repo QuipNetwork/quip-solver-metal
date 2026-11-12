@@ -95,6 +95,9 @@ pub struct MetalDevice {
     /// `msa` for weighted models: milli `int` coefficients and host-built
     /// Metropolis threshold rows at slot 25.
     pub(crate) msa_weighted: ComputePipelineState,
+    /// `msa_weighted` for Float32 models: `float` coefficients and a
+    /// per-lane `float` Metropolis test, no threshold rows.
+    pub(crate) msa_float: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -159,6 +162,7 @@ impl MetalDevice {
             compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
+        let msa_float = compile_pipeline(&device, &float(MSA_SRC), "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -180,6 +184,7 @@ impl MetalDevice {
             gibbs_parallel_float,
             msa,
             msa_weighted,
+            msa_float,
             msa_slots,
             msa_screen,
             msa_frustration_draw,
@@ -299,6 +304,7 @@ mod tests {
             ("gibbs_parallel_wide", &dev.gibbs_parallel_wide),
             ("gibbs_parallel_float", &dev.gibbs_parallel_float),
             ("msa_weighted", &dev.msa_weighted),
+            ("msa_float", &dev.msa_float),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");
@@ -347,12 +353,19 @@ mod tests {
             return;
         }
         let dev = MetalDevice::open(0).unwrap();
-        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
+        for pipeline in [
+            &dev.msa,
+            &dev.msa_weighted,
+            &dev.msa_float,
+            &dev.msa_slots,
+            &dev.msa_screen,
+        ] {
             assert!(pipeline.static_threadgroup_memory_length() as usize <= 32 * 4 + 16);
         }
     }
 
     #[test]
+    #[expect(clippy::print_stderr, reason = "report multi-spin pipeline limits")]
     fn msa_pipeline_compiles_and_admits_at_least_256_threads() {
         if MetalDevice::device_count() == 0 {
             return;
@@ -360,7 +373,18 @@ mod tests {
         let dev = MetalDevice::open(0).unwrap();
         // The host requests 1,024 threads per multi-spin threadgroup and clamps
         // to the pipeline maximum. Require support for at least 256 threads.
-        for pipeline in [&dev.msa, &dev.msa_slots, &dev.msa_screen] {
+        for pipeline in [
+            &dev.msa,
+            &dev.msa_weighted,
+            &dev.msa_float,
+            &dev.msa_slots,
+            &dev.msa_screen,
+        ] {
+            eprintln!(
+                "msa pipeline: max threads {}, static tg bytes {}",
+                pipeline.max_total_threads_per_threadgroup(),
+                pipeline.static_threadgroup_memory_length()
+            );
             assert!(pipeline.max_total_threads_per_threadgroup() >= 256);
             // Static threadgroup lane totals must leave room for the
             // largest advertised N at 4 bytes per spin under the 32 KB cap.

@@ -3,6 +3,7 @@
 
 //! Real-valued models on the Float32 kernels. Each case is a helper that takes
 //! the kernel, and each kernel module calls the helpers under the case names.
+//! Every read count is a multiple of 32, a whole number of multi-spin words.
 //!
 //! Metal GPU tests: each case returns early when the host has no Metal device.
 
@@ -251,5 +252,34 @@ mod gibbs {
     #[test]
     fn chunked_and_unchunked_real_anneals_match() {
         super::chunked_and_unchunked_real_anneals_match(Kernel::Gibbs);
+    }
+}
+
+mod msa {
+    use super::Kernel;
+
+    #[test]
+    fn a_real_model_returns_exact_energies() {
+        super::a_real_model_returns_exact_energies(Kernel::Msa);
+    }
+
+    #[test]
+    fn portfolio_models_reach_their_ground_states() {
+        super::portfolio_models_reach_their_ground_states(Kernel::Msa);
+    }
+
+    #[test]
+    fn a_model_whose_schedule_overflows_f32_is_refused() {
+        super::a_model_whose_schedule_overflows_f32_is_refused(Kernel::Msa);
+    }
+
+    #[test]
+    fn a_schedule_past_half_f32_max_is_refused() {
+        super::a_schedule_past_half_f32_max_is_refused(Kernel::Msa);
+    }
+
+    #[test]
+    fn chunked_and_unchunked_real_anneals_match() {
+        super::chunked_and_unchunked_real_anneals_match(Kernel::Msa);
     }
 }

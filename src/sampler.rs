@@ -173,6 +173,10 @@ const FLOAT_SA_COST_FACTOR: f64 = 1.3;
 /// Float32 Gibbs work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-11-11-float-kernels.md`.
 const FLOAT_GIBBS_COST_FACTOR: f64 = 1.3;
+/// Float32 MSA work per word update for chunk sizing, measured in
+/// `docs/perf/2026-11-11-float-kernels.md`: 1.5 times the weighted lane's
+/// [`WEIGHTED_MSA_COST_FACTOR`], rounded up.
+const FLOAT_MSA_COST_FACTOR: f64 = 5.3;
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -205,6 +209,17 @@ const _: () = assert!(
 /// Zephyr (Advantage2) is degree 20. A nonzero field is a 21st input, which
 /// the kernel's `popcount21` covers.
 pub(crate) const MSA_MAX_DEG: usize = 20;
+
+/// Largest CSR degree the multi-spin kernel admits for a model of `rep`.
+/// The Float32 lane walks a row in chunks of [`MSA_MAX_DEG`] up to
+/// `MSA_FLOAT_MAX_DEG` in `kernels/msa.metal`, CUDA's sparse limit; the unit
+/// and milli lanes unroll one chunk.
+pub(crate) const fn msa_max_degree(rep: Representation) -> usize {
+    match rep {
+        Representation::Float32 => crate::capacity::MSA_SPARSE_MAX_DEGREE,
+        Representation::Binary | Representation::Int8 | Representation::Wide => MSA_MAX_DEG,
+    }
+}
 
 /// Largest `num_sweeps` a dispatch accepts.
 ///
@@ -1044,8 +1059,7 @@ pub(crate) fn sa_tier(rep: Representation, kernel: Kernel) -> Representation {
 /// `encode_batch_inner`, and its coefficient upload in `upload_inputs`.
 pub(crate) fn has_float32_kernel(kernel: Kernel) -> bool {
     match kernel {
-        Kernel::Sa | Kernel::Gibbs => true,
-        Kernel::Msa => false,
+        Kernel::Sa | Kernel::Gibbs | Kernel::Msa => true,
     }
 }
 
@@ -1191,18 +1205,6 @@ fn validate_batch_within<'a>(
             "graph N={n} exceeds {kernel:?} kernel limit {cap}"
         )));
     }
-    if kernel == Kernel::Msa {
-        // The kernel unrolls a fixed 20-neighbour prefetch; a denser node
-        // would read past it. Capacity, not a driver fault: the coordinator
-        // routes the job to a backend that walks CSR rows of any length.
-        let max_deg = max_csr_degree(first);
-        if max_deg > MSA_MAX_DEG {
-            return Err(SampleError::TooLarge(format!(
-                "graph max degree {max_deg} exceeds the multi-spin kernel's \
-                 {MSA_MAX_DEG}-neighbour budget"
-            )));
-        }
-    }
     if params.num_sweeps > MAX_SWEEPS {
         // No defense in depth here: nothing upstream bounds `num_sweeps` at
         // all (see `MAX_SWEEPS`), so this is the only gate between a hostile
@@ -1213,6 +1215,21 @@ fn validate_batch_within<'a>(
         )));
     }
     let rep = batch_representation(graphs, kernel)?;
+    if kernel == Kernel::Msa {
+        // The unit and milli lanes unroll a fixed 20-neighbour prefetch, and
+        // the float lane walks at most `msa_max_degree` neighbours; a denser
+        // node would read past them. Capacity, not a driver fault: the
+        // coordinator routes the job to a backend that walks CSR rows of any
+        // length.
+        let max_deg = max_csr_degree(first);
+        let budget = msa_max_degree(rep);
+        if max_deg > budget {
+            return Err(SampleError::TooLarge(format!(
+                "graph max degree {max_deg} exceeds the multi-spin kernel's \
+                 {budget}-neighbour budget"
+            )));
+        }
+    }
     admit_footprint(first, params, kernel, rep, limits)?;
     Ok((first, n, rep))
 }
@@ -1327,10 +1344,17 @@ fn upload_inputs(
                 all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
                 all_h[p * n..p * n + h_f32.len()].copy_from_slice(&h_f32);
             }
-            (
-                checked_buffer(device.new_buffer_from_slice(&all_j))?,
-                checked_buffer(device.new_buffer_from_slice(&all_h))?,
-            )
+            if kernel == Kernel::Msa {
+                (
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_j)?,
+                    pooled_from_slice(&device.buffer_pool, &device.device, &all_h)?,
+                )
+            } else {
+                (
+                    checked_buffer(device.new_buffer_from_slice(&all_j))?,
+                    checked_buffer(device.new_buffer_from_slice(&all_h))?,
+                )
+            }
         }
         Representation::Binary | Representation::Int8 => {
             let mut all_j = vec![0i8; num_problems * nnz_alloc];
@@ -1447,7 +1471,9 @@ fn new_gibbs_persistent(
 
 /// Multi-spin carry-over state: one `uint` word per (threadgroup, spin) plus
 /// one xoshiro128** stream (four `uint`) per (threadgroup, thread). Only spin
-/// words and RNG streams persist across a chunk boundary.
+/// words and RNG streams persist across a chunk boundary, so the sizes do not
+/// depend on the coefficient width: the int8, milli, and float lanes share
+/// them.
 fn new_msa_persistent(
     pool: &BufferPool,
     device: &metal::DeviceRef,
@@ -1608,6 +1634,7 @@ fn encode_batch_inner(
         Kernel::Sa if float => &device.sa_float,
         Kernel::Sa => &device.sa,
         Kernel::Msa if wide => &device.msa_weighted,
+        Kernel::Msa if float => &device.msa_float,
         Kernel::Msa => &device.msa,
         Kernel::Gibbs if node_parallel && wide => &device.gibbs_parallel_wide,
         Kernel::Gibbs if node_parallel && float => &device.gibbs_parallel_float,
@@ -1703,9 +1730,8 @@ fn encode_batch_inner(
         (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
         (Representation::Float32, Kernel::Gibbs) => FLOAT_GIBBS_COST_FACTOR,
-        // `kernel_representation` refuses Float32 on MSA.
-        (Representation::Float32, Kernel::Msa)
-        | (Representation::Binary | Representation::Int8, _) => 1.0,
+        (Representation::Float32, Kernel::Msa) => FLOAT_MSA_COST_FACTOR,
+        (Representation::Binary | Representation::Int8, _) => 1.0,
     };
     let plan = match plan_override {
         Some(p) => p.to_vec(),
@@ -1782,9 +1808,10 @@ fn encode_batch_inner(
     let colors = cached.colors.clone();
     let num_colors = cached.topo.colors.num_colors;
     Ok(EncodedBatch {
-        // The weighted entry leaves energies to the host.
+        // The weighted entry and its float lane leave energies to the host.
         device_energy: kernel == Kernel::Msa
             && !wide
+            && !float
             && graphs.iter().all(|g| device_energy_exact(g)),
         cmds: Vec::with_capacity(plan.len()),
         d_samples: out.samples.clone(),
@@ -2488,19 +2515,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_batch_refuses_float32_models_without_a_float_build() {
+    fn validate_batch_runs_float32_models_on_every_kernel() {
         let params = SampleParams {
             num_reads: 32,
             num_sweeps: 8,
             ..Default::default()
         };
         let off_grid = IsingGraph::new(vec![0.1 + 0.2, 0.0], vec![1.0], vec![(0, 1)]);
-        let err = validate_batch(&[&off_grid], &params, Kernel::Msa).unwrap_err();
-        assert!(
-            matches!(&err, SampleError::TooLarge(m) if m.contains("Float32")),
-            "{err:?}"
-        );
-        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             let (_, _, rep) = validate_batch(&[&off_grid], &params, kernel).unwrap();
             assert_eq!(rep, Representation::Float32, "{kernel:?}");
         }
@@ -2673,6 +2695,30 @@ mod tests {
     fn validate_batch_accepts_msa_degree_at_the_budget() {
         let g = star(MSA_MAX_DEG);
         validate_batch(&[&g], &params(64), Kernel::Msa).unwrap();
+    }
+
+    #[test]
+    fn the_float_lane_admits_msa_degree_up_to_the_sparse_limit() {
+        let scaled = |leaves: usize, j: f64| {
+            let edges: Vec<(usize, usize)> = (1..=leaves).map(|i| (0, i)).collect();
+            IsingGraph::new(vec![0.0; leaves + 1], vec![j; leaves], edges)
+        };
+        let budget = crate::capacity::MSA_SPARSE_MAX_DEGREE;
+        let (_, _, rep) =
+            validate_batch(&[&scaled(budget, 0.0005)], &params(64), Kernel::Msa).unwrap();
+        assert_eq!(rep, Representation::Float32);
+        let msg = too_large_msg(
+            validate_batch(&[&scaled(budget + 1, 0.0005)], &params(64), Kernel::Msa).unwrap_err(),
+        );
+        assert!(msg.contains(&format!("degree {}", budget + 1)), "{msg}");
+        // A milli model keeps the one-chunk budget of the int lane.
+        let msg = too_large_msg(
+            validate_batch(&[&scaled(MSA_MAX_DEG + 1, 1.5)], &params(64), Kernel::Msa).unwrap_err(),
+        );
+        assert!(
+            msg.contains(&format!("degree {}", MSA_MAX_DEG + 1)),
+            "{msg}"
+        );
     }
 
     #[test]

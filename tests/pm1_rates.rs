@@ -12,6 +12,7 @@
 //! run on the wide SA and Gibbs paths and the weighted MSA path, for the cost
 //! factors in `sampler.rs`. `QUIP_PM1_SCALE=float` multiplies by 1.0005, off
 //! the milli grid, so the jobs run on the kernels with a Float32 build.
+//! `QUIP_PM1_KERNEL=Msa` (or `Sa`, `Gibbs`) runs only that kernel.
 
 use std::io::{self, Write};
 use std::time::Instant;
@@ -80,11 +81,15 @@ fn pm1_rates() {
     let dev = MetalDevice::open(0).unwrap();
     let (scale, kernels): (f64, &[Kernel]) = match std::env::var("QUIP_PM1_SCALE").as_deref() {
         Ok("wide") => (1.5, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
-        Ok("float") => (1.0005, &[Kernel::Sa, Kernel::Gibbs]),
+        Ok("float") => (1.0005, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
         _ => (1.0, &[Kernel::Sa, Kernel::Gibbs, Kernel::Msa]),
     };
+    let only = std::env::var("QUIP_PM1_KERNEL").ok();
     let edges = edges();
     for &kernel in kernels {
+        if only.as_deref().is_some_and(|k| k != format!("{kernel:?}")) {
+            continue;
+        }
         let params = SampleParams {
             num_reads: 64,
             num_sweeps: 4096,
