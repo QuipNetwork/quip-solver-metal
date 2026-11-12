@@ -422,6 +422,32 @@ async fn degree_sixty_three_lease_returns_capacity_without_faulting() {
     refused_lease_then_ring_lease(&mut s, b"degree-63").await;
 }
 
+/// A hub of degree 63 without a repeated coupler runs on dense-matrix
+/// storage, so every salt of the lease runs and wins an i64::MAX target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_degree_sixty_three_lease_runs_dense() {
+    let mut s = Session::start(&msa(), 4, "").await;
+    let (mut topology, _) = ring(64, RING_A);
+    topology.edges = Some(EdgeList {
+        u: vec![0; 63],
+        v: (1..64).collect(),
+    });
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    s.send(coord_msg::Msg::Job(lease(b"degree-63", 3, RING_A, 0, 8)))
+        .await;
+    s.until("degree-63 lease done", LONG, |log| {
+        log.done(b"degree-63").is_some()
+    })
+    .await;
+    assert_eq!(s.log.done(b"degree-63").expect("LeaseDone").salts_done, 8);
+    assert_eq!(s.log.results_for(b"degree-63").len(), 8);
+    assert!(s.log.rejects.is_empty(), "{:?}", s.log.rejects);
+    assert_eq!(s.shutdown(2_000).await, 0);
+    assert!(s.log.fatal.is_none());
+}
+
 /// A model of 5,000 nodes passes the node limit, and its degree-63 hub runs
 /// only on dense-matrix storage, where one sweep of 5,000 * 5,000 columns is
 /// estimated past the one-sweep limit. The lease closes with a refund and

@@ -766,9 +766,10 @@ impl Preparer {
             && crate::representation::classify_msa(&job.graph)
                 == Ok(crate::representation::Representation::Binary);
         if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
-            // One problem: the batch path runs this job alone and checks its
-            // one-sweep limit again in `encode_batch`.
-            sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+            // One problem: the batch path runs this job alone, on the tier
+            // the capacity model routes it to, and checks its one-sweep
+            // limit again in `encode_batch`.
+            sampler::admit_one(&job.graph, &job.params, Kernel::Msa)?;
             return Ok(None);
         }
         let lookup = |cached: Option<&Arc<PreparedTopology>>| {
@@ -792,7 +793,7 @@ impl Preparer {
                     Some(hit) => hit,
                     None => {
                         // Degree depends only on nodes and ordered edges. The cache is
-                        // established only after validate_batch, and coefficient filling
+                        // established only after admit_one, and coefficient filling
                         // checks exact topology equality on every hit. Recounting degree
                         // would allocate and walk the same 41,515 edges on every job.
                         // This checks the one-sweep limit for one problem, while a
@@ -800,8 +801,7 @@ impl Preparer {
                         // That is safe only because the unit lane (6,016 nodes or
                         // fewer, degree 20 or less) estimates a full pool at 1.7 ms
                         // or less. A larger lane needs the pool's real problems.
-                        let (_, _, rep) =
-                            sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                        let rep = sampler::admit_one(&job.graph, &job.params, Kernel::Msa)?;
                         // A unit model denser than the unit kernel's rows runs on the
                         // weighted lane, which only the batch path has. Its topology is
                         // never cached, so a cache hit is always a unit-lane topology.
@@ -3889,17 +3889,22 @@ mod tests {
         let mut input = job(0, 32);
         preparer.prepare(&mut input, settings, true).unwrap();
         // A unit model past the unit kernel's degree takes the batch path's
-        // weighted lane; past the weighted lane's degree it is capacity.
-        input.graph.edges = (1..=sampler::MSA_UNIT_MAX_DEG + 1)
+        // weighted lane, and past the weighted lane's degree its dense-matrix
+        // build. With a repeated coupler no tier admits it: capacity.
+        for leaves in [
+            sampler::MSA_UNIT_MAX_DEG + 1,
+            sampler::MSA_SPARSE_MAX_DEG + 1,
+        ] {
+            input.graph.edges = (1..=leaves).map(|v| (0, v)).collect();
+            input.graph.j = vec![1.0; input.graph.edges.len()];
+            assert!(preparer
+                .prepare(&mut input, settings, true)
+                .unwrap()
+                .is_none());
+        }
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG)
             .map(|v| (0, v))
-            .collect();
-        input.graph.j = vec![1.0; input.graph.edges.len()];
-        assert!(preparer
-            .prepare(&mut input, settings, true)
-            .unwrap()
-            .is_none());
-        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG + 1)
-            .map(|v| (0, v))
+            .chain(std::iter::once((0, 1)))
             .collect();
         input.graph.j = vec![1.0; input.graph.edges.len()];
         assert!(matches!(
@@ -4291,10 +4296,20 @@ mod tests {
             .unwrap()
             .is_none());
         input.params.num_sweeps = 64;
+        // Past the weighted lane's degree, the batch path runs a star on
+        // dense-matrix storage. A repeated coupler leaves it no tier.
         input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG + 1)
             .map(|v| (0, v))
             .collect();
         input.graph.j = vec![0.5; input.graph.edges.len()];
+        assert!(preparer
+            .prepare(&mut input, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG)
+            .map(|v| (0, v))
+            .chain(std::iter::once((0, 1)))
+            .collect();
         assert!(matches!(
             preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))

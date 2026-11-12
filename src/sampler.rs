@@ -529,13 +529,16 @@ fn check_one_sweep(shape: &SweepShape) -> Result<(), SampleError> {
     )))
 }
 
-/// The most problems of `graph` that one batch of the CSR gates may hold,
-/// at most `max` and at least 1, so that [`one_sweep_ms`] of the whole batch
-/// with `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`]. The stream
-/// caps its batches with it, so a batch is never refused when its jobs pass
-/// alone. `None` when one problem of `graph` fails with `in_flight` batches:
-/// the stream then runs it as the only batch on the GPU, where the admission
-/// applies the rule of [`sample_ising`].
+/// The most problems of `graph` that one stream batch may hold, at most
+/// `max` and at least 1, so that [`one_sweep_ms`] of the whole batch with
+/// `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`]. The stream caps
+/// its batches with it, so a batch is never refused when its jobs pass
+/// alone. `None` when one problem of `graph` fails with `in_flight` batches,
+/// or when the capacity model routes `graph` to dense-matrix storage: the
+/// stream then runs it as the only batch on the GPU, where the admission
+/// applies the rule of [`sample_ising`]. The dense-matrix estimate covers
+/// one problem with nothing else on the GPU, the only shape it was measured
+/// at.
 pub(crate) fn one_sweep_problem_cap(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -551,11 +554,14 @@ pub(crate) fn one_sweep_problem_cap(
         host_device_limits(),
         true,
         None,
-        DenseMode::Off,
+        DenseMode::Auto,
         in_flight,
     ) else {
         return None;
     };
+    if batch.storage == Storage::Dense {
+        return None;
+    }
     let fits = |problems: usize| {
         one_sweep_ms(&SweepShape {
             kernel,
@@ -1888,6 +1894,33 @@ pub(crate) fn validate_batch<'a>(
     .map(|batch| (batch.first, batch.n, batch.rep))
 }
 
+/// The session admission of one problem of `graph`: the tier the capacity
+/// model routes it to, dense-matrix storage included, and the one-sweep
+/// limit with one batch in flight, as the batch path that runs it applies
+/// them. Returns the coefficient representation the batch path runs.
+///
+/// # Errors
+///
+/// [`SampleError::TooLarge`] when the capacity model or the one-sweep limit
+/// refuses the model.
+pub(crate) fn admit_one(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+) -> Result<Representation, SampleError> {
+    validate_batch_within(
+        &[graph],
+        params,
+        kernel,
+        host_device_limits(),
+        false,
+        None,
+        DenseMode::Auto,
+        1,
+    )
+    .map(|batch| batch.rep)
+}
+
 /// A batch [`validate_batch_within`] admits.
 #[derive(Debug)]
 struct ValidBatch<'a> {
@@ -1911,10 +1944,11 @@ struct ValidBatch<'a> {
 /// Whether a batch may take dense-matrix storage ([`Storage::Dense`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DenseMode {
-    /// CSR storage only: the resident, streaming, and slot gates, whose
-    /// paths run no dense kernel.
+    /// CSR storage only: the slot gate, whose unit lane runs no dense
+    /// kernel.
     Off,
-    /// The tier the capacity model routes the batch to (the batch path).
+    /// The tier the capacity model routes the batch to: the batch path, the
+    /// stream, and the resident fallback.
     Auto,
     /// Dense storage, refusing a model that is not a dense candidate
     /// ([`Tuning::force_dense`]).
@@ -2111,9 +2145,9 @@ fn model_shape(
     }
 }
 
-/// The footprint `encode_batch` admits `graph` at, for tests of the storage
-/// choice: a wide model whose coefficients fit `i8` after division by their
-/// gcd counts one byte per coefficient.
+/// The footprint `encode_batch` admits `graph` at, on the tier the capacity
+/// model routes it to: a wide model whose coefficients fit `i8` after
+/// division by their gcd counts one byte per coefficient.
 ///
 /// # Errors
 ///
@@ -2134,12 +2168,11 @@ pub fn model_footprint(
     // A model past the default `K` runs the spill build on `int` storage.
     let past_k = kernel == Kernel::Msa && graph.num_nodes() > MSA_MAX_NODES;
     let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows && !past_k);
-    // The resident gate runs CSR storage only.
-    crate::capacity::footprint_in(
+    crate::capacity::routed_runnable_footprint(
         kernel,
+        graph,
         &model_shape(graph, params, rep, i8_scale.is_some()),
         host_device_limits(),
-        &[Storage::Threadgroup, Storage::Spill],
     )
     .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model: {e}")))
 }
@@ -2619,6 +2652,8 @@ fn bind_sa_chunk(
 }
 
 /// Build one batch's device buffers and plan its chunks. Does **not** commit.
+/// The batch takes the tier the capacity model routes it to, dense-matrix
+/// storage included ([`DenseMode::Auto`]).
 ///
 /// `graphs` must be non-empty and share a topology (same `N` and `edges`) — the
 /// caller ([`crate::streaming`]) guarantees this by batch key; the topology is
@@ -2656,7 +2691,7 @@ fn encode_batch_inner(
         beta_override,
         true,
         Tuning::default(),
-        DenseMode::Off,
+        DenseMode::Auto,
     )
 }
 
@@ -4679,7 +4714,7 @@ mod tests {
                 host_device_limits(),
                 true,
                 None,
-                DenseMode::Off,
+                DenseMode::Auto,
                 2,
             )
         };
@@ -4691,6 +4726,38 @@ mod tests {
         );
         // The cap never reaches 0.
         assert_eq!(one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 0), Some(1));
+    }
+
+    /// A model the capacity model routes to dense-matrix storage runs as
+    /// the only batch on the GPU, one problem, as `sample_ising` runs it:
+    /// the dense one-sweep estimate covers that shape alone.
+    #[test]
+    fn the_stream_runs_a_dense_job_as_the_only_batch() {
+        let p = SampleParams {
+            num_reads: 64,
+            num_sweeps: 16,
+            ..Default::default()
+        };
+        let graph = complete_int32(1_000);
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let alone = validate_batch_within(
+                &[&graph],
+                &p,
+                kernel,
+                host_device_limits(),
+                true,
+                None,
+                DenseMode::Auto,
+                1,
+            )
+            .unwrap();
+            assert_eq!(alone.storage, Storage::Dense, "{kernel:?}");
+            assert_eq!(
+                one_sweep_problem_cap(&graph, &p, kernel, 2, 240),
+                None,
+                "{kernel:?}"
+            );
+        }
     }
 
     /// The three outcomes of the stream's cap for one Gibbs job of 256

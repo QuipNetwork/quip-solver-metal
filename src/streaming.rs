@@ -1478,12 +1478,16 @@ mod tests {
         let device = MetalDevice::open(0).unwrap();
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
-        // Past the weighted lane's 62 neighbours, so capacity on MSA.
-        let leaves = crate::sampler::MSA_SPARSE_MAX_DEG + 1;
+        // Past the weighted lane's 62 neighbours, and a repeated coupler
+        // keeps it off dense-matrix storage, so capacity on MSA.
+        let leaves = crate::sampler::MSA_SPARSE_MAX_DEG;
         let star = IsingGraph::new(
             vec![0.0; leaves + 1],
-            vec![1.0; leaves],
-            (1..=leaves).map(|leaf| (0, leaf)).collect(),
+            vec![1.0; leaves + 1],
+            (1..=leaves)
+                .map(|leaf| (0, leaf))
+                .chain(std::iter::once((0, 1)))
+                .collect(),
         );
         job_tx.blocking_send(job(b"star", star, 64, 32, 1)).unwrap();
         job_tx

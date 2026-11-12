@@ -272,6 +272,71 @@ fn alternating_int8_and_wide_jobs_keep_exact_scores_and_wide_samples() {
     }
 }
 
+/// A complete model of `n` nodes on the Int32 grid: couplings and fields
+/// of three milli magnitudes with alternating signs.
+fn complete_int32(n: usize) -> IsingGraph {
+    const COUPLINGS: [f64; 3] = [1.3, 0.127, 2.0];
+    const FIELDS: [f64; 3] = [0.5, 0.0, 0.75];
+    let sign = |k: usize| if k.is_multiple_of(2) { 1.0 } else { -1.0 };
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for u in 0..n {
+        for v in u + 1..n {
+            let k = u * 13 + v * 5;
+            edges.push((u, v));
+            j.push(sign(k) * COUPLINGS[(k / 2) % 3]);
+        }
+    }
+    let h = (0..n).map(|i| sign(i) * FIELDS[(i / 2) % 3]).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// A complete Int32 model of 1,000 nodes is inside the capacity limits on
+/// dense-matrix storage. The stream runs it as `sample_ising` does: two
+/// jobs of the same topology each return the reads of `sample_ising` with
+/// their seed, every one scored exactly.
+#[test]
+fn a_complete_model_runs_dense_in_the_stream() {
+    let graph = complete_int32(1_000);
+    each_kernel(|kernel| {
+        let Some(sampler) = open(kernel) else { return };
+        let jobs = (0..2)
+            .map(|i| {
+                job(
+                    &format!("dense-{i}"),
+                    graph.clone(),
+                    params(64, 64, i + 41),
+                    None,
+                )
+            })
+            .collect();
+        let results = stream(&sampler, jobs, &CancelToken::default(), || {});
+        assert_eq!(results.len(), 2, "{kernel:?}");
+        let dev = MetalDevice::open(0).unwrap();
+        for result in results {
+            let id = id_of(&result);
+            let seed: u64 = id.strip_prefix("dense-").unwrap().parse().unwrap();
+            let reads = match result.outcome {
+                StreamOutcome::Completed(Ok(reads)) => reads,
+                StreamOutcome::Completed(Err(error)) => {
+                    panic!("{kernel:?}: {id} failed: {error:?}")
+                }
+                StreamOutcome::Cancelled => panic!("{kernel:?}: {id} cancelled"),
+            };
+            assert_eq!(reads.len(), 64, "{kernel:?}: {id}");
+            for read in &reads {
+                assert_eq!(
+                    read.energy_milli,
+                    energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges),
+                    "{kernel:?}: {id}"
+                );
+            }
+            let direct = sample_ising(&dev, &graph, &params(64, 64, seed + 41), kernel).unwrap();
+            assert_eq!(reads, direct, "{kernel:?}: {id}");
+        }
+    });
+}
+
 #[test]
 fn a_cancelled_watermark_returns_cancelled() {
     each_kernel(|kernel| {

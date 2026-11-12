@@ -285,9 +285,8 @@ struct EdgeFacts {
     /// No self-loop and no repeated undirected edge. Only meaningful in bounds.
     simple: bool,
     /// No node has more than 20 in-bounds incident edges; a self-loop counts once.
-    /// The bound stays at the unit lane's and the ANE's 20, the degree the
-    /// backend identity advertises, although the batch path's weighted lanes
-    /// admit 62.
+    /// The ANE's degree bound. Metal admits a denser MSA model through the
+    /// capacity model instead.
     degree_ok: bool,
 }
 
@@ -387,10 +386,11 @@ fn eligibility(
     if kernel != Kernel::Msa {
         return [metal, false];
     }
+    // The tier the capacity model routes the model to, dense-matrix storage
+    // included, and the one-sweep limit: the admission of the batch path
+    // that runs a model past the unit lane.
+    metal = metal && (n == 0 || crate::sampler::admit_one(graph, params, kernel).is_ok());
     let facts = edge_facts.get(n, &graph.edges);
-    if kernel == Kernel::Msa {
-        metal &= facts.degree_ok;
-    }
     ane &= facts.in_bounds && facts.simple;
     if ane && facts.degree_ok {
         // Nonzero couplings are a subset of the edges, so a topology within
@@ -1354,19 +1354,68 @@ mod tests {
             vec![1.0; 21],
             (1..22).map(|v| (0, v)).collect(),
         );
+        // Degree 21 is past the ANE's 20; Metal runs it on the weighted lane.
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
         j.graph.j.fill(0.0);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, true]
+            [true, true]
         );
         // An endpoint past the nodes: no MSA path represents it.
         j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 2)]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [false, false]
+        );
+    }
+
+    /// A plain MSA job past the unit lane's degree 20 is Metal-eligible when
+    /// the capacity model admits it: degree 40 and 62 on the weighted lanes,
+    /// and degree 63 on dense-matrix storage. A degree-63 model with a
+    /// repeated coupler has no tier, and neither engine takes it.
+    #[test]
+    fn high_degree_msa_jobs_are_metal_eligible_by_the_capacity_model() {
+        let star = |leaves: usize| {
+            IsingGraph::new(
+                vec![0.0; leaves + 1],
+                vec![1.0; leaves],
+                (1..=leaves).map(|v| (0, v)).collect(),
+            )
+        };
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        for leaves in [40, 62, 63] {
+            for cfg in [config(true, true), config(true, false)] {
+                assert_eq!(
+                    eligibility(Kernel::Msa, &star(leaves), &params, cfg, &mut facts),
+                    [true, false],
+                    "degree {leaves}"
+                );
+            }
+        }
+        let repeated = IsingGraph::new(
+            vec![0.0; 64],
+            vec![1.0; 63],
+            (1..63)
+                .map(|v| (0, v))
+                .chain(std::iter::once((0, 1)))
+                .collect(),
+        );
+        assert_eq!(
+            eligibility(
+                Kernel::Msa,
+                &repeated,
+                &params,
+                config(true, true),
+                &mut facts
+            ),
             [false, false]
         );
     }
