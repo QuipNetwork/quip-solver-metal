@@ -133,7 +133,8 @@ pub fn host_limits() -> DeviceLimits {
 /// Numeric type of the couplings and fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// One bit per coupling in a dense matrix; one byte in CSR.
+    /// Unit coefficients: two bit planes in a dense matrix (2 bits per
+    /// cell); one byte in CSR.
     Binary,
     /// Signed 8-bit coefficients.
     Int8,
@@ -165,13 +166,19 @@ impl Precision {
         }
     }
 
-    /// Bytes of an `n * n` dense coupling matrix.
-    const fn dense_bytes(self, cells: usize) -> usize {
-        match self {
-            Self::Binary => cells.div_ceil(8),
-            Self::Int8 | Self::Int8Scaled => cells,
-            Self::Int32 | Self::Float32 => cells.saturating_mul(4),
-        }
+    /// Bytes of the dense coupling matrix of an `nodes`-node model: `nodes`
+    /// rows of [`dense_row_elems`] elements. A unit model holds two `uint`
+    /// bit planes per 32 columns (the negative and the nonzero couplings),
+    /// every other precision one coefficient per cell
+    /// (`sampler::upload_dense_inputs`).
+    const fn dense_bytes(self, nodes: usize) -> usize {
+        let elem_bytes = match self {
+            Self::Binary | Self::Int32 | Self::Float32 => 4,
+            Self::Int8 | Self::Int8Scaled => 1,
+        };
+        nodes
+            .saturating_mul(dense_row_elems(self, nodes))
+            .saturating_mul(elem_bytes)
     }
 }
 
@@ -210,8 +217,14 @@ pub struct ModelShape {
     pub edges: usize,
     /// Largest number of neighbours of any node.
     pub max_degree: usize,
-    /// Coefficient type.
+    /// Coefficient type on CSR storage.
     pub precision: Precision,
+    /// Coefficient type of the dense coupling matrix. It differs from
+    /// [`Self::precision`] where the two layouts differ: a unit multi-spin
+    /// model past the unit lane runs `int` CSR rows but a bit matrix, and a
+    /// wide model whose CSR rows must stay `int` can hold an `int8_t`
+    /// matrix.
+    pub dense_precision: Precision,
     /// Entries in the beta schedule.
     pub betas: usize,
     /// Reads per model, before rounding up to a whole SIMD group.
@@ -380,7 +393,7 @@ pub(crate) fn check_indices(
     }
     let mut int = Vec::new();
     if storage == Storage::Dense {
-        uint.push(n.saturating_mul(dense_row_elems(shape.precision, n)));
+        uint.push(n.saturating_mul(dense_row_elems(shape.dense_precision, n)));
     } else {
         let copies = if kernel == Kernel::Msa { 1 } else { problems };
         int.push(copies.saturating_mul(shape.edges.saturating_mul(2).max(1)));
@@ -523,25 +536,27 @@ fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     threadgroup_sizes(kernel, shape)
 }
 
-/// Dense-tier sizes: an `N * N` coupling matrix at the precision's width
-/// (1 bit, 1, 4, 4 bytes) replaces the CSR structure and couplings. The
-/// fields, the outputs, and the carry-over buffers remain. The multi-spin
-/// and Gibbs kernels also share one colour start and one count per
-/// node.
+/// Dense-tier sizes: the coupling matrix at [`ModelShape::dense_precision`]
+/// ([`Precision::dense_bytes`]) replaces the CSR structure and couplings.
+/// The fields, the outputs, and the carry-over buffers remain, at the same
+/// precision. The multi-spin and Gibbs kernels also share one colour start
+/// and one count per node.
 fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
+    let dense = ModelShape {
+        precision: shape.dense_precision,
+        ..*shape
+    };
     let mut per_instance = vec![
-        shape
-            .precision
-            .dense_bytes(shape.nodes.saturating_mul(shape.nodes)),
-        shape.nodes.saturating_mul(shape.precision.coef_bytes()),
+        dense.precision.dense_bytes(dense.nodes),
+        dense.nodes.saturating_mul(dense.precision.coef_bytes()),
     ];
-    per_instance.extend(output_buffers(shape));
-    per_instance.extend(persistent_buffers(kernel, shape));
-    let mut shared = common_shared(shape);
+    per_instance.extend(output_buffers(&dense));
+    per_instance.extend(persistent_buffers(kernel, &dense));
+    let mut shared = common_shared(&dense);
     if kernel != Kernel::Sa {
         // The colour start and count arrays: a complete model has one
         // colour per node (`sampler::encode_batch_storage`).
-        shared.extend([shape.nodes.saturating_mul(4); 2]);
+        shared.extend([dense.nodes.saturating_mul(4); 2]);
     }
     Sizes {
         per_instance,
@@ -819,6 +834,7 @@ pub fn max_model(
             edges,
             max_degree,
             precision,
+            dense_precision: precision,
             betas: ADVERTISED_BETAS,
             reads,
         };
@@ -904,6 +920,7 @@ mod tests {
             edges: 41_515,
             max_degree: 20,
             precision: Precision::Binary,
+            dense_precision: Precision::Binary,
             betas: 64,
             reads: 100,
         }
@@ -915,6 +932,7 @@ mod tests {
             edges: 4_000_000,
             max_degree: 40,
             precision: Precision::Int32,
+            dense_precision: Precision::Int32,
             betas: 64,
             reads: 100,
         }
@@ -926,6 +944,7 @@ mod tests {
             edges: 1_999_000,
             max_degree: 1_999,
             precision: Precision::Int8,
+            dense_precision: Precision::Int8,
             betas: 64,
             reads: 100,
         }
@@ -994,6 +1013,7 @@ mod tests {
             edges: 200_000,
             max_degree: 20,
             precision: Precision::Int8,
+            dense_precision: Precision::Int8,
             betas: 64,
             reads: 100,
         };
@@ -1020,6 +1040,7 @@ mod tests {
                 edges: 200_000,
                 max_degree: 20,
                 precision,
+                dense_precision: precision,
                 betas: 64,
                 reads: 100,
             };
@@ -1049,6 +1070,7 @@ mod tests {
             edges: 1_000 * 999 / 2,
             max_degree: 999,
             precision: Precision::Int8,
+            dense_precision: Precision::Int8,
             betas: 64,
             reads: 256,
         };
@@ -1069,6 +1091,39 @@ mod tests {
             runnable.shared_bytes,
             sum(&dense_sizes(Kernel::Gibbs, &shape).shared)
         );
+    }
+
+    /// A unit model's dense matrix holds two `uint` bit planes per 32
+    /// columns, 2 bits per cell (`sampler::upload_dense_inputs`), and the
+    /// dense tier prices the dense layout, not the CSR one.
+    #[test]
+    fn the_dense_tier_prices_the_matrix_that_runs() {
+        let unit = ModelShape {
+            nodes: 1_000,
+            edges: 1_000 * 999 / 2,
+            max_degree: 999,
+            precision: Precision::Int32,
+            dense_precision: Precision::Binary,
+            betas: 64,
+            reads: 64,
+        };
+        // 32 words of two planes per row of 1,000 columns.
+        assert_eq!(
+            dense_sizes(Kernel::Msa, &unit).per_instance[0],
+            1_000 * 64 * 4
+        );
+        let scaled = ModelShape {
+            dense_precision: Precision::Int8Scaled,
+            ..unit
+        };
+        let sizes = dense_sizes(Kernel::Sa, &scaled);
+        assert_eq!(sizes.per_instance[0], 1_000 * 1_000);
+        // The fields and the SA deltas follow the matrix: one byte per
+        // field, four per `int` delta.
+        assert_eq!(sizes.per_instance[1], 1_000);
+        assert!(sizes
+            .per_instance
+            .contains(&(simd_rounded_reads(64) * 1_000 * 4)));
     }
 
     #[test]
@@ -1135,6 +1190,7 @@ mod tests {
             edges: graph.edges.len(),
             max_degree: degree.into_iter().max().unwrap_or(0),
             precision: Precision::Int8,
+            dense_precision: Precision::Int8,
             betas: 64,
             reads: 64,
         }
@@ -1349,6 +1405,7 @@ mod tests {
             edges: 10,
             max_degree: 3,
             precision: Precision::Int8,
+            dense_precision: Precision::Int8,
             betas: 10_000_000,
             reads: 32,
         };
@@ -1371,14 +1428,15 @@ mod tests {
 
     #[test]
     fn a_costlier_tier_is_used_when_the_cheapest_fails_the_buffer_limit() {
-        // Dense is the cheaper tier (matrix 500,000 bytes against 563,000
-        // bytes of CSR), but its matrix is the largest single buffer. A
+        // Dense is the cheaper tier (a bit matrix of 1,008,000 bytes against
+        // 1.2 MB of CSR), but its matrix is the largest single buffer. A
         // limit between the two largest buffers refuses dense only.
         let shape = ModelShape {
             nodes: 2_000,
-            edges: 55_555,
-            max_degree: 100,
+            edges: 120_000,
+            max_degree: 120,
             precision: Precision::Binary,
+            dense_precision: Precision::Binary,
             betas: 64,
             reads: 100,
         };
@@ -1440,6 +1498,7 @@ mod tests {
             edges,
             max_degree,
             precision: Precision::Binary,
+            dense_precision: Precision::Binary,
             betas: 64,
             reads,
         }
@@ -1476,6 +1535,7 @@ mod tests {
                 // `couplers` edges over `nodes` nodes.
                 max_degree: (2 * couplers).div_ceil(nodes).min(nodes - 1),
                 precision: Precision::Binary,
+                dense_precision: Precision::Binary,
                 betas: 64,
                 reads: advertised_reads(kernel),
             };
@@ -1531,6 +1591,7 @@ mod tests {
             edges: 0,
             max_degree: 0,
             precision,
+            dense_precision: precision,
             betas: 64,
             reads: 256,
         }

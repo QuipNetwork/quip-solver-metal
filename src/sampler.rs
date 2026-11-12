@@ -553,7 +553,7 @@ pub(crate) fn one_sweep_problem_cap(
         params,
         kernel,
         host_device_limits(),
-        true,
+        I8Storage::batch_path(kernel, graph.num_nodes()),
         None,
         DenseMode::Auto,
         in_flight,
@@ -1889,7 +1889,7 @@ pub(crate) fn validate_batch<'a>(
         params,
         kernel,
         host_device_limits(),
-        false,
+        I8Storage::NONE,
         None,
         DenseMode::Off,
         1,
@@ -1916,7 +1916,7 @@ pub(crate) fn admit_one(
         params,
         kernel,
         host_device_limits(),
-        false,
+        I8Storage::batch_path(kernel, graph.num_nodes()),
         None,
         DenseMode::Auto,
         1,
@@ -1960,16 +1960,51 @@ enum DenseMode {
     Forced,
 }
 
+/// Where a batch may hold wide coefficients as `int8_t` times one scale
+/// ([`batch_i8_scale`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct I8Storage {
+    /// On CSR storage. The multi-spin spill and dense-rows builds hold `int`
+    /// coefficients only, whatever this says.
+    csr: bool,
+    /// On dense-matrix storage.
+    dense: bool,
+}
+
+impl I8Storage {
+    /// Plain `int` storage everywhere.
+    const NONE: Self = Self {
+        csr: false,
+        dense: false,
+    };
+    /// `int8_t` storage wherever the coefficients fit it.
+    #[cfg(test)]
+    const ALL: Self = Self {
+        csr: true,
+        dense: true,
+    };
+
+    /// The storage the batch path ([`encode_batch`]) gives a model of
+    /// `nodes` nodes: a multi-spin model past the threadgroup words runs the
+    /// spill build, which holds `int` coefficients on CSR storage.
+    const fn batch_path(kernel: Kernel, nodes: usize) -> Self {
+        Self {
+            csr: !matches!(kernel, Kernel::Msa) || nodes <= MSA_MAX_NODES,
+            dense: true,
+        }
+    }
+}
+
 /// Memory limits of this host, computed once.
 pub(crate) fn host_device_limits() -> &'static DeviceLimits {
     static LIMITS: std::sync::OnceLock<DeviceLimits> = std::sync::OnceLock::new();
     LIMITS.get_or_init(host_limits)
 }
 
-/// [`validate_batch`] against explicit memory `limits`. `allow_i8` sizes a wide
-/// batch that [`batch_i8_scale`] accepts at one byte per coefficient, for the
-/// batch path that uploads it so. A dense MSA batch always takes `int`
-/// storage, the faster one on the dense pipeline.
+/// [`validate_batch`] against explicit memory `limits`. `i8` says where a
+/// wide batch that [`batch_i8_scale`] accepts is held at one byte per
+/// coefficient, for the batch path that uploads it so. Each tier is priced
+/// at the layout it runs ([`model_shape`]).
 ///
 /// The footprint check comes last and runs before any buffer exists, so a
 /// model that does not fit is refused without allocating. `dense` says
@@ -1984,7 +2019,7 @@ fn validate_batch_within<'a>(
     params: &SampleParams,
     kernel: Kernel,
     limits: &DeviceLimits,
-    allow_i8: bool,
+    i8: I8Storage,
     node_cap: Option<usize>,
     dense: DenseMode,
     in_flight: usize,
@@ -2049,8 +2084,9 @@ fn validate_batch_within<'a>(
             return Err(SampleError::TooLarge(message));
         }
     }
-    let i8_scale = batch_i8_scale(graphs, rep, allow_i8 && !dense_rows);
-    let shape = model_shape(first, params, rep, i8_scale.is_some());
+    let i8_scale = batch_i8_scale(graphs, rep, i8.csr && !dense_rows);
+    let dense_i8 = !unit && batch_i8_scale(graphs, rep, i8.dense).is_some();
+    let shape = model_shape(first, params, rep, unit, i8_scale.is_some(), dense_i8);
     let too_large = |e: crate::capacity::CapacityError| {
         SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}"))
     };
@@ -2126,26 +2162,30 @@ fn batch_i8_scale(graphs: &[&IsingGraph], rep: Representation, allow: bool) -> O
     }
 }
 
-/// The size of one model of a batch for the capacity model. `i8_storage` is
-/// a wide model held as `int8_t` coefficients with `int` deltas and fields.
-///
-/// A unit model costs what Int8 does on every tier. On CSR storage that is
-/// its exact width. A dense-matrix unit model holds two bit planes, a
-/// quarter of the Int8 bytes, so the dense tier overstates it.
+/// The size of one model of a batch for the capacity model, at the layout
+/// each tier runs. `i8_csr` is a wide model held as `int8_t` coefficients
+/// with `int` deltas and fields on CSR storage, and `i8_dense` the same on
+/// dense-matrix storage. A `unit` multi-spin model holds two bit planes on
+/// dense-matrix storage, whatever lane its CSR rows take
+/// (`encode_batch_storage`).
 fn model_shape(
     graph: &IsingGraph,
     params: &SampleParams,
     rep: Representation,
-    i8_storage: bool,
+    unit: bool,
+    i8_csr: bool,
+    i8_dense: bool,
 ) -> ModelShape {
+    let scaled = crate::capacity::Precision::Int8Scaled;
     ModelShape {
         nodes: graph.num_nodes(),
         edges: graph.edges.len(),
         max_degree: max_csr_degree(graph),
-        precision: if rep == Representation::Binary {
-            Representation::Int8.precision()
-        } else if i8_storage {
-            crate::capacity::Precision::Int8Scaled
+        precision: if i8_csr { scaled } else { rep.precision() },
+        dense_precision: if unit {
+            crate::capacity::Precision::Binary
+        } else if i8_dense {
+            scaled
         } else {
             rep.precision()
         },
@@ -2169,19 +2209,20 @@ pub fn model_footprint(
     kernel: Kernel,
 ) -> Result<crate::capacity::Footprint, SampleError> {
     let mut rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
+    let unit = rep == Representation::Binary;
     let mut dense_rows = false;
     if kernel == Kernel::Msa {
         let degree = max_csr_degree(graph);
         rep = msa_lane(rep, degree, graph.num_nodes());
         dense_rows = degree > MSA_UNIT_MAX_DEG;
     }
-    // A model past the default `K` runs the spill build on `int` storage.
-    let past_k = kernel == Kernel::Msa && graph.num_nodes() > MSA_MAX_NODES;
-    let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows && !past_k);
+    let i8 = I8Storage::batch_path(kernel, graph.num_nodes());
+    let i8_csr = batch_i8_scale(&[graph], rep, i8.csr && !dense_rows).is_some();
+    let i8_dense = !unit && batch_i8_scale(&[graph], rep, i8.dense).is_some();
     crate::capacity::routed_runnable_footprint(
         kernel,
         graph,
-        &model_shape(graph, params, rep, i8_scale.is_some()),
+        &model_shape(graph, params, rep, unit, i8_csr, i8_dense),
         host_device_limits(),
     )
     .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model: {e}")))
@@ -2754,7 +2795,10 @@ fn encode_batch_storage(
         params,
         kernel,
         host_device_limits(),
-        wide_i8 && !past_k,
+        I8Storage {
+            csr: wide_i8 && !past_k,
+            dense: wide_i8,
+        },
         tuning.node_cap,
         dense,
         in_flight,
@@ -3919,7 +3963,7 @@ mod tests {
             &params,
             kernel,
             host_device_limits(),
-            true,
+            I8Storage::ALL,
             None,
             DenseMode::Off,
             1,
@@ -4214,7 +4258,7 @@ mod tests {
             &p,
             Kernel::Msa,
             host_device_limits(),
-            true,
+            I8Storage::ALL,
             None,
             DenseMode::Auto,
             1,
@@ -4233,7 +4277,7 @@ mod tests {
             &p,
             Kernel::Msa,
             host_device_limits(),
-            true,
+            I8Storage::ALL,
             None,
             DenseMode::Auto,
             1,
@@ -4252,7 +4296,7 @@ mod tests {
             &p,
             Kernel::Msa,
             host_device_limits(),
-            true,
+            I8Storage::ALL,
             None,
             DenseMode::Forced,
             1,
@@ -4280,7 +4324,7 @@ mod tests {
                 &p,
                 Kernel::Sa,
                 host_device_limits(),
-                true,
+                I8Storage::ALL,
                 None,
                 dense,
                 1,
@@ -4333,7 +4377,7 @@ mod tests {
                 &p,
                 Kernel::Gibbs,
                 host_device_limits(),
-                true,
+                I8Storage::ALL,
                 None,
                 dense,
                 1,
@@ -4661,7 +4705,7 @@ mod tests {
             &p,
             Kernel::Sa,
             host_device_limits(),
-            true,
+            I8Storage::ALL,
             None,
             DenseMode::Auto,
             1,
@@ -4694,7 +4738,7 @@ mod tests {
                 &p,
                 Kernel::Sa,
                 host_device_limits(),
-                true,
+                I8Storage::ALL,
                 None,
                 DenseMode::Auto,
                 2,
@@ -4727,7 +4771,7 @@ mod tests {
                 &p,
                 kernel,
                 host_device_limits(),
-                true,
+                I8Storage::ALL,
                 None,
                 DenseMode::Auto,
                 1,
@@ -4865,7 +4909,7 @@ mod tests {
             &params(64),
             Kernel::Sa,
             &limits,
-            false,
+            I8Storage::NONE,
             None,
             DenseMode::Auto,
             1,
@@ -5019,6 +5063,63 @@ mod tests {
         too_large(check_float_schedule(&star, &[0.0]));
     }
 
+    /// A complete model on `n` nodes with every coupling `j`.
+    fn complete_with(n: usize, j: f64) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        IsingGraph::new(vec![0.0; n], vec![j; edges.len()], edges)
+    }
+
+    /// Each tier is priced at the layout the batch path runs on it: a unit
+    /// multi-spin model past the unit lane walks `int` CSR rows but holds a
+    /// bit matrix, and a wide model whose rows pass one chunk walks `int` CSR
+    /// rows but holds an `int8_t` matrix when its coefficients fit one. The
+    /// session admission prices the batch path's `int8_t` CSR storage too.
+    #[test]
+    fn the_admission_prices_the_layout_each_tier_runs() {
+        use crate::capacity::Precision;
+        let p = SampleParams {
+            num_reads: 64,
+            ..params(64)
+        };
+        let shape = |graph: &IsingGraph, kernel| {
+            let batch = validate_batch_within(
+                &[graph],
+                &p,
+                kernel,
+                host_device_limits(),
+                I8Storage::batch_path(kernel, graph.num_nodes()),
+                None,
+                DenseMode::Auto,
+                1,
+            )
+            .unwrap();
+            (batch.storage, batch.shape, batch.i8_scale)
+        };
+        let (storage, unit, _) = shape(&complete_with(100, -1.0), Kernel::Msa);
+        assert_eq!(storage, Storage::Dense);
+        assert_eq!(unit.precision, Precision::Int32);
+        assert_eq!(unit.dense_precision, Precision::Binary);
+        let (storage, scaled, _) = shape(&complete_with(100, 2.0), Kernel::Msa);
+        assert_eq!(storage, Storage::Dense);
+        assert_eq!(scaled.precision, Precision::Int32);
+        assert_eq!(scaled.dense_precision, Precision::Int8Scaled);
+        // A sparse wide model takes `int8_t` CSR storage on the batch path,
+        // and the session admission prices it so.
+        let ring = IsingGraph::new(
+            vec![0.0; 64],
+            vec![0.25; 64],
+            (0..64).map(|u| (u, (u + 1) % 64)).collect(),
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let (storage, sparse, i8_scale) = shape(&ring, kernel);
+            assert_ne!(storage, Storage::Dense, "{kernel:?}");
+            assert_eq!(sparse.precision, Precision::Int8Scaled, "{kernel:?}");
+            assert!(i8_scale.is_some(), "{kernel:?}");
+        }
+    }
+
     /// The chromatic Gibbs builds index the RNG streams as
     /// `(sample * 256 + thread) * 4` in 32 bits, so a batch of 16,384
     /// problems of 256 reads is refused before any buffer exists, as the SA
@@ -5036,7 +5137,7 @@ mod tests {
             &p,
             Kernel::Gibbs,
             host_device_limits(),
-            false,
+            I8Storage::NONE,
             None,
             DenseMode::Auto,
             1,
@@ -5059,7 +5160,7 @@ mod tests {
             &params(64),
             Kernel::Gibbs,
             host_device_limits(),
-            false,
+            I8Storage::NONE,
             Some(GIBBS_MAX_NODES),
             DenseMode::Auto,
             1,
