@@ -385,6 +385,59 @@ impl MetalDevice {
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
         let msa_frustration_count = compile_pipeline(&device, MSA_SRC, "msa_frustration_count")?;
+        // Fixed dispatch widths must fit before any job reaches the device.
+        // Other pipelines cap their dispatch width to the compiled limit.
+        for (name, pipeline, width) in [
+            ("sa", &sa, crate::sampler::MAX_READS),
+            ("sa_global", &sa_global, crate::sampler::MAX_READS),
+            ("sa_matrix_i8", &sa_matrix_i8, crate::sampler::MAX_READS),
+            ("gibbs", &gibbs, crate::sampler::MAX_READS),
+            ("gibbs_parallel_wide", &gibbs_parallel_wide, 128),
+            ("gibbs_parallel_wide_i8", &gibbs_parallel_wide_i8, 128),
+            ("gibbs_parallel_wide_spill", &gibbs_parallel_wide_spill, 128),
+            (
+                "gibbs_parallel_wide_i8_spill",
+                &gibbs_parallel_wide_i8_spill,
+                128,
+            ),
+            ("gibbs_matrix_wide_i8", &gibbs_matrix_wide_i8, 128),
+            ("gibbs_matrix_int", &gibbs_matrix_int, 128),
+            (
+                "msa_matrix_bits_unit",
+                &msa_matrix_bits_unit,
+                crate::sampler::MSA_LANES,
+            ),
+            (
+                "msa_matrix_bits",
+                &msa_matrix_bits,
+                crate::sampler::MSA_LANES,
+            ),
+            ("msa_matrix_i8", &msa_matrix_i8, crate::sampler::MSA_LANES),
+            ("msa_matrix_int", &msa_matrix_int, crate::sampler::MSA_LANES),
+            (
+                "msa_matrix_float",
+                &msa_matrix_float,
+                crate::sampler::MSA_LANES,
+            ),
+            (
+                "gibbs_matrix_i8",
+                &gibbs_matrix_i8,
+                (gibbs_parallel.max_total_threads_per_threadgroup() as usize).clamp(1, 256),
+            ),
+            (
+                "gibbs_matrix_float",
+                &gibbs_matrix_float,
+                (gibbs_parallel_float.max_total_threads_per_threadgroup() as usize).clamp(1, 256),
+            ),
+            ("msa_frustration_draw", &msa_frustration_draw, 64),
+            ("msa_frustration_count", &msa_frustration_count, 256),
+        ] {
+            check_threadgroup_width(
+                name,
+                pipeline.max_total_threads_per_threadgroup() as usize,
+                width,
+            )?;
+        }
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -506,6 +559,15 @@ impl MetalDevice {
     }
 }
 
+fn check_threadgroup_width(entry: &str, maximum: usize, dispatch: usize) -> Result<(), MetalError> {
+    if dispatch > maximum {
+        return Err(MetalError::Driver(format!(
+            "{entry} dispatch needs {dispatch} threads per threadgroup, but the pipeline admits {maximum}"
+        )));
+    }
+    Ok(())
+}
+
 fn compile_pipeline(
     device: &Device,
     source: &str,
@@ -546,6 +608,15 @@ fn compile_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_rejects_a_dispatch_past_its_thread_limit() {
+        check_threadgroup_width("test", 256, 256).unwrap();
+        let error = check_threadgroup_width("test", 255, 256).unwrap_err();
+        assert!(
+            matches!(error, MetalError::Driver(message) if message.contains("256") && message.contains("255"))
+        );
+    }
 
     #[test]
     fn wide_row_matches_metal_sources() {
