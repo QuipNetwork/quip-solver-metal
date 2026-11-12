@@ -6,6 +6,9 @@
 //! one fixed order and accepts every flat move only shifts the ring's domain
 //! walls in step, so its reads keep the energy of their random start.
 
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::sampler::{sample_ising, Kernel};
+use quip_solver_metal::{IsingGraph, SampleParams};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -245,4 +248,48 @@ fn quip_metal_msa_visits_every_node_in_a_one_sweep_anneal() {
         &two_fields_one_sweep(),
     ));
     assert_eq!(got, vec![-2000; READS]);
+}
+
+/// Coupling of the Float32 ring: off the milli grid, so the classifier
+/// selects the Float32 build. The binaries refuse such a model, so the case
+/// calls the library.
+const FLOAT_J: f64 = 1.0005;
+
+/// Assert `kernel`'s Float32 build reaches the ground state of the zero-field
+/// ring, every bond satisfied at `-16 * FLOAT_J`.
+fn assert_float_build_anneals_the_zero_field_ring(kernel: Kernel) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![FLOAT_J; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 1000,
+        sweeps_per_beta: 1,
+        seed: 7,
+        ..Default::default()
+    };
+    let reads = sample_ising(&dev, &graph, &params, kernel).unwrap();
+    assert_eq!(reads.len(), READS, "{kernel:?}");
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "{kernel:?} Float32: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn float_sa_anneals_the_zero_field_ring() {
+    assert_float_build_anneals_the_zero_field_ring(Kernel::Sa);
+}
+
+#[test]
+fn float_msa_anneals_the_zero_field_ring() {
+    assert_float_build_anneals_the_zero_field_ring(Kernel::Msa);
 }
