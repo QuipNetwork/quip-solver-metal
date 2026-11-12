@@ -258,7 +258,7 @@ fn sa_matrix_rate(in_flight: usize) -> f64 {
 /// `n` columns of its row, the threadgroups of a dispatch run side by side,
 /// and one sweep of every read costs `n * n` columns of the one rate, at
 /// every read count. It is a per-chunk worst case: the slowest single chunk
-/// measured on a quiet GPU in `docs/perf/2026-11-12-gibbs-dense.md`, less a
+/// measured on a shared host in `docs/perf/2026-11-12-gibbs-dense.md`, less a
 /// margin for contention from other GPU work. The planner and the one-sweep
 /// admission limit both use it.
 const GIBBS_MATRIX_COLUMNS_PER_SEC: f64 = 7.0e6;
@@ -1560,8 +1560,9 @@ struct ValidBatch<'a> {
     dense_rows: bool,
     /// The storage tier the admission priced the batch on.
     storage: Storage,
-    /// Every coupling and field is in {-1, 0, 1}, so a dense-matrix batch
-    /// holds a bit matrix.
+    /// Every coupling and field is in {-1, 0, 1}. Only the multi-spin kernel
+    /// holds a dense-matrix batch of such a model as a bit matrix; SA and
+    /// Gibbs map it to the Int8 tier.
     unit: bool,
 }
 
@@ -2430,6 +2431,8 @@ fn encode_batch_storage(
     // only the dispatch geometry below differs.
     // Only the chromatic kernel has a spill build, so a model past its
     // threadgroup array runs it whatever `QUIP_METAL_GIBBS_SEQUENTIAL` says.
+    // The dense-matrix build is chromatic too, so that variable does not
+    // apply to it either.
     let node_parallel = kernel == Kernel::Gibbs && (gibbs_node_parallel() || gibbs_spill || matrix);
     // A milli model with a row past one chunk takes the weighted lane's dense
     // build, on `int` storage; the default build keeps the one-chunk code
@@ -2466,9 +2469,10 @@ fn encode_batch_storage(
     };
     // A dense-matrix multi-spin batch keeps the RNG streams of the sparse
     // pipeline the model would take, so it emulates that pipeline's dispatch
-    // width. A dense-matrix batch holds a bit matrix for a unit model, and
-    // otherwise the narrowest matrix its coefficients fit: `int8_t` storage
-    // needs no CSR rule here.
+    // width. A dense-matrix multi-spin batch holds a bit matrix for a unit
+    // model. Every other dense batch, and a multi-spin batch that is not a
+    // unit model, holds the narrowest matrix its coefficients fit: `int8_t`
+    // storage needs no CSR rule here.
     let (pipeline, i8_scale) = if matrix {
         let dense_i8 = if unit {
             None

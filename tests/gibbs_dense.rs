@@ -268,9 +268,18 @@ fn the_dense_path_matches_the_sparse_path() {
         shapes.push((circulant(1_400, 4, precision), params(64, 16, 4, 7)));
     }
     shapes.push((cancelling_float_model(10), cold(params(64, 64, 4, 7))));
+    // A complete model has one node per colour class, so one thread walks each
+    // row while the rest of the group waits.
+    for precision in [Precision::Int8, Precision::Float32] {
+        shapes.push((planted_complete(64, precision).0, params(64, 64, 4, 7)));
+    }
     for (graph, p) in shapes {
         let label = format!("{} nodes, {} edges", graph.num_nodes(), graph.edges.len());
-        let sparse = run(&dev, &graph, &p, Tuning::default());
+        let sparse_tuning = Tuning {
+            force_sparse: true,
+            ..Tuning::default()
+        };
+        let sparse = run(&dev, &graph, &p, sparse_tuning);
         assert_ne!(sparse.storage, Storage::Dense, "{label}");
         let dense_run = run(&dev, &graph, &p, dense(Tuning::default()));
         assert_eq!(dense_run.storage, Storage::Dense, "{label}");
