@@ -15,6 +15,51 @@
 
 use quip_solver_core::IsingGraph;
 
+#[cfg(test)]
+thread_local! {
+    static PAIR_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_pair_scan_count() {
+    PAIR_SCAN_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn pair_scan_count() -> usize {
+    PAIR_SCAN_COUNT.get()
+}
+
+/// Whether `graph` can use an `N * N` dense coupling matrix: no self-loop,
+/// and no pair of nodes coupled twice, in either orientation. A dense matrix
+/// holds one coefficient per pair, so a repeat would lose a term that CSR
+/// keeps.
+///
+/// The scan allocates one bit per matrix cell. Callers run it only when
+/// dense storage is already the cheaper choice, so the bitset stays small
+/// beside the CSR it replaces.
+pub(crate) fn dense_candidate(graph: &IsingGraph) -> bool {
+    #[cfg(test)]
+    PAIR_SCAN_COUNT.set(PAIR_SCAN_COUNT.get() + 1);
+    let n = graph.num_nodes();
+    let Some(cells) = n.checked_mul(n) else {
+        return false;
+    };
+    let mut seen = vec![0u8; cells.div_ceil(8)];
+    for &(u, v) in graph.edges.iter() {
+        if u == v || u >= n || v >= n {
+            return false;
+        }
+        let pair = u.min(v) * n + u.max(v);
+        let (byte, bit) = (pair / 8, 1u8 << (pair % 8));
+        if seen[byte] & bit != 0 {
+            return false;
+        }
+        seen[byte] |= bit;
+    }
+    true
+}
+
 /// Chromatic color-block partition of a CSR graph's dense node indices.
 ///
 /// `nodes` is grouped by color; `starts`/`counts` index into it per color.

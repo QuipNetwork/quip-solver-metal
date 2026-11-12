@@ -21,9 +21,11 @@
 //!   `delta_energy` in its carry-over buffers in the same way. The Gibbs
 //!   spill build keeps the spins past its threadgroup prefix in each read's
 //!   slice of its carry-over spin buffer, which holds one byte per spin.
-//! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. Not yet
-//!   implemented, and no multi-spin model is admitted to it until a dense
-//!   multi-spin kernel exists.
+//! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. It
+//!   admits any degree, so a multi-spin model past the sparse degree routes
+//!   here. [`routed_footprint`] keeps a graph with a repeated coupler or a
+//!   self-loop off this tier. No kernel runs it yet (see
+//!   [`runnable_storages`]).
 //!
 //! Every formula sits in one small function per kernel, so a later task can
 //! correct one without touching the routing.
@@ -33,6 +35,7 @@ use crate::sampler::{
     MSA_THREADS, MSA_UNIT_MAX_DEG, SA_MAX_NODES,
 };
 use crate::streaming::batch_size_for_reads;
+use quip_solver_core::IsingGraph;
 
 /// Largest node count the 32-bit kernel indexing can address.
 pub const MAX_NODES: usize = i32::MAX as usize;
@@ -322,9 +325,8 @@ fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
                 && (kernel != Kernel::Msa || shape.max_degree <= msa_degree)
         }
         Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEG,
-        // No dense multi-spin kernel exists, so MSA refuses this tier and a
-        // model past the sparse degree is a `CapacityError::Degree`.
-        Storage::Dense => kernel != Kernel::Msa,
+        // A dense matrix has no row-length limit, so it admits any degree.
+        Storage::Dense => true,
     }
 }
 
@@ -512,6 +514,36 @@ pub fn footprint(
         limits,
         &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
     )
+}
+
+/// [`footprint`] for a graph: the tier choice of [`footprint`], except that a
+/// graph that is not a dense candidate (a repeated coupler or a self-loop,
+/// see `topology::dense_candidate`) never takes [`Storage::Dense`].
+///
+/// The pair scan runs only when [`footprint`] picks dense storage, so a
+/// sparse model pays nothing for it. `shape` must describe `graph`.
+///
+/// # Errors
+///
+/// The errors of [`footprint`]. A non-candidate that no sparse tier admits,
+/// such as a multi-spin model past the sparse degree, is a
+/// [`CapacityError::Degree`].
+pub fn routed_footprint(
+    kernel: Kernel,
+    graph: &IsingGraph,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+) -> Result<Footprint, CapacityError> {
+    let chosen = footprint(kernel, shape, limits)?;
+    if chosen.storage == Storage::Dense && !crate::topology::dense_candidate(graph) {
+        return footprint_in(
+            kernel,
+            shape,
+            limits,
+            &[Storage::Threadgroup, Storage::Spill],
+        );
+    }
+    Ok(chosen)
 }
 
 /// The tiers a kernel of this crate runs. No SA or Gibbs dense kernel
@@ -954,35 +986,112 @@ mod tests {
         }
     }
 
-    #[test]
-    fn msa_above_sparse_degree_is_refused() {
-        let mut shape = sparse_shape();
-        shape.max_degree = MSA_SPARSE_MAX_DEG + 1;
-        shape.nodes = 1_000;
-        shape.edges = 40_000;
-        assert_eq!(
-            footprint(Kernel::Msa, &shape, &ROOMY),
-            Err(CapacityError::Degree {
-                max: MSA_SPARSE_MAX_DEG
-            })
-        );
-        assert_eq!(
-            footprint(Kernel::Msa, &complete_shape(), &ROOMY),
-            Err(CapacityError::Degree {
-                max: MSA_SPARSE_MAX_DEG
-            })
-        );
-        shape.max_degree = MSA_SPARSE_MAX_DEG;
-        let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
-        assert_ne!(fp.storage, Storage::Dense);
+    /// A complete graph on `n` nodes, each pair once.
+    fn complete_graph(n: usize) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges)
+    }
+
+    /// `graph` plus one more coupler.
+    fn with_edge(graph: &IsingGraph, edge: (usize, usize)) -> IsingGraph {
+        let mut edges = graph.edges.to_vec();
+        edges.push(edge);
+        let mut j = graph.j.to_vec();
+        j.push(1.0);
+        IsingGraph::new(graph.h.to_vec(), j, edges)
+    }
+
+    fn shape_of(graph: &IsingGraph) -> ModelShape {
+        let mut degree = vec![0usize; graph.num_nodes()];
+        for &(u, v) in graph.edges.iter() {
+            degree[u] += 1;
+            degree[v] += 1;
+        }
+        ModelShape {
+            nodes: graph.num_nodes(),
+            edges: graph.edges.len(),
+            max_degree: degree.into_iter().max().unwrap_or(0),
+            precision: Precision::Int8,
+            betas: 64,
+            reads: 64,
+        }
     }
 
     #[test]
-    fn msa_never_admits_dense_storage() {
-        for shape in [unit_shape(), sparse_shape(), complete_shape()] {
-            assert!(!admits(Kernel::Msa, Storage::Dense, &shape), "{shape:?}");
+    fn a_repeated_coupler_stays_sparse() {
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let graph = complete_graph(64);
+            let shape = shape_of(&graph);
+            let clean = routed_footprint(kernel, &graph, &shape, &ROOMY).unwrap();
+            assert_eq!(clean.storage, Storage::Dense, "{kernel:?}");
+            // The same pair in the other orientation is still a repeat.
+            let graph = with_edge(&graph, (1, 0));
+            let shape = shape_of(&graph);
+            let fp = routed_footprint(kernel, &graph, &shape, &ROOMY).unwrap();
+            assert_ne!(fp.storage, Storage::Dense, "{kernel:?}");
         }
-        assert!(admits(Kernel::Sa, Storage::Dense, &complete_shape()));
+    }
+
+    #[test]
+    fn a_self_loop_stays_sparse() {
+        let graph = with_edge(&complete_graph(64), (5, 5));
+        let shape = shape_of(&graph);
+        let fp = routed_footprint(Kernel::Sa, &graph, &shape, &ROOMY).unwrap();
+        assert_ne!(fp.storage, Storage::Dense);
+        assert!(!crate::topology::dense_candidate(&graph));
+    }
+
+    #[test]
+    fn msa_above_degree_62_routes_dense() {
+        let graph = complete_graph(80);
+        let shape = shape_of(&graph);
+        assert!(shape.max_degree > MSA_SPARSE_MAX_DEG);
+        let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
+        assert_eq!(fp.storage, Storage::Dense);
+        let fp = routed_footprint(Kernel::Msa, &graph, &shape, &ROOMY).unwrap();
+        assert_eq!(fp.storage, Storage::Dense);
+        // A repeated coupler keeps the model off dense, so no tier admits it.
+        let repeated = with_edge(&graph, (1, 0));
+        assert_eq!(
+            routed_footprint(Kernel::Msa, &repeated, &shape_of(&repeated), &ROOMY),
+            Err(CapacityError::Degree {
+                max: MSA_SPARSE_MAX_DEG
+            })
+        );
+    }
+
+    #[test]
+    fn the_sampler_still_refuses_a_job_that_only_fits_dense() {
+        let shape = shape_of(&complete_graph(80));
+        assert_eq!(
+            footprint(Kernel::Msa, &shape, &ROOMY).unwrap().storage,
+            Storage::Dense
+        );
+        assert_eq!(
+            runnable_footprint(Kernel::Msa, &shape, &ROOMY),
+            Err(CapacityError::Degree {
+                max: MSA_SPARSE_MAX_DEG
+            })
+        );
+    }
+
+    #[test]
+    fn sparse_models_pay_no_pair_scan() {
+        let n = 2_000;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=10).map(move |o| (u, (u + o) % n)))
+            .collect();
+        let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+        let shape = shape_of(&graph);
+        crate::topology::reset_pair_scan_count();
+        let fp = routed_footprint(Kernel::Sa, &graph, &shape, &ROOMY).unwrap();
+        assert_ne!(fp.storage, Storage::Dense);
+        assert_eq!(crate::topology::pair_scan_count(), 0);
+        let complete = complete_graph(64);
+        routed_footprint(Kernel::Sa, &complete, &shape_of(&complete), &ROOMY).unwrap();
+        assert_eq!(crate::topology::pair_scan_count(), 1);
     }
 
     #[test]
