@@ -7,7 +7,7 @@
 //! walls in step, so its reads keep the energy of their random start.
 
 use quip_solver_metal::metal_device::MetalDevice;
-use quip_solver_metal::sampler::{sample_ising, Kernel};
+use quip_solver_metal::sampler::{sample_ising, sample_ising_tuned, Kernel, MsaTuning};
 use quip_solver_metal::{IsingGraph, SampleParams};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -292,4 +292,60 @@ fn float_sa_anneals_the_zero_field_ring() {
 #[test]
 fn float_msa_anneals_the_zero_field_ring() {
     assert_float_build_anneals_the_zero_field_ring(Kernel::Msa);
+}
+
+/// Assert the QUIP_MSA_SPILL build reaches the ground state of the zero-field
+/// ring with coupling `j`, with `shared_spins_cap` words in threadgroup memory
+/// and the rest spilled, and that sweep windows of one sweep return the same
+/// reads. 1.5 takes the milli lane and `FLOAT_J` the Float32 lane.
+fn assert_spill_build_anneals_the_zero_field_ring(j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 256,
+        sweeps_per_beta: 4,
+        seed: 7,
+        ..Default::default()
+    };
+    let run = |planning_rate| {
+        let tuning = MsaTuning {
+            shared_spins_cap: Some(NODES / 4),
+            planning_rate,
+        };
+        sample_ising_tuned(&dev, &graph, &params, Kernel::Msa, tuning).unwrap()
+    };
+    // One command buffer, then one sweep per command buffer.
+    let whole = run(Some(1e18));
+    assert_eq!(whole.plan.len(), 1, "j {j}");
+    let windows = run(Some(1.0));
+    assert_eq!(windows.plan.len(), params.num_sweeps, "j {j}");
+    assert_eq!(
+        windows.reads, whole.reads,
+        "j {j}: windows change the reads"
+    );
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = whole
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "spill j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn msa_spill_build_anneals_the_zero_field_ring() {
+    assert_spill_build_anneals_the_zero_field_ring(1.5);
+}
+
+#[test]
+fn msa_float_spill_build_anneals_the_zero_field_ring() {
+    assert_spill_build_anneals_the_zero_field_ring(FLOAT_J);
 }
