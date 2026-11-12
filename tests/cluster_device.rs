@@ -554,6 +554,42 @@ fn cluster_chunks_stay_under_the_ceiling() {
     assert!(worst < 400.0, "a chunk measured {worst:.1} ms");
 }
 
+/// Compare the production chunk plan at 256 anneals across cluster schedules.
+#[test]
+#[ignore = "measurement: thousands of Advantage2 sweeps per schedule"]
+#[expect(clippy::print_stderr, reason = "report measured chunk times")]
+fn cluster_chunks_on_other_schedules() {
+    let device = device();
+    let prepared = advantage2(256);
+    let mut worst = 0.0_f64;
+    for (rounds, single_every) in [(2, 1), (8, 0), (1, 0)] {
+        let params = ClusterParams {
+            sweeps: 4096,
+            anneals: 256,
+            seed: 5,
+            rounds,
+            single_every,
+            ..ClusterParams::default()
+        };
+        let trace = device
+            .trace_for_test(&prepared, &params, false, None, &|| false)
+            .unwrap();
+        let chunks: Vec<_> = trace.chunks.iter().filter(|c| c.sweeps > 0).collect();
+        let max = chunks.iter().map(|c| c.gpu_ms).fold(0.0, f64::max);
+        let ratio = chunks
+            .iter()
+            .map(|c| c.gpu_ms / c.planned_ms)
+            .fold(0.0, f64::max);
+        eprintln!(
+            "rounds {rounds}, single_every {single_every}: {} chunks of {} sweeps, max {max:.1} ms, measured/planned {ratio:.3}",
+            chunks.len(),
+            chunks[0].sweeps,
+        );
+        worst = worst.max(max);
+    }
+    assert!(worst < 400.0, "a chunk measured {worst:.1} ms");
+}
+
 /// Wall time of one production family job: 256 reads at 2,048 sweeps, one
 /// sweep per beta (the session default), on the Advantage2 instance with
 /// full weights, as `quip-metal-otsuka` runs it.
