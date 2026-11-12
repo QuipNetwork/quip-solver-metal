@@ -146,6 +146,7 @@ fn sweeps_match_the_host_reference_before_final_descent() {
                     knee_frac: if knee { 0.4 } else { 0.0 },
                     anneals: 4,
                     seed,
+                    ladder: None,
                 };
                 let (expected, rng) = reference::run(&p, &q);
                 let actual = device
@@ -231,6 +232,71 @@ fn chunked_and_unchunked_anneals_match() {
         assert_eq!(a, trace(1e18, true).spins);
         assert_eq!(a, device.anneal(&p, &one_sweep, &|| false).unwrap());
         assert_eq!(a, device.anneal(&p, &one_sweep, &|| false).unwrap());
+    }
+}
+
+/// A ladder run keeps each command buffer inside one rung at that rung's
+/// beta. One sweep per command buffer and one command buffer per rung give
+/// the same state. A one-rung ladder equals the kernel schedule at that
+/// constant beta.
+#[test]
+fn ladder_runs_match_across_chunking_and_a_constant_schedule() {
+    use quip_solver_metal::cluster::device::BetaLadder;
+    let device = device();
+    for weights in WEIGHTS {
+        let p = corner_sharing(weights);
+        let ladder = ClusterParams {
+            sweeps: 12,
+            rounds: 3,
+            anneals: 16,
+            seed: 11,
+            ladder: Some(BetaLadder {
+                betas: vec![0.4, 1.1, 2.5],
+                sweeps_per_beta: 4,
+            }),
+            ..ClusterParams::default()
+        };
+        let trace = |q: &ClusterParams, rate| {
+            device
+                .trace_for_test(&p, q, false, Some(rate), &|| false)
+                .unwrap()
+        };
+        let chunked = trace(&ladder, 1.0);
+        let per_rung = trace(&ladder, 1e18);
+        assert_eq!(chunked.chunks.len(), 12);
+        assert_eq!(
+            per_rung.chunks.iter().map(|c| c.sweeps).collect::<Vec<_>>(),
+            [4, 4, 4]
+        );
+        assert_eq!(chunked.spins, per_rung.spins);
+        assert_eq!(chunked.rng, per_rung.rng);
+        let one_rung = ClusterParams {
+            sweeps: 4,
+            ladder: Some(BetaLadder {
+                betas: vec![1.1],
+                sweeps_per_beta: 4,
+            }),
+            ..ladder.clone()
+        };
+        let constant = ClusterParams {
+            beta_min: 1.1,
+            beta_max: 1.1,
+            ladder: None,
+            ..one_rung.clone()
+        };
+        let a = trace(&one_rung, 1e18);
+        let b = trace(&constant, 1e18);
+        assert_eq!(a.spins, b.spins);
+        assert_eq!(a.rng, b.rng);
+        // A different rung order changes the anneal.
+        let reversed = ClusterParams {
+            ladder: Some(BetaLadder {
+                betas: vec![2.5, 1.1, 0.4],
+                sweeps_per_beta: 4,
+            }),
+            ..ladder.clone()
+        };
+        assert_ne!(trace(&reversed, 1e18).rng, per_rung.rng);
     }
 }
 

@@ -64,16 +64,19 @@ the `FamilyBinding` of explicit jobs.
 
 - A checked twisted-ice-dimer job runs on the Otsuka cluster kernel
   (`kernels/cluster.metal`). Each read is one anneal, and a job has at most 256
-  reads. Every job uses the measured default schedule of `ClusterParams`:
-  65,536 sweeps, 2 rounds, a single-spin sweep after each cluster sweep, and
-  beta from 1 to 12. The job seed seeds the anneal. The host scores each read
-  on the original model.
+  reads. The schedule follows the job, as in the CUDA miner: the job's
+  `num_sweeps`, `sweeps_per_beta`, beta range, and beta schedule give the
+  beta ladder, and each command buffer runs inside one rung at that rung's
+  beta. Every sweep has 2 rounds and a single-spin sweep. The job seed seeds
+  the anneal. The host scores each read on the original model.
 - Each other job runs on the Metal SA engine of `quip-metal-sa`. For the
   same seed, a plain job returns the same reads on both binaries.
 - The cluster kernel and Metal SA never share the GPU. Each plans its
   command buffers against the 500 ms ceiling as if it owns the GPU. A family
   job waits until every plain job ahead of it answers, and no plain job starts
-  while a family job runs.
+  while a family job runs. Estimate from the chunk timings in
+  `docs/perf/2026-11-12-otsuka-metal.md`: a 2,048-sweep family job at 256
+  reads on a 4,577-node instance holds the GPU for about 7 seconds.
 - A family job that does not fit the cluster layout, the memory budget, or the
   single-buffer limit gets a `Capacity` reject with one refund, and the
   session goes on. The miner refuses the job before it allocates a buffer.

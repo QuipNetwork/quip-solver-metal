@@ -118,10 +118,15 @@ impl CombinedSampler {
     }
 
     /// The IOKit governor of the Metal engine. Opens the engine when no job
-    /// has opened it yet, because the governor starts with it. `None` when
-    /// it cannot open.
-    pub(crate) fn governor(&self) -> Option<&crate::iokit_gov::UtilGovernor> {
-        self.metal().ok().map(|metal| &metal.gov)
+    /// has opened it yet, because the governor starts with it. Once the
+    /// engine is open this only reads it. The error is the cached open
+    /// failure.
+    pub(crate) fn governor(&self) -> Result<&crate::iokit_gov::UtilGovernor, SampleError> {
+        match self.metal.get() {
+            Some(Ok(metal)) => Ok(&metal.gov),
+            Some(Err(error)) => Err(SampleError::DeviceFault(error.clone())),
+            None => self.metal().map(|metal| &metal.gov),
+        }
     }
 
     pub(crate) fn check(&self) -> Result<(), OpenError> {

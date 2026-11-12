@@ -11,7 +11,7 @@
 //! forwarded to the SA stream has answered, and the dispatcher forwards no
 //! plain job while the cluster job runs.
 
-use super::device::{ClusterDevice, ClusterDeviceError, ClusterParams};
+use super::device::{BetaLadder, ClusterDevice, ClusterDeviceError, ClusterParams};
 use super::{PreparedGraph, Weights};
 use crate::capacity::DeviceLimits;
 use crate::combined::CombinedSampler;
@@ -86,6 +86,15 @@ pub trait ClusterGovernor {
     /// Count `us` GPU microseconds of a cluster command buffer as the
     /// miner's own load.
     fn record_gpu_busy_us(&self, us: u64);
+
+    /// Make the governor ready. The error says why there is none: the job
+    /// then runs with no governor yield.
+    ///
+    /// # Errors
+    /// The reason the governor is not available.
+    fn open_governor(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The Metal SA engine of `quip-metal-otsuka`: the sampler of
@@ -93,16 +102,22 @@ pub trait ClusterGovernor {
 pub struct MetalSa(CombinedSampler);
 
 impl ClusterGovernor for MetalSa {
+    // Both read a governor that `open_governor` already reported on, so a
+    // missing governor is quiet here: no yield and no accounting.
     fn yields_to_others(&self) -> bool {
         self.0
             .governor()
-            .is_some_and(crate::iokit_gov::UtilGovernor::should_yield_to_others)
+            .is_ok_and(crate::iokit_gov::UtilGovernor::should_yield_to_others)
     }
 
     fn record_gpu_busy_us(&self, us: u64) {
-        if let Some(governor) = self.0.governor() {
+        if let Ok(governor) = self.0.governor() {
             governor.record_gpu_busy_us(us);
         }
+    }
+
+    fn open_governor(&self) -> Result<(), String> {
+        self.0.governor().map(|_| ()).map_err(|e| e.to_string())
     }
 }
 
@@ -251,8 +266,8 @@ impl<D: ClusterBackend, S: Sampler + ClusterGovernor> OtsukaSampler<D, S> {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Anneal one read per anneal with the measured default schedule, then
-    /// score every read on the original model.
+    /// Anneal one read per anneal on the job's beta ladder
+    /// ([`cluster_params`]), then score every read on the original model.
     fn reads(
         &self,
         graph: &IsingGraph,
@@ -260,14 +275,18 @@ impl<D: ClusterBackend, S: Sampler + ClusterGovernor> OtsukaSampler<D, S> {
         prepared: &PreparedGraph,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        if params.num_reads == 0 || params.num_reads > MAX_READS {
-            return Err(SampleError::Capacity);
+        let cluster = cluster_params(graph, params).map_err(|reason| {
+            tracing::warn!(reason, "cluster job parameters refused");
+            SampleError::Capacity
+        })?;
+        if let Err(error) = self.sa.open_governor() {
+            // The governor starts with the SA engine. Without it this job
+            // cannot yield to other GPU users, but it still runs.
+            tracing::warn!(
+                %error,
+                "the SA engine did not open; this cluster job runs with no governor yield"
+            );
         }
-        let cluster = ClusterParams {
-            anneals: params.num_reads,
-            seed: params.seed,
-            ..ClusterParams::default()
-        };
         // A governor yield to other processes refuses this job as busy. Only
         // the session token makes `finish` report Cancelled and drop the
         // result. The job reports its GPU time, so its own load is not
@@ -370,6 +389,66 @@ impl<D: ClusterBackend, S: Sampler + ClusterGovernor> OtsukaSampler<D, S> {
             })
         })
     }
+}
+
+/// The cluster schedule of a job, as the CUDA cluster sampler builds it
+/// (`ClusterWork::new`): the job's beta ladder from
+/// `sampler::build_beta_schedule`, with `sweeps_per_beta` capped at a
+/// positive `num_sweeps`, one anneal per read, and the job seed. The other
+/// fields are the [`ClusterParams`] defaults that CUDA runs with: 2 rounds,
+/// a single-spin sweep after each cluster sweep, and no knee.
+///
+/// # Errors
+/// The reason, for a sweep count past `i32`, a read count outside
+/// `1..=MAX_READS`, or a beta range or ladder that is not finite and
+/// positive. The sampler refuses such a job as `Capacity`.
+#[doc(hidden)]
+pub fn cluster_params(
+    graph: &IsingGraph,
+    params: &SampleParams,
+) -> Result<ClusterParams, &'static str> {
+    let int_max = i32::MAX.unsigned_abs() as usize;
+    if params.num_sweeps > int_max || params.sweeps_per_beta > int_max {
+        return Err("sweep count exceeds i32");
+    }
+    if params.num_reads == 0
+        || params.num_reads > MAX_READS
+        || params.beta_range.is_some_and(|(hot, cold)| {
+            !hot.is_finite() || !cold.is_finite() || hot <= 0.0 || cold <= 0.0
+        })
+    {
+        return Err("invalid read count or beta range");
+    }
+    let per_beta = if params.num_sweeps == 0 {
+        params.sweeps_per_beta.max(1)
+    } else {
+        params.sweeps_per_beta.max(1).min(params.num_sweeps)
+    };
+    let (betas, sweeps_per_beta) = crate::sampler::build_beta_schedule(
+        graph,
+        params.num_sweeps,
+        per_beta,
+        params.beta_range,
+        params.schedule,
+    );
+    let ladder = BetaLadder {
+        betas,
+        sweeps_per_beta,
+    };
+    let sweeps = ladder
+        .sweeps()
+        .filter(|&n| n > 0 && n <= int_max)
+        .ok_or("invalid read count or beta ladder")?;
+    if ladder.betas.iter().any(|b| !b.is_finite() || *b <= 0.0) {
+        return Err("invalid read count or beta ladder");
+    }
+    Ok(ClusterParams {
+        sweeps,
+        anneals: params.num_reads,
+        seed: params.seed,
+        ladder: Some(ladder),
+        ..ClusterParams::default()
+    })
 }
 
 fn checkpoint(stopped: &dyn Fn() -> bool) -> Result<(), ClusterDeviceError> {

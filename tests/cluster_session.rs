@@ -14,9 +14,9 @@ use quip_solver_core::{
     StreamOutcome, StreamResult,
 };
 use quip_solver_metal::capacity::{CapacityError, DeviceLimits};
-use quip_solver_metal::cluster::device::{ClusterDeviceError, ClusterParams};
+use quip_solver_metal::cluster::device::{BetaLadder, ClusterDeviceError, ClusterParams};
 use quip_solver_metal::cluster::sampler::{
-    ClusterBackend, ClusterGovernor, OtsukaSampler, MAX_READS,
+    cluster_params, ClusterBackend, ClusterGovernor, OtsukaSampler, MAX_READS,
 };
 use quip_solver_metal::cluster::{Model, Motifs, PreparedGraph, Weights};
 use quip_solver_metal::iokit_gov::UtilGovernor;
@@ -138,6 +138,7 @@ struct FakeSa {
     probe: Option<Probe>,
     governor: Option<Arc<UtilGovernor>>,
     busy_us: Arc<AtomicU64>,
+    governor_error: Option<&'static str>,
 }
 
 impl ClusterGovernor for FakeSa {
@@ -155,6 +156,10 @@ impl ClusterGovernor for FakeSa {
         if let Some(governor) = &self.governor {
             governor.record_gpu_busy_us(us);
         }
+    }
+
+    fn open_governor(&self) -> Result<(), String> {
+        self.governor_error.map_or(Ok(()), |e| Err(e.to_owned()))
     }
 }
 
@@ -275,15 +280,17 @@ fn every_read_is_returned_in_order_and_rescored() {
     assert!(reads.iter().all(|r| r.energy_milli == 1000));
 }
 
-/// The device gets the measured default schedule, one anneal per read, and
-/// the job seed. The job's sweep count and ladder do not change it.
+/// The device gets the job's beta ladder, one anneal per read, and the job
+/// seed, with the CUDA defaults for the other schedule fields.
 #[test]
-fn the_production_schedule_and_the_job_seed_reach_the_device() {
+fn the_job_ladder_and_the_job_seed_reach_the_device() {
     let device = FakeDevice::default();
     let sampler = sampler(device.clone(), FakeSa::default());
     let mut request = job();
-    request.params.num_sweeps = 3_000_000_000;
-    request.params.beta_range = Some((0.1, 0.2));
+    request.params.num_sweeps = 7;
+    request.params.sweeps_per_beta = 2;
+    request.params.beta_range = Some((0.5, 1.5));
+    request.params.schedule = quip_solver_core::BetaSchedule::Linear;
     let result = sampler.sample_prepared_for_test(
         &request,
         &prepared(&HEADLESS_LIMITS),
@@ -294,11 +301,102 @@ fn the_production_schedule_and_the_job_seed_reach_the_device() {
     assert_eq!(
         *calls,
         [ClusterParams {
+            sweeps: 6,
             anneals: 3,
             seed: 0x5eed,
+            ladder: Some(BetaLadder {
+                betas: vec![0.5, 1.0, 1.5],
+                sweeps_per_beta: 2,
+            }),
             ..ClusterParams::default()
         }]
     );
+}
+
+/// A family job runs the sweeps the job asks for, not a fixed count.
+#[test]
+fn a_family_job_sweep_count_follows_num_sweeps() {
+    let device = FakeDevice::default();
+    let sampler = sampler(device.clone(), FakeSa::default());
+    for (num_sweeps, sweeps_per_beta) in [(256, 1), (2048, 1), (4096, 64), (3, 100)] {
+        let mut request = job();
+        request.params.num_sweeps = num_sweeps;
+        request.params.sweeps_per_beta = sweeps_per_beta;
+        let result = sampler.sample_prepared_for_test(
+            &request,
+            &prepared(&HEADLESS_LIMITS),
+            &CancelToken::default(),
+        );
+        assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(_))));
+        let params = device.calls.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            params.sweeps, num_sweeps,
+            "{num_sweeps} / {sweeps_per_beta}"
+        );
+        let ladder = params.ladder.unwrap();
+        assert_eq!(ladder.betas.len() * ladder.sweeps_per_beta, num_sweeps);
+        // A rung never runs more sweeps than the job asks for.
+        assert!(ladder.sweeps_per_beta <= num_sweeps);
+    }
+}
+
+/// Job parameters the ladder cannot run are refusals, as in CUDA.
+#[test]
+fn job_parameters_are_refusals_and_never_launch() {
+    let device = FakeDevice::default();
+    let sampler = sampler(device.clone(), FakeSa::default());
+    let mut bad_params = vec![];
+    for (sweeps, per_beta) in [(3_000_000_000, 1), (7, 3_000_000_000)] {
+        bad_params.push(SampleParams {
+            num_sweeps: sweeps,
+            sweeps_per_beta: per_beta,
+            ..job().params
+        });
+    }
+    for range in [
+        (f64::NAN, 1.0),
+        (0.0, 1.0),
+        (-1.0, 2.0),
+        (0.1, f64::INFINITY),
+        (0.1, f64::MAX),
+        (f64::MIN_POSITIVE, 1.0),
+    ] {
+        bad_params.push(SampleParams {
+            beta_range: Some(range),
+            ..job().params
+        });
+    }
+    for params in bad_params {
+        let mut request = job();
+        request.params = params.clone();
+        let result = sampler.sample_prepared_for_test(
+            &request,
+            &prepared(&HEADLESS_LIMITS),
+            &CancelToken::default(),
+        );
+        assert!(
+            matches!(
+                result.outcome,
+                StreamOutcome::Completed(Err(SampleError::Capacity))
+            ),
+            "{params:?}"
+        );
+    }
+    assert!(device.calls.lock().unwrap().is_empty());
+}
+
+/// A job with a zero sweep count runs one rung of `sweeps_per_beta`.
+#[test]
+fn a_zero_sweep_job_runs_one_rung() {
+    let params = SampleParams {
+        num_sweeps: 0,
+        sweeps_per_beta: 5,
+        num_reads: 2,
+        ..Default::default()
+    };
+    let cluster = cluster_params(&graph(), &params).unwrap();
+    assert_eq!(cluster.sweeps, 5);
+    assert_eq!(cluster.ladder.unwrap().betas.len(), 1);
 }
 
 #[test]
@@ -395,7 +493,8 @@ fn a_device_capacity_refusal_is_a_capacity_reject() {
         result.outcome,
         StreamOutcome::Completed(Err(SampleError::Capacity))
     ));
-    assert_eq!(*device.launches.lock().unwrap(), 0);
+    // The device was asked once, and its refusal became the reject.
+    assert_eq!(device.calls.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -508,6 +607,56 @@ fn foreign_gpu_load_above_the_ceiling_stops_a_family_job() {
     assert_eq!(*device.launches.lock().unwrap(), 0);
 }
 
+/// An SA engine that does not open is logged at warn, and the cluster job
+/// still runs, with no governor yield.
+#[test]
+fn a_missing_governor_is_logged_and_the_job_still_runs() {
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogWriter(Arc::clone(&output));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let device = FakeDevice::default();
+    let sa = FakeSa {
+        governor_error: Some("Metal device 0: scripted open failure"),
+        ..Default::default()
+    };
+    let sampler = sampler(device.clone(), sa);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        sampler.sample_prepared_for_test(
+            &job(),
+            &prepared(&HEADLESS_LIMITS),
+            &CancelToken::default(),
+        )
+    });
+    assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+    assert_eq!(
+        *device.launches.lock().unwrap(),
+        SWEEP_CHUNKS + DESCENT_PASSES
+    );
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("scripted open failure"), "{log}");
+    assert!(log.contains("no governor yield"), "{log}");
+}
+
 #[test]
 fn an_abandoned_job_never_reaches_the_device() {
     let cancel = CancelToken::default();
@@ -586,6 +735,7 @@ fn capabilities_are_headless_and_bounded() {
 const ROUTING: &str = "routing";
 const SERIAL: &str = "serial";
 const TINY: &str = "tiny";
+const UNSUPPORTED: &str = "unsupported";
 
 /// Reads of the family job that the routing fake device refuses.
 const REFUSED_READS: u32 = 5;
@@ -652,6 +802,13 @@ fn headless_miner_entry() {
             );
         }
         TINY => assert_eq!(annealed, 0, "a refused family job never reaches the device"),
+        UNSUPPORTED => {
+            assert_eq!(*sa.calls.lock().unwrap(), 1, "the job runs on SA");
+            assert_eq!(
+                annealed, 0,
+                "an unsupported family never reaches the cluster"
+            );
+        }
         other => panic!("unknown mode {other}"),
     }
 }
@@ -796,6 +953,32 @@ async fn cluster_jobs_never_run_beside_sa_jobs() {
     assert_eq!(session.shutdown(2000).await, 0);
 }
 
+/// An explicit job bound to a family this binary does not list runs on SA
+/// as the plain model.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_family_job_runs_on_sa() {
+    use quip_solver_core::quip_proto::v1::coord_msg;
+    let mut session = headless_session(UNSUPPORTED).await;
+    session
+        .send(coord_msg::Msg::SetTarget(support::target(i64::MAX, 4)))
+        .await;
+    let instance = canonical::uniform_instance();
+    session
+        .send(coord_msg::Msg::Job(canonical::uniform_job(
+            &instance,
+            b"uniform-field",
+        )))
+        .await;
+    session
+        .until("the plain result", PHASE_LIMIT, |log| {
+            !log.results_for(b"uniform-field").is_empty() || log.fatal.is_some()
+        })
+        .await;
+    assert!(session.log.fatal.is_none(), "{:?}", session.log.fatal);
+    assert!(session.log.rejects.is_empty(), "{:?}", session.log.rejects);
+    assert_eq!(session.shutdown(2000).await, 0);
+}
+
 /// A family job past the cluster memory budget is a `TooLarge` reject with
 /// one refund, refused in preparation before any allocation.
 #[tokio::test(flavor = "multi_thread")]
@@ -874,6 +1057,59 @@ mod canonical {
                 family: Some(FamilyBinding {
                     family: Some(descriptor(params)),
                     nonce: vec![7; 32],
+                    instance_digest: instance.digest().to_vec(),
+                    metadata: instance.metadata().to_vec(),
+                    topology_order_digest: instance.topology_order_digest().to_vec(),
+                    node_ids: instance.node_ids().to_vec(),
+                    offset_milli: instance.offset_milli(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The canonical `vectors/uniform-field` revision 1 instance at
+    /// `P_SPEC` on `T_SPARSE`, a family that `quip-metal-otsuka` does not
+    /// list.
+    pub(super) fn uniform_instance() -> Instance {
+        use quip_solver_conformance::families::layered::{P_SPEC, UNIFORM_V1};
+        let stored = quip_solver_conformance::t_sparse().unwrap();
+        let topology = BaseTopology::new(stored.nodes, &stored.edges).unwrap();
+        let nonces: Vec<[u8; 32]> = (0..=u8::MAX).map(|byte| [byte; 32]).collect();
+        export_instances(&UNIFORM_V1, &P_SPEC, &topology, &nonces)
+            .unwrap()
+            .into_iter()
+            .find_map(Result::ok)
+            .expect("one of 256 nonces generates")
+    }
+
+    /// An explicit job of `instance`, bound to `vectors/uniform-field`.
+    pub(super) fn uniform_job(instance: &Instance, id: &[u8]) -> Job {
+        use quip_solver_conformance::families::layered::{P_SPEC, UNIFORM_V1};
+        Job {
+            job_id: id.to_vec(),
+            kind: JobKind::IsingSample as i32,
+            generation: 1,
+            ising: Some(IsingProblem {
+                graph: Some(ising_problem::Graph::Edges(EdgeList {
+                    u: instance.edges().iter().map(|&(u, _)| u).collect(),
+                    v: instance.edges().iter().map(|&(_, v)| v).collect(),
+                })),
+                encoding: CoefficientEncoding::I32 as i32,
+                scale: 1000,
+                h: encode_i32_le(instance.h()),
+                j: encode_i32_le(instance.j()),
+                num_reads: 3,
+                num_sweeps: 4,
+                family: Some(FamilyBinding {
+                    family: Some(FamilyDescriptor {
+                        family_id: UNIFORM_V1.family_id.into(),
+                        revision: UNIFORM_V1.revision,
+                        params: P_SPEC.to_vec(),
+                        params_digest: params_digest(&P_SPEC).to_vec(),
+                    }),
+                    nonce: instance.nonce().unwrap().to_vec(),
                     instance_digest: instance.digest().to_vec(),
                     metadata: instance.metadata().to_vec(),
                     topology_order_digest: instance.topology_order_digest().to_vec(),

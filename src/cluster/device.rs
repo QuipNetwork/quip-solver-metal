@@ -53,6 +53,28 @@ pub struct ClusterParams {
     pub anneals: usize,
     /// Seed of the initial spins and of every thread's random state.
     pub seed: u64,
+    /// A host beta ladder, as the CUDA cluster sampler runs a job. When set,
+    /// it replaces `beta_min`, `beta_knee`, `knee_frac`, and `beta_max`:
+    /// each command buffer stays inside one rung and runs at that rung's
+    /// constant beta. `sweeps` must equal the ladder's sweeps.
+    pub ladder: Option<BetaLadder>,
+}
+
+/// `sweeps_per_beta` sweeps at each beta in turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BetaLadder {
+    /// Positive, finite betas, in order.
+    pub betas: Vec<f32>,
+    /// Sweeps at each beta. Must be positive.
+    pub sweeps_per_beta: usize,
+}
+
+impl BetaLadder {
+    /// Total sweeps, or `None` on overflow.
+    #[must_use]
+    pub fn sweeps(&self) -> Option<usize> {
+        self.betas.len().checked_mul(self.sweeps_per_beta)
+    }
 }
 
 impl Default for ClusterParams {
@@ -67,6 +89,7 @@ impl Default for ClusterParams {
             beta_max: 12.0,
             anneals: 1,
             seed: 1,
+            ladder: None,
         }
     }
 }
@@ -154,6 +177,16 @@ impl ClusterParams {
         int(self.sweeps)?;
         int(self.single_every)?;
         int(self.rounds)?;
+        if let Some(ladder) = &self.ladder {
+            if ladder.sweeps_per_beta == 0
+                || ladder.sweeps() != Some(self.sweeps)
+                || ladder.betas.iter().any(|b| !b.is_finite() || *b <= 0.0)
+            {
+                return Err(ClusterDeviceError::Parameter(
+                    "a ladder needs positive finite betas and must cover the sweeps",
+                ));
+            }
+        }
         if ![self.beta_min, self.beta_knee, self.knee_frac, self.beta_max]
             .iter()
             .all(|v| v.is_finite())
@@ -392,8 +425,16 @@ impl ClusterDevice {
             return Err(ClusterDeviceError::Cancelled);
         }
         let buffers = self.upload(prepared, params)?;
-        let mut chunks = Vec::with_capacity(plan.windows.len());
-        for &(start, count) in &plan.windows {
+        let windows = match &params.ladder {
+            Some(ladder) => ladder_windows(&plan.windows, ladder),
+            None => plan
+                .windows
+                .iter()
+                .map(|&(start, count)| (start, count, None))
+                .collect(),
+        };
+        let mut chunks = Vec::with_capacity(windows.len());
+        for &(start, count, beta) in &windows {
             if stop() {
                 return Err(ClusterDeviceError::Cancelled);
             }
@@ -402,7 +443,19 @@ impl ClusterDevice {
                 nsweeps: window_int(count)?,
                 final_pass: 0,
             };
-            let gpu_ms = self.dispatch(&buffers, &args, window, params.anneals, busy_us)?;
+            // A ladder rung is a constant beta: `beta_at` returns `beta_min`
+            // when it equals `beta_max` and the knee is off.
+            let window_args = match beta {
+                Some(beta) => ClusterArgs {
+                    beta_min: beta,
+                    beta_knee: 0.0,
+                    knee_frac: 0.0,
+                    beta_max: beta,
+                    ..args
+                },
+                None => args,
+            };
+            let gpu_ms = self.dispatch(&buffers, &window_args, window, params.anneals, busy_us)?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a sweep count is at most i32::MAX"
@@ -622,6 +675,32 @@ fn buffer_bytes(prepared: &PreparedGraph, anneals: usize) -> [usize; 16] {
 /// `anneal * n` in the spins, `parent`, and `acc`; each thread's random
 /// state is `anneal * 512 + thread`; an ELL slot is `slot * n + node`.
 /// Preparation bounds the `int` tile, pair, colour, and ELL counts.
+/// The command buffers of a ladder run: `(first sweep, sweeps, beta)`. Each
+/// rung splits into windows no longer than the longest window of `plan`,
+/// so no command buffer crosses a rung or runs longer than planned.
+fn ladder_windows(
+    plan: &[(usize, usize)],
+    ladder: &BetaLadder,
+) -> Vec<(usize, usize, Option<f32>)> {
+    let longest = plan
+        .iter()
+        .map(|&(_, count)| count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let per = ladder.sweeps_per_beta;
+    let mut windows = Vec::new();
+    for (rung, &beta) in ladder.betas.iter().enumerate() {
+        let mut done = 0;
+        while done < per {
+            let count = longest.min(per - done);
+            windows.push((rung * per + done, count, Some(beta)));
+            done += count;
+        }
+    }
+    windows
+}
+
 fn check_capacity(
     prepared: &PreparedGraph,
     anneals: usize,
@@ -724,6 +803,55 @@ mod tests {
         DeviceLimits {
             memory_bytes: 1 << 30,
             max_buffer_bytes: 1 << 30,
+        }
+    }
+
+    #[test]
+    fn ladder_windows_stay_inside_rungs() {
+        let ladder = BetaLadder {
+            betas: vec![0.5, 1.0],
+            sweeps_per_beta: 5,
+        };
+        assert_eq!(
+            ladder_windows(&[(0, 2), (2, 2), (4, 2), (6, 2), (8, 2)], &ladder),
+            [
+                (0, 2, Some(0.5)),
+                (2, 2, Some(0.5)),
+                (4, 1, Some(0.5)),
+                (5, 2, Some(1.0)),
+                (7, 2, Some(1.0)),
+                (9, 1, Some(1.0)),
+            ]
+        );
+        // A plan longer than a rung runs each rung in one command buffer.
+        assert_eq!(
+            ladder_windows(&[(0, 10)], &ladder),
+            [(0, 5, Some(0.5)), (5, 5, Some(1.0))]
+        );
+    }
+
+    #[test]
+    fn a_ladder_must_cover_the_sweeps_with_positive_betas() {
+        let with = |betas: Vec<f32>, sweeps_per_beta, sweeps| ClusterParams {
+            sweeps,
+            ladder: Some(BetaLadder {
+                betas,
+                sweeps_per_beta,
+            }),
+            ..ClusterParams::default()
+        };
+        with(vec![0.5, 1.0], 3, 6).validate().unwrap();
+        for bad in [
+            with(vec![0.5, 1.0], 3, 7),
+            with(vec![0.5, 1.0], 0, 6),
+            with(vec![0.5, 0.0], 3, 6),
+            with(vec![0.5, f32::NAN], 3, 6),
+            with(vec![], 3, 6),
+        ] {
+            assert!(
+                matches!(bad.validate(), Err(ClusterDeviceError::Parameter(_))),
+                "{bad:?}"
+            );
         }
     }
 
@@ -950,11 +1078,11 @@ mod tests {
         // Four node passes at the default; 8 and 10 with 6 and 8 rounds.
         let six = ClusterParams {
             rounds: 6,
-            ..default
+            ..default.clone()
         };
         let eight = ClusterParams {
             rounds: 8,
-            ..default
+            ..default.clone()
         };
         assert_eq!(windows(&six)[0], (0, 50));
         assert_eq!(windows(&eight)[0], (0, 40));
