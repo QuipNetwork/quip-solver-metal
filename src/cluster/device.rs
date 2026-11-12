@@ -53,10 +53,6 @@ pub struct ClusterParams {
     pub anneals: usize,
     /// Seed of the initial spins and of every thread's random state.
     pub seed: u64,
-    /// Plans command buffers at this many updates per second instead of the
-    /// measured rate, for tests. The one-sweep ceiling then does not apply.
-    #[doc(hidden)]
-    pub planning_rate: Option<f64>,
 }
 
 impl Default for ClusterParams {
@@ -71,7 +67,6 @@ impl Default for ClusterParams {
             beta_max: 12.0,
             anneals: 1,
             seed: 1,
-            planning_rate: None,
         }
     }
 }
@@ -171,15 +166,33 @@ impl ClusterParams {
                 "betas must be finite and positive; knee fraction must be in [0, 1)",
             ));
         }
-        if self
-            .planning_rate
-            .is_some_and(|rate| !rate.is_finite() || rate <= 0.0)
-        {
-            return Err(ClusterDeviceError::Parameter(
-                "the planning rate must be finite and positive",
-            ));
-        }
         Ok(())
+    }
+
+    /// Node passes of one sweep: the cluster draw, one residual pass per
+    /// round, and the share of sweeps that run a single-spin pass.
+    fn sweep_work(&self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "rounds and single_every are at most i32::MAX"
+        )]
+        let single = if self.single_every > 0 {
+            1.0 / self.single_every as f64
+        } else {
+            0.0
+        };
+        #[expect(clippy::cast_precision_loss, reason = "rounds is at most i32::MAX")]
+        let rounds = self.rounds as f64;
+        1.0 + rounds + single
+    }
+
+    /// The chunk cost of this schedule: [`CLUSTER_COST_FACTOR`], measured at
+    /// the default schedule, times the schedule's [`Self::sweep_work`]
+    /// relative to the default, at least 1.0. The default schedule plans
+    /// exactly at the measured factor.
+    fn chunk_cost(&self) -> f64 {
+        let measured = Self::default().sweep_work();
+        CLUSTER_COST_FACTOR * (self.sweep_work() / measured).max(1.0)
     }
 
     fn args(&self, prepared: &PreparedGraph) -> Result<ClusterArgs, ClusterDeviceError> {
@@ -297,23 +310,35 @@ impl ClusterDevice {
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
     ) -> Result<Vec<Vec<i8>>, ClusterDeviceError> {
-        self.run(prepared, params, stop, true)
+        self.run(prepared, params, stop, true, None)
             .map(|trace| trace.spins)
     }
 
     /// [`Self::anneal`] with the random state and every command buffer's
     /// timing. `final_descent` false stops before the greedy passes.
+    /// `planning_rate` plans command buffers at that many updates per second
+    /// instead of the measured rate; the one-sweep ceiling then does not
+    /// apply. Production calls [`Self::anneal`], which always plans at the
+    /// measured rate.
     ///
     /// # Errors
-    /// The errors of [`Self::anneal`].
+    /// The errors of [`Self::anneal`], and a parameter error for a rate that
+    /// is not finite and positive.
     #[doc(hidden)]
     pub fn trace_for_test(
         &self,
         prepared: &PreparedGraph,
         params: &ClusterParams,
         final_descent: bool,
+        planning_rate: Option<f64>,
+        stop: &dyn Fn() -> bool,
     ) -> Result<ClusterTrace, ClusterDeviceError> {
-        self.run(prepared, params, &|| false, final_descent)
+        if planning_rate.is_some_and(|rate| !rate.is_finite() || rate <= 0.0) {
+            return Err(ClusterDeviceError::Parameter(
+                "the planning rate must be finite and positive",
+            ));
+        }
+        self.run(prepared, params, stop, final_descent, planning_rate)
     }
 
     fn run(
@@ -322,6 +347,7 @@ impl ClusterDevice {
         params: &ClusterParams,
         stop: &dyn Fn() -> bool,
         final_descent: bool,
+        planning_rate: Option<f64>,
     ) -> Result<ClusterTrace, ClusterDeviceError> {
         let args = params.args(prepared)?;
         let n = prepared.original_graph().num_nodes();
@@ -330,10 +356,10 @@ impl ClusterDevice {
             params.anneals,
             n,
             params.sweeps,
-            CLUSTER_COST_FACTOR,
-            params.planning_rate,
+            params.chunk_cost(),
+            planning_rate,
         );
-        if params.planning_rate.is_none() && plan.sweep_ms > crate::sampler::ONE_SWEEP_MAX_MS {
+        if planning_rate.is_none() && plan.sweep_ms > crate::sampler::ONE_SWEEP_MAX_MS {
             return Err(ClusterDeviceError::SweepTooLong {
                 planned_ms: plan.sweep_ms,
                 max_ms: crate::sampler::ONE_SWEEP_MAX_MS,
@@ -675,6 +701,42 @@ mod tests {
         }
     }
 
+    /// The corner-sharing fixture at 250 milli weights, so the residual
+    /// layer holds the soft tile and pair remainders.
+    fn corner_sharing() -> PreparedGraph {
+        let tiles = [[0, 1, 2, 3], [3, 4, 5, 6]];
+        let gauges = [[1, -1, 1, 1], [-1, 1, 1, -1]];
+        let mut edges = vec![(0, 4), (5, 7), (1, 5), (2, 6), (1, 4), (6, 7)];
+        let mut j = vec![-1000, -1000, 300, -200, 700, 500];
+        for (tile, gauge) in tiles.iter().zip(gauges) {
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    edges.push((tile[a], tile[b]));
+                    j.push(1000 * i32::from(gauge[a] * gauge[b]));
+                }
+            }
+        }
+        PreparedGraph::new(
+            &Model {
+                h_milli: &[0; 8],
+                edges: &edges,
+                j_milli: &j,
+            },
+            &Motifs {
+                tiles: &tiles,
+                gauges: &gauges,
+                pairs: &[(0, 4), (5, 7)],
+            },
+            Weights {
+                tile_milli: 250,
+                pair_milli: 250,
+            },
+            &limits(),
+            1,
+        )
+        .unwrap()
+    }
+
     fn single_node() -> PreparedGraph {
         PreparedGraph::new(
             &Model {
@@ -764,10 +826,6 @@ mod tests {
                 knee_frac: 1.0,
                 ..q.clone()
             },
-            ClusterParams {
-                planning_rate: Some(0.0),
-                ..q.clone()
-            },
             ClusterParams { beta_min: 0.0, ..q },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
@@ -776,11 +834,49 @@ mod tests {
 
     #[test]
     fn allocations_match_the_footprint() {
-        let p = single_node();
-        for anneals in [1, 3, 64] {
-            let total: usize = buffer_bytes(&p, anneals).iter().sum();
-            assert_eq!(total, p.footprint().total(anneals, 1));
+        let empty = single_node();
+        let full = corner_sharing();
+        // Tiles, gauges, pairs, and residual edges in both ELL tables.
+        let d = full.layout();
+        assert!(!d.tiles.is_empty() && !d.pairs.is_empty());
+        assert!(d.weak_deg.iter().any(|&deg| deg > 0));
+        assert!(!d.weak_ell.is_empty() && !d.all_ell.is_empty());
+        for p in [&empty, &full] {
+            for anneals in [1, 3, 64] {
+                let total: usize = buffer_bytes(p, anneals).iter().sum();
+                assert_eq!(total, p.footprint().total(anneals, 1));
+            }
         }
+    }
+
+    #[test]
+    fn more_rounds_give_proportionally_smaller_windows() {
+        // At 1,000 nodes, one anneal, and 1.4e6 updates per second, a
+        // 500 ms budget holds 100 sweeps at the measured factor of 7.0.
+        let windows = |q: &ClusterParams| {
+            crate::sampler::cluster_plan(1, 1000, 1000, q.chunk_cost(), Some(1.4e6)).windows
+        };
+        let default = ClusterParams::default();
+        assert_eq!(default.chunk_cost(), CLUSTER_COST_FACTOR);
+        assert_eq!(windows(&default)[0], (0, 100));
+        // Four node passes at the default; 8 and 10 with 6 and 8 rounds.
+        let six = ClusterParams {
+            rounds: 6,
+            ..default
+        };
+        let eight = ClusterParams {
+            rounds: 8,
+            ..default
+        };
+        assert_eq!(windows(&six)[0], (0, 50));
+        assert_eq!(windows(&eight)[0], (0, 40));
+        // A lighter schedule keeps the measured factor.
+        let light = ClusterParams {
+            rounds: 1,
+            single_every: 0,
+            ..default
+        };
+        assert_eq!(light.chunk_cost(), CLUSTER_COST_FACTOR);
     }
 
     #[test]

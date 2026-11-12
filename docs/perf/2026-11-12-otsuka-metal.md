@@ -41,6 +41,12 @@ Three runs at a factor of 7.0 gave the following longest chunks, in milliseconds
 
 Every greedy pass of the final descent took less than 1 ms. Each run converged in 3 passes.
 
+## Other schedules
+
+The measurement used the default schedule, with 2 rounds and a single-spin sweep after every cluster sweep. `ClusterParams::chunk_cost` scales the factor by the work of one sweep, counted in passes over the nodes. The cluster draw is one pass, and each round adds one pass. The single-spin sweeps add `1 / single_every` of a pass.
+
+The default schedule does 4 passes, so it plans at exactly 7.0. A schedule with more work plans at 7.0 times its passes divided by 4: 8 rounds give 10 passes and a factor of 17.5. A schedule with less work keeps 7.0. This scaling is an estimate, and this report has no measurement of another schedule.
+
 ## Limits of this result
 
 - The factor covers 1 to 256 anneals at 4,577 nodes. Below 64 anneals, chunks run about 100 ms, so a run uses about four times as many command buffers as a quiet GPU needs. The planner has one factor and has no occupancy curve of its own for the cluster kernel.

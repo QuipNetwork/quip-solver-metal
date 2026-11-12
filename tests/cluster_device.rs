@@ -8,7 +8,7 @@ use quip_solver_core::ising_generators::family::BaseTopology;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
 use quip_solver_core::ising_generators::instance::Instance;
 use quip_solver_metal::capacity::DeviceLimits;
-use quip_solver_metal::cluster::device::{ClusterDevice, ClusterParams};
+use quip_solver_metal::cluster::device::{ClusterDevice, ClusterDeviceError, ClusterParams};
 use quip_solver_metal::cluster::{Model, Motifs, PreparedGraph, Weights};
 
 #[path = "support/cluster_reference.rs"]
@@ -146,10 +146,11 @@ fn sweeps_match_the_host_reference_before_final_descent() {
                     knee_frac: if knee { 0.4 } else { 0.0 },
                     anneals: 4,
                     seed,
-                    planning_rate: None,
                 };
                 let (expected, rng) = reference::run(&p, &q);
-                let actual = device.trace_for_test(&p, &q, false).unwrap();
+                let actual = device
+                    .trace_for_test(&p, &q, false, None, &|| false)
+                    .unwrap();
                 assert_eq!(
                     actual.spins, expected,
                     "spins: {q:?}, {weights:?}, seed {seed}"
@@ -157,6 +158,43 @@ fn sweeps_match_the_host_reference_before_final_descent() {
                 assert_eq!(actual.rng, rng, "RNG: {q:?}, {weights:?}, seed {seed}");
             }
         }
+    }
+}
+
+// The same comparison where union-find is contended: the Advantage2 instance
+// has thousands of tiles that share nodes, spread over all 512 threads. Each
+// `(sweeps, single_every, rounds, seed)` keeps every reference decision more
+// than 1e-5 from its threshold; most other seeds trip the reference's
+// near-tie guard, which is not a mismatch.
+#[test]
+fn sweeps_match_the_host_reference_at_4577_nodes() {
+    let device = device();
+    let p = advantage2(4);
+    for (sweeps, single_every, rounds, seed) in [
+        (1, 0, 2, 2),
+        (1, 0, 2, 4),
+        (3, 1, 2, 4),
+        (3, 1, 2, 5),
+        (2, 1, 3, 1),
+        (2, 2, 3, 4),
+        (4, 2, 3, 33),
+    ] {
+        let q = ClusterParams {
+            sweeps,
+            single_every,
+            rounds,
+            beta_min: 0.3,
+            beta_max: 4.0,
+            anneals: 4,
+            seed,
+            ..ClusterParams::default()
+        };
+        let (expected, rng) = reference::run(&p, &q);
+        let actual = device
+            .trace_for_test(&p, &q, false, None, &|| false)
+            .unwrap();
+        assert_eq!(actual.spins, expected, "spins: {q:?}");
+        assert_eq!(actual.rng, rng, "RNG: {q:?}");
     }
 }
 
@@ -172,16 +210,16 @@ fn chunked_and_unchunked_anneals_match() {
             knee_frac: 0.4,
             anneals: 32,
             seed: 7,
-            // One sweep per command buffer.
-            planning_rate: Some(1.0),
             ..ClusterParams::default()
         };
-        let whole = ClusterParams {
-            planning_rate: Some(1e18),
-            ..one_sweep.clone()
+        // One sweep per command buffer, and one command buffer.
+        let trace = |rate, descent| {
+            device
+                .trace_for_test(&p, &one_sweep, descent, Some(rate), &|| false)
+                .unwrap()
         };
-        let chunked = device.trace_for_test(&p, &one_sweep, false).unwrap();
-        let unchunked = device.trace_for_test(&p, &whole, false).unwrap();
+        let chunked = trace(1.0, false);
+        let unchunked = trace(1e18, false);
         assert_eq!(chunked.chunks.len(), 32);
         assert!(chunked.chunks.iter().all(|c| c.sweeps == 1));
         assert_eq!(unchunked.chunks.len(), 1);
@@ -189,9 +227,9 @@ fn chunked_and_unchunked_anneals_match() {
         assert_eq!(chunked.spins, unchunked.spins);
         assert_eq!(chunked.rng, unchunked.rng);
         // With the final descent, and through the production entry point.
-        let a = device.anneal(&p, &one_sweep, &|| false).unwrap();
-        let b = device.anneal(&p, &whole, &|| false).unwrap();
-        assert_eq!(a, b);
+        let a = trace(1.0, true).spins;
+        assert_eq!(a, trace(1e18, true).spins);
+        assert_eq!(a, device.anneal(&p, &one_sweep, &|| false).unwrap());
         assert_eq!(a, device.anneal(&p, &one_sweep, &|| false).unwrap());
     }
 }
@@ -269,11 +307,14 @@ fn the_final_descent_reaches_a_local_minimum() {
         knee_frac: 0.4,
         anneals: 4,
         seed: u64::MAX,
-        planning_rate: Some(1.0),
         ..ClusterParams::default()
     };
-    let before = device.trace_for_test(&p, &q, false).unwrap();
-    let after = device.trace_for_test(&p, &q, true).unwrap();
+    let before = device
+        .trace_for_test(&p, &q, false, Some(1.0), &|| false)
+        .unwrap();
+    let after = device
+        .trace_for_test(&p, &q, true, Some(1.0), &|| false)
+        .unwrap();
     assert_eq!(after.spins.len(), 4);
     assert_ne!(before.spins, after.spins, "the descent changed nothing");
     assert_local_minima(&p, &after.spins);
@@ -303,8 +344,49 @@ fn a_4577_node_instance_runs() {
     // Cancellation before the first command buffer returns no reads.
     assert!(matches!(
         device.anneal(&p, &q, &|| true),
-        Err(quip_solver_metal::cluster::device::ClusterDeviceError::Cancelled)
+        Err(ClusterDeviceError::Cancelled)
     ));
+}
+
+#[test]
+fn stop_between_command_buffers_cancels() {
+    let device = device();
+    let p = advantage2(8);
+    let q = ClusterParams {
+        sweeps: 1024,
+        anneals: 8,
+        seed: 3,
+        ..ClusterParams::default()
+    };
+    // `stop` runs once before allocation and once before each command
+    // buffer: `sweep_chunks` sweep windows, then the descent passes.
+    let calls = std::cell::Cell::new(0_usize);
+    let counted = || {
+        calls.set(calls.get() + 1);
+        false
+    };
+    let full = device.trace_for_test(&p, &q, true, None, &counted).unwrap();
+    let sweep_chunks = full.chunks.iter().filter(|c| c.sweeps > 0).count();
+    let passes = full.chunks.len() - sweep_chunks;
+    assert!(sweep_chunks >= 2, "{sweep_chunks} sweep chunks");
+    assert!(passes >= 2, "{passes} descent passes");
+    assert_eq!(calls.get(), 1 + full.chunks.len());
+    // True before the second sweep chunk, then before the second pass.
+    for stop_at in [3, 1 + sweep_chunks + 2] {
+        let calls = std::cell::Cell::new(0_usize);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            calls.get() == stop_at
+        };
+        assert!(
+            matches!(
+                device.anneal(&p, &q, &stop),
+                Err(ClusterDeviceError::Cancelled)
+            ),
+            "stop at call {stop_at}"
+        );
+        assert_eq!(calls.get(), stop_at);
+    }
 }
 
 #[test]
@@ -375,7 +457,9 @@ fn cluster_chunks_stay_under_the_ceiling() {
             seed: 5,
             ..ClusterParams::default()
         };
-        let trace = device.trace_for_test(&p, &q, true).unwrap();
+        let trace = device
+            .trace_for_test(&p, &q, true, None, &|| false)
+            .unwrap();
         let sweeps: Vec<_> = trace.chunks.iter().filter(|c| c.sweeps > 0).collect();
         let max = sweeps.iter().map(|c| c.gpu_ms).fold(0.0, f64::max);
         let ratio = sweeps

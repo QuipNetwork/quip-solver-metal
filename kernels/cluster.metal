@@ -179,6 +179,11 @@ kernel void cluster_anneal(
                 if (np == 0 || np == 4) continue;
                 float r = urand(rng);
                 float tz0 = zero_ice, tsi = single_ice, tzd = zero_defect;
+                // The per-tile and per-link weight branches mirror CUDA's
+                // nullable weight arrays. The prepared graph gives every tile
+                // and every pair the same weight today, and the host passes
+                // that weight as q.tile_w and q.dimer_w, so the shared values
+                // above apply.
                 if (float(tile_w[t]) != q.tile_w) {
                     float tbt = beta * float(tile_w[t]) * 0.001f;
                     float tz = exp(-2.0f * tbt);
