@@ -373,11 +373,15 @@ fn max_nodes_above_the_limit_fails_at_open() {
         assert_eq!(caps["maxNodes"], 1_000, "{bin}: {caps}");
         assert_eq!(capabilities(limit).status.code(), Some(0), "{bin}");
 
-        let out = capabilities(limit + 1);
-        assert_eq!(out.status.code(), Some(64), "{bin}");
-        assert!(out.stdout.is_empty(), "{bin}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(&limit.to_string()), "{bin}: {stderr}");
+        // A zero cap would advertise no bound, so it fails like one past the
+        // limit.
+        for cap in [limit + 1, 0] {
+            let out = capabilities(cap);
+            assert_eq!(out.status.code(), Some(64), "{bin} --max-nodes {cap}");
+            assert!(out.stdout.is_empty(), "{bin} --max-nodes {cap}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains(&limit.to_string()), "{bin}: {stderr}");
+        }
     }
 }
 

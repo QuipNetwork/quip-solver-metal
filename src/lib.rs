@@ -226,8 +226,8 @@ fn identity(
 ///
 /// # Errors
 ///
-/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it, or when
-/// no model fits `limits`.
+/// [`CapacityError::Nodes`] naming the limit when `cap` is 0 or exceeds it,
+/// or when no model fits `limits`.
 ///
 /// # Examples
 ///
@@ -299,7 +299,7 @@ pub fn metal_msa_identity(
 }
 
 /// The identity of `kernel` on this host with `max_nodes` lowered to `cap`,
-/// or, when `cap` passes the limit, the exit code of an invalid
+/// or, when `cap` is 0 or passes the limit, the exit code of an invalid
 /// configuration after a message on standard error. The binaries call it
 /// before they open anything, so `--capabilities` prints the same limits.
 ///
@@ -322,7 +322,7 @@ pub fn host_identity(kernel: Kernel, cap: Option<usize>) -> Result<BackendIdenti
         {
             match (cap, e) {
                 (Some(cap), CapacityError::Nodes { max }) => eprintln!(
-                    "--max-nodes {cap} exceeds the {max} nodes this host admits for {kernel:?}"
+                    "--max-nodes {cap} is outside 1 to {max}, the nodes this host admits for {kernel:?}"
                 ),
                 (_, e) => eprintln!("no {kernel:?} model fits this host: {e}"),
             }
@@ -1200,6 +1200,15 @@ mod tests {
                 super::host_identity(kernel, Some(limit + 1)).is_err(),
                 "{kernel:?}"
             );
+            // The harness reads `max_nodes == 0` as no bound, so a zero cap
+            // would lift the limit it was meant to lower.
+            let zero = super::identity(kernel, identity.adapt, identity.limits, limits, Some(0));
+            assert_eq!(
+                zero.map(|_| ()),
+                Err(crate::capacity::CapacityError::Nodes { max: limit }),
+                "{kernel:?}"
+            );
+            assert!(super::host_identity(kernel, Some(0)).is_err(), "{kernel:?}");
             assert_eq!(
                 super::host_identity(kernel, Some(limit)).map(|id| id.max_nodes),
                 Ok(identity.max_nodes),

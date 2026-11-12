@@ -979,8 +979,9 @@ pub fn advertised_couplers(kernel: Kernel, limits: &DeviceLimits) -> usize {
 ///
 /// # Errors
 ///
-/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it, or when
-/// the limit is 0: a zero `max_nodes` would advertise no bound at all.
+/// [`CapacityError::Nodes`] naming the limit when `cap` is 0 or exceeds it,
+/// or when the limit is 0: the harness reads a zero `max_nodes` as no bound
+/// at all.
 pub fn advertised_nodes(
     kernel: Kernel,
     limits: &DeviceLimits,
@@ -993,7 +994,7 @@ pub fn advertised_nodes(
     });
     match cap {
         _ if limit == 0 => Err(CapacityError::Nodes { max: 0 }),
-        Some(cap) if cap > limit => Err(CapacityError::Nodes { max: limit }),
+        Some(cap) if cap == 0 || cap > limit => Err(CapacityError::Nodes { max: limit }),
         Some(cap) => Ok(cap),
         None => Ok(limit),
     }
