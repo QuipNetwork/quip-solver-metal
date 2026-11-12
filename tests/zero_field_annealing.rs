@@ -350,3 +350,57 @@ fn msa_spill_build_anneals_the_zero_field_ring() {
 fn msa_float_spill_build_anneals_the_zero_field_ring() {
     assert_spill_build_anneals_the_zero_field_ring(FLOAT_J);
 }
+
+/// Assert the QUIP_SA_GLOBAL build reaches the ground state of the zero-field
+/// ring with coupling `j`, and that sweep windows of one sweep return the same
+/// reads. 1 takes the int8 build, 1000 the wide build and `FLOAT_J` the
+/// Float32 build.
+fn assert_sa_global_build_anneals_the_zero_field_ring(j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 256,
+        sweeps_per_beta: 4,
+        seed: 7,
+        ..Default::default()
+    };
+    let run = |planning_rate| {
+        let tuning = Tuning {
+            sa_global: true,
+            planning_rate,
+            ..Tuning::default()
+        };
+        sample_ising_tuned(&dev, &graph, &params, Kernel::Sa, tuning).unwrap()
+    };
+    // One command buffer, then one sweep per command buffer.
+    let whole = run(Some(1e18));
+    assert_eq!(whole.plan.len(), 1, "j {j}");
+    let windows = run(Some(1.0));
+    assert_eq!(windows.plan.len(), params.num_sweeps, "j {j}");
+    assert_eq!(
+        windows.reads, whole.reads,
+        "j {j}: windows change the reads"
+    );
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = whole
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "SA global j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn sa_global_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_sa_global_build_anneals_the_zero_field_ring(j);
+    }
+}
