@@ -317,6 +317,20 @@ impl SelfFeedingTopology {
         Self::without_csr(n, greedy_color(n, &row_ptr, &col_ind))
     }
 
+    /// No CSR and no colours, for the dense-matrix SA kernel, which reads
+    /// neither. `colors.num_colors` is 0 and every array is empty.
+    pub(crate) fn bare(n: usize) -> Self {
+        Self::without_csr(
+            n,
+            ColorBlocks {
+                starts: Vec::new(),
+                counts: Vec::new(),
+                nodes: Vec::new(),
+                num_colors: 0,
+            },
+        )
+    }
+
     fn without_csr(n: usize, colors: ColorBlocks) -> Self {
         Self {
             n,

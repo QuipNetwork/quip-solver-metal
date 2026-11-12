@@ -24,7 +24,7 @@
 //! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. It
 //!   admits any degree, so a multi-spin model past the sparse degree routes
 //!   here. [`routed_footprint`] keeps a graph with a repeated coupler or a
-//!   self-loop off this tier. Only the multi-spin kernel runs it (see
+//!   self-loop off this tier. The multi-spin and SA kernels run it (see
 //!   [`runnable_storages`]).
 //!
 //! Every formula sits in one small function per kernel, so a later task can
@@ -588,15 +588,15 @@ fn routed_on(
     Ok(chosen)
 }
 
-/// The tiers a kernel of this crate runs. No SA or Gibbs dense kernel
-/// exists, so those kernels upload CSR whatever tier [`footprint`] prices.
-/// A dense kernel adds its tier here: the multi-spin kernel runs dense
-/// storage on the batch path (`kernels/msa_dense.metal`).
+/// The tiers a kernel of this crate runs. No Gibbs dense kernel exists, so
+/// that kernel uploads CSR whatever tier [`footprint`] prices. A dense kernel
+/// adds its tier here: the multi-spin and SA kernels run dense storage on
+/// the batch path (`kernels/msa_dense.metal`, `kernels/sa_dense.metal`).
 #[must_use]
 pub const fn runnable_storages(kernel: Kernel) -> &'static [Storage] {
     match kernel {
-        Kernel::Sa | Kernel::Gibbs => &[Storage::Threadgroup, Storage::Spill],
-        Kernel::Msa => &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
+        Kernel::Gibbs => &[Storage::Threadgroup, Storage::Spill],
+        Kernel::Sa | Kernel::Msa => &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
     }
 }
 
@@ -955,11 +955,11 @@ mod tests {
         }
     }
 
-    /// No SA dense kernel exists, so the sampler's admission prices an SA
+    /// No Gibbs dense kernel exists, so the sampler's admission prices a Gibbs
     /// complete model past the local frame on CSR, and refuses it when CSR
     /// does not fit, even where the dense tier would.
     #[test]
-    fn an_sa_complete_model_past_the_frame_is_priced_on_csr() {
+    fn a_gibbs_complete_model_past_the_frame_is_priced_on_csr() {
         let shape = ModelShape {
             nodes: 5_000,
             edges: 5_000 * 4_999 / 2,
@@ -969,21 +969,21 @@ mod tests {
             reads: 256,
         };
         assert_eq!(
-            footprint(Kernel::Sa, &shape, &ROOMY).unwrap().storage,
+            footprint(Kernel::Gibbs, &shape, &ROOMY).unwrap().storage,
             Storage::Dense
         );
-        let runnable = runnable_footprint(Kernel::Sa, &shape, &ROOMY).unwrap();
+        let runnable = runnable_footprint(Kernel::Gibbs, &shape, &ROOMY).unwrap();
         assert_eq!(runnable.storage, Storage::Spill);
         assert_eq!(
             runnable.per_instance_bytes,
-            sum(&spill_sizes(Kernel::Sa, &shape).per_instance)
+            sum(&spill_sizes(Kernel::Gibbs, &shape).per_instance)
         );
         let col_ind = shape.edges * 2 * COL_IND_ENTRY_BYTES;
         assert!(runnable.per_instance_bytes > col_ind);
 
         // Room for the dense tier but not for CSR.
-        let dense = footprint(Kernel::Sa, &shape, &ROOMY).unwrap();
-        let in_flight = instances(Kernel::Sa, shape.reads);
+        let dense = footprint(Kernel::Gibbs, &shape, &ROOMY).unwrap();
+        let in_flight = instances(Kernel::Gibbs, shape.reads);
         let memory = (dense.total(in_flight) + runnable.total(in_flight)) / 2 / 4 * 5;
         let limits = DeviceLimits {
             memory_bytes: memory,
@@ -991,11 +991,11 @@ mod tests {
             max_buffer_bytes: memory,
         };
         assert_eq!(
-            footprint(Kernel::Sa, &shape, &limits).unwrap().storage,
+            footprint(Kernel::Gibbs, &shape, &limits).unwrap().storage,
             Storage::Dense
         );
         assert!(matches!(
-            runnable_footprint(Kernel::Sa, &shape, &limits),
+            runnable_footprint(Kernel::Gibbs, &shape, &limits),
             Err(CapacityError::Memory { .. })
         ));
     }
@@ -1135,9 +1135,22 @@ mod tests {
                 max: MSA_SPARSE_MAX_DEG
             })
         );
-        // SA has no dense kernel, so its batch path prices CSR.
+        // Gibbs has no dense kernel, so its batch path prices CSR; SA runs
+        // dense, and a repeated coupler keeps it on CSR.
         assert_ne!(
+            routed_runnable_footprint(Kernel::Gibbs, &graph, &shape, &ROOMY)
+                .unwrap()
+                .storage,
+            Storage::Dense
+        );
+        assert_eq!(
             routed_runnable_footprint(Kernel::Sa, &graph, &shape, &ROOMY)
+                .unwrap()
+                .storage,
+            Storage::Dense
+        );
+        assert_ne!(
+            routed_runnable_footprint(Kernel::Sa, &repeated, &shape_of(&repeated), &ROOMY)
                 .unwrap()
                 .storage,
             Storage::Dense

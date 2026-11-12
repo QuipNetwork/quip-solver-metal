@@ -80,6 +80,21 @@ fn float(source: &str) -> String {
     format!("{FLOAT_DEFINE}{source}")
 }
 
+/// The dense-matrix SA kernel, appended to [`SA_SRC`] for its typedefs, RNG,
+/// and spin helpers; see `kernels/sa_dense.metal`.
+const SA_DENSE_SRC: &str = include_str!("../kernels/sa_dense.metal");
+
+/// Prepended to a dense-matrix SA variant whose matrix holds two bit planes
+/// per 32 columns (a unit model).
+const SA_MATRIX_BITS_DEFINE: &str = "#define QUIP_SA_MATRIX_BITS 1\n";
+
+/// The dense-matrix SA kernel source after the `defines` of its variant. The
+/// kernel keeps each read's state in the persistent buffers, so every
+/// variant is a global build.
+fn sa_matrix(defines: &str) -> String {
+    format!("{SA_GLOBAL_DEFINE}{defines}{SA_SRC}\n{SA_DENSE_SRC}")
+}
+
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
@@ -210,6 +225,18 @@ pub struct MetalDevice {
     /// Dense-matrix multi-spin with a `float` matrix and the float lane's
     /// acceptance.
     pub(crate) msa_matrix_float: ComputePipelineState,
+    /// Dense-matrix SA (`kernels/sa_dense.metal`) with a bit matrix and
+    /// `int8_t` deltas, for a unit model.
+    pub(crate) sa_matrix_bits: ComputePipelineState,
+    /// Dense-matrix SA with an `int8_t` matrix and `int8_t` deltas.
+    pub(crate) sa_matrix_i8: ComputePipelineState,
+    /// Dense-matrix SA with an `int8_t` matrix times one integer scale and
+    /// milli `int` deltas.
+    pub(crate) sa_matrix_wide_i8: ComputePipelineState,
+    /// Dense-matrix SA with a milli `int` matrix.
+    pub(crate) sa_matrix_int: ComputePipelineState,
+    /// Dense-matrix SA with a `float` matrix.
+    pub(crate) sa_matrix_float: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -328,6 +355,13 @@ impl MetalDevice {
         let msa_matrix_i8 = matrix(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
         let msa_matrix_int = matrix("")?;
         let msa_matrix_float = matrix(FLOAT_DEFINE)?;
+        let sa_matrix_pipeline =
+            |defines: &str| compile_pipeline(&device, &sa_matrix(defines), "sa_matrix_anneal");
+        let sa_matrix_bits = sa_matrix_pipeline(SA_MATRIX_BITS_DEFINE)?;
+        let sa_matrix_i8 = sa_matrix_pipeline("")?;
+        let sa_matrix_wide_i8 = sa_matrix_pipeline(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
+        let sa_matrix_int = sa_matrix_pipeline(WIDE_DEFINE)?;
+        let sa_matrix_float = sa_matrix_pipeline(FLOAT_DEFINE)?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -370,6 +404,11 @@ impl MetalDevice {
             msa_matrix_i8,
             msa_matrix_int,
             msa_matrix_float,
+            sa_matrix_bits,
+            sa_matrix_i8,
+            sa_matrix_wide_i8,
+            sa_matrix_int,
+            sa_matrix_float,
             msa_slots,
             msa_screen,
             msa_frustration_draw,
@@ -511,6 +550,11 @@ mod tests {
             ("msa_matrix_i8", &dev.msa_matrix_i8),
             ("msa_matrix_int", &dev.msa_matrix_int),
             ("msa_matrix_float", &dev.msa_matrix_float),
+            ("sa_matrix_bits", &dev.sa_matrix_bits),
+            ("sa_matrix_i8", &dev.sa_matrix_i8),
+            ("sa_matrix_wide_i8", &dev.sa_matrix_wide_i8),
+            ("sa_matrix_int", &dev.sa_matrix_int),
+            ("sa_matrix_float", &dev.sa_matrix_float),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");
