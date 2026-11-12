@@ -52,8 +52,6 @@ const ADVERTISED_BETAS: usize = 64;
 const HEADROOM_NUM: usize = 4;
 /// Memory headroom denominator, as CUDA's `MEMORY_HEADROOM_DEN`.
 const HEADROOM_DEN: usize = 5;
-/// Threadgroup memory of every Apple GPU, in bytes. No opt-in raises it.
-const TG_MEMORY_BYTES: usize = 32_768;
 /// Threads per chromatic-Gibbs threadgroup (`kernels/gibbs.metal`).
 const GIBBS_GROUP_THREADS: usize = 256;
 /// Bytes of xoshiro128** state per random stream (four `uint`).
@@ -64,8 +62,6 @@ const RNG_BYTES_PER_STREAM: usize = 16;
 pub struct DeviceLimits {
     /// Memory the miner may plan against, in bytes.
     pub memory_bytes: usize,
-    /// Threadgroup memory per threadgroup, in bytes.
-    pub tg_memory_bytes: usize,
     /// Largest single buffer, in bytes.
     pub max_buffer_bytes: usize,
 }
@@ -114,9 +110,8 @@ fn physical_memory_bytes() -> Option<usize> {
     }
 }
 
-/// Limits of this host: half of `hw.memsize` as planning memory, 32,768
-/// bytes of threadgroup memory, and a buffer limit equal to the planning
-/// memory.
+/// Limits of this host: half of `hw.memsize` as planning memory, and a
+/// buffer limit equal to the planning memory.
 ///
 /// When `hw.memsize` cannot be read, the memory is 0, so every model is
 /// refused rather than planned against a guessed size.
@@ -131,7 +126,6 @@ pub fn host_limits() -> DeviceLimits {
     );
     DeviceLimits {
         memory_bytes,
-        tg_memory_bytes: TG_MEMORY_BYTES,
         max_buffer_bytes: memory_bytes,
     }
 }
@@ -811,7 +805,6 @@ mod tests {
 
     const ROOMY: DeviceLimits = DeviceLimits {
         memory_bytes: 1 << 40,
-        tg_memory_bytes: TG_MEMORY_BYTES,
         max_buffer_bytes: 1 << 40,
     };
 
@@ -852,7 +845,6 @@ mod tests {
     fn usable_bytes_keeps_one_fifth_headroom() {
         let limits = DeviceLimits {
             memory_bytes: 1000,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1000,
         };
         assert_eq!(limits.usable_bytes(), 800);
@@ -862,7 +854,6 @@ mod tests {
     fn usable_bytes_does_not_overflow_on_huge_memory() {
         let limits = DeviceLimits {
             memory_bytes: usize::MAX,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: usize::MAX,
         };
         assert!(limits.usable_bytes() > usize::MAX / 5 * 4 - 1);
@@ -872,7 +863,6 @@ mod tests {
     fn host_limits_read_half_of_physical_memory() {
         let limits = host_limits();
         assert!(limits.memory_bytes > 0);
-        assert_eq!(limits.tg_memory_bytes, 32_768);
         assert_eq!(limits.max_buffer_bytes, limits.memory_bytes);
     }
 
@@ -1167,7 +1157,6 @@ mod tests {
     fn a_model_over_memory_is_refused() {
         let limits = DeviceLimits {
             memory_bytes: 1 << 20,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1 << 20,
         };
         for kernel in KERNELS {
@@ -1180,7 +1169,6 @@ mod tests {
     fn a_buffer_over_the_limit_is_refused() {
         let limits = DeviceLimits {
             memory_bytes: 1 << 40,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1 << 10,
         };
         let err = footprint(Kernel::Sa, &unit_shape(), &limits).unwrap_err();
@@ -1247,7 +1235,6 @@ mod tests {
     fn memory_is_checked_before_the_buffer_limit() {
         let limits = DeviceLimits {
             memory_bytes: 1 << 20,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1 << 10,
         };
         let err = footprint(Kernel::Sa, &sparse_shape(), &limits).unwrap_err();
@@ -1277,7 +1264,6 @@ mod tests {
         };
         let limits = DeviceLimits {
             memory_bytes: 1 << 40,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1 << 20,
         };
         for kernel in KERNELS {
@@ -1316,7 +1302,6 @@ mod tests {
         assert!(dense_largest > threadgroup_largest);
         let limits = DeviceLimits {
             memory_bytes: 1 << 40,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: threadgroup_largest,
         };
         assert_eq!(
@@ -1355,7 +1340,6 @@ mod tests {
     /// 64 GiB of planning memory, near a large Apple Silicon host.
     const BIG: DeviceLimits = DeviceLimits {
         memory_bytes: 64 << 30,
-        tg_memory_bytes: TG_MEMORY_BYTES,
         max_buffer_bytes: 64 << 30,
     };
 
@@ -1445,7 +1429,6 @@ mod tests {
     fn fit_is_monotone_in_the_node_count() {
         let limits = DeviceLimits {
             memory_bytes: 1 << 25,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 1 << 25,
         };
         for kernel in KERNELS {
@@ -1470,7 +1453,6 @@ mod tests {
     fn max_model_is_none_when_one_node_does_not_fit() {
         let tiny = DeviceLimits {
             memory_bytes: 16,
-            tg_memory_bytes: TG_MEMORY_BYTES,
             max_buffer_bytes: 16,
         };
         for kernel in KERNELS {

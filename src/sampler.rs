@@ -4872,7 +4872,6 @@ mod tests {
         // only possible cause of the refusal.
         let limits = crate::capacity::DeviceLimits {
             memory_bytes: 0,
-            tg_memory_bytes: 32_768,
             max_buffer_bytes: 0,
         };
         let device = (crate::metal_device::MetalDevice::device_count() > 0)
