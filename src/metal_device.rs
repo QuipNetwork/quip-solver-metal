@@ -39,6 +39,14 @@ const MSA_DENSE_DEFINE: &str = "#define QUIP_MSA_DENSE 1\n";
 /// threadgroup memory.
 const MSA_SPILL_DEFINE: &str = "#define QUIP_MSA_SPILL 1\n";
 
+/// Prepended to an SA variant that keeps each read's spins and
+/// `delta_energy` in device memory instead of the thread-private frame.
+const SA_GLOBAL_DEFINE: &str = "#define QUIP_SA_GLOBAL 1\n";
+
+fn global_state(source: &str) -> String {
+    format!("{SA_GLOBAL_DEFINE}{source}")
+}
+
 fn msa_dense(source: &str) -> String {
     format!("{MSA_DENSE_DEFINE}{source}")
 }
@@ -106,6 +114,16 @@ pub struct MetalDevice {
     pub(crate) sa_float: ComputePipelineState,
     /// `sa_wide` with `int8_t` coefficients times one integer scale.
     pub(crate) sa_wide_i8: ComputePipelineState,
+    /// `sa` with each read's spins and `delta_energy` in device memory (the
+    /// `QUIP_SA_GLOBAL` build), for a model past the thread-private frame of
+    /// `sampler::SA_MAX_NODES` nodes.
+    pub(crate) sa_global: ComputePipelineState,
+    /// `sa_wide` on the global build.
+    pub(crate) sa_wide_global: ComputePipelineState,
+    /// `sa_float` on the global build.
+    pub(crate) sa_float_global: ComputePipelineState,
+    /// `sa_wide_i8` on the global build.
+    pub(crate) sa_wide_i8_global: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
     pub(crate) gibbs_wide: ComputePipelineState,
     /// `gibbs` for Float32 models: `float` coefficients and heat-bath.
@@ -199,6 +217,23 @@ impl MetalDevice {
         let sa_wide = compile_pipeline(&device, &wide(SA_SRC), "pure_simulated_annealing")?;
         let sa_float = compile_pipeline(&device, &float(SA_SRC), "pure_simulated_annealing")?;
         let sa_wide_i8 = compile_pipeline(&device, &wide_i8(SA_SRC), "pure_simulated_annealing")?;
+        let sa_global =
+            compile_pipeline(&device, &global_state(SA_SRC), "pure_simulated_annealing")?;
+        let sa_wide_global = compile_pipeline(
+            &device,
+            &global_state(&wide(SA_SRC)),
+            "pure_simulated_annealing",
+        )?;
+        let sa_float_global = compile_pipeline(
+            &device,
+            &global_state(&float(SA_SRC)),
+            "pure_simulated_annealing",
+        )?;
+        let sa_wide_i8_global = compile_pipeline(
+            &device,
+            &global_state(&wide_i8(SA_SRC)),
+            "pure_simulated_annealing",
+        )?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_float = compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_sampler")?;
@@ -234,6 +269,10 @@ impl MetalDevice {
             sa_wide,
             sa_float,
             sa_wide_i8,
+            sa_global,
+            sa_wide_global,
+            sa_float_global,
+            sa_wide_i8_global,
             gibbs,
             gibbs_wide,
             gibbs_float,

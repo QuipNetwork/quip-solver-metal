@@ -17,8 +17,8 @@ typedef unsigned int uint;
 // `int` milli coefficients, an `int` delta, and integer acceptance against a
 // host-built threshold row, so no floating point decides a flip. The float
 // build prepends `#define QUIP_FLOAT 1`: `float` coefficients and delta, and
-// the same `float` Metropolis test as the int8 build. Only the int8 build
-// keeps a device energy; the host scores the wide and float builds' reads.
+// the same `float` Metropolis test as the int8 build. Only the local int8
+// build keeps a device energy; the host scores every SA read.
 #if defined(QUIP_WIDE)
 typedef int coef_t;
 typedef int delta_t;
@@ -32,7 +32,11 @@ typedef float field_t;
 typedef int8_t coef_t;
 typedef int8_t delta_t;
 typedef int field_t;
+// The host scores every SA read, so the global build, whose models are past
+// the thread-private frame, skips the device energy and its O(edges) setup.
+#ifndef QUIP_SA_GLOBAL
 #define QUIP_DEVICE_ENERGY 1
+#endif
 #endif
 
 // Storage type of the `h` and `J` buffers. The QUIP_WIDE_I8 build (always with
@@ -47,6 +51,18 @@ typedef coef_t stored_t;
 #define COEF(v, s) (v)
 #endif
 
+// Address space of each read's packed spins and `delta_energy`. The local
+// build keeps them in thread-private arrays of a fixed frame. The
+// QUIP_SA_GLOBAL build keeps them in the persistent buffers, interleaved by
+// thread: entry `i` of thread `t` is at `i * num_threads + t`, so the threads
+// of a SIMD group, which visit the same spin together, touch adjacent bytes.
+// Every helper takes that stride; the local build passes 1.
+#if defined(QUIP_SA_GLOBAL)
+#define SA_STATE device
+#else
+#define SA_STATE thread
+#endif
+
 inline uint xorshift32(thread uint &state) {
     uint x = state;
     x ^= x << 13;
@@ -56,39 +72,40 @@ inline uint xorshift32(thread uint &state) {
     return x;
 }
 
-// Bit-packing helpers for thread-local state
+// Bit-packing helpers for per-read state
 // Pack 8 spins into 1 byte: bit i stores spin i (0=+1, 1=-1)
-inline int8_t get_spin_packed(int var, thread const int8_t* packed_state) {
+inline int8_t get_spin_packed(int var, SA_STATE const int8_t* packed_state, uint stride) {
     int byte_idx = var >> 3;  // var / 8
     int bit_idx = var & 7;    // var % 8
-    int bit = (packed_state[byte_idx] >> bit_idx) & 1;
+    int bit = (packed_state[uint(byte_idx) * stride] >> bit_idx) & 1;
     return bit ? -1 : 1;  // 0 -> +1, 1 -> -1
 }
 
-inline void set_spin_packed(int var, int8_t spin, thread int8_t* packed_state) {
+inline void set_spin_packed(int var, int8_t spin, SA_STATE int8_t* packed_state, uint stride) {
     int byte_idx = var >> 3;  // var / 8
     int bit_idx = var & 7;    // var % 8
     int8_t bit = (spin < 0) ? 1 : 0;  // -1 -> 1, +1 -> 0
     int8_t mask = 1 << bit_idx;
 
     if (bit) {
-        packed_state[byte_idx] |= mask;   // Set bit
+        packed_state[uint(byte_idx) * stride] |= mask;   // Set bit
     } else {
-        packed_state[byte_idx] &= ~mask;  // Clear bit
+        packed_state[uint(byte_idx) * stride] &= ~mask;  // Clear bit
     }
 }
 
-inline void flip_spin_packed(int var, thread int8_t* packed_state) {
+inline void flip_spin_packed(int var, SA_STATE int8_t* packed_state, uint stride) {
     int byte_idx = var >> 3;  // var / 8
     int bit_idx = var & 7;    // var % 8
-    packed_state[byte_idx] ^= (1 << bit_idx);  // Toggle bit
+    packed_state[uint(byte_idx) * stride] ^= (1 << bit_idx);  // Toggle bit
 }
 
 // Compute delta energy for flipping a single variable
-// using the bit-packed state in thread-local memory
+// using the bit-packed per-read state
 inline delta_t get_flip_energy(
     int var,
-    thread const int8_t* packed_state,
+    SA_STATE const int8_t* packed_state,
+    uint stride,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
     device const stored_t* csr_J_vals,
@@ -108,7 +125,7 @@ inline delta_t get_flip_energy(
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
         coef_t Jij = COEF(csr_J_vals[p], coef_scale);
-        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state, stride);
         energy += field_t(neighbor_spin) * field_t(Jij);
     }
 
@@ -117,7 +134,7 @@ inline delta_t get_flip_energy(
     // (representation::classify in src/), so |delta_E| = 2 * |energy| <= 126,
     // inside int8_t. The wide build holds the delta in int, the float build
     // in float.
-    int8_t var_spin = get_spin_packed(var, packed_state);
+    int8_t var_spin = get_spin_packed(var, packed_state, stride);
     return (delta_t)(field_t(-2 * var_spin) * energy);
 }
 
@@ -158,6 +175,8 @@ kernel void pure_simulated_annealing(
     constant int& beta_count [[buffer(17)]],               // betas to process this chunk
     device int8_t* persistent_state [[buffer(18)]],        // [num_threads * packed_size] persisted packed state
     device delta_t* persistent_delta_energy [[buffer(19)]], // [num_threads * N] persisted delta_energy
+    constant int& sweep_start [[buffer(24)]],              // first sweep of each rung this chunk
+    constant int& sweep_count [[buffer(25)]],              // sweeps of each rung this chunk
     device uint* persistent_rng [[buffer(20)]],            // [num_threads] persisted RNG state
     device int* persistent_energy [[buffer(21)]],          // [num_threads] persisted current_energy
 
@@ -201,17 +220,28 @@ kernel void pure_simulated_annealing(
     int sweeps_per_beta_val = sweeps_per_beta;
     int packed_size = (n + 7) / 8;  // bytes needed for bit-packed state
 
-    // Thread-local memory for state and delta_energy
-    // Bit-packed state: (N+7)/8 bytes
-    // Delta energy: N bytes in the int8 build, 4*N bytes in the wide and
-    // float builds.
+    // Per-read state: bit-packed spins, (N+7)/8 bytes, and delta_energy, N
+    // bytes in the int8 build and 4*N bytes in the wide and float builds.
+#ifdef QUIP_SA_GLOBAL
+    // Interleaved in the persistent buffers, which every chunk updates in
+    // place. The host bounds num_threads * N to 32-bit indexing.
+    const uint stride = uint(num_threads);
+    device int8_t* packed_state = &persistent_state[thread_id];
+    device delta_t* delta_energy = &persistent_delta_energy[thread_id];
+#else
+    // Thread-local frame, copied from and to the persistent buffers.
+    const uint stride = 1;
     thread int8_t packed_state[4593 / 8 + 1];  // Bit-packed state
     thread delta_t delta_energy[4593];           // Delta energy
+#endif
 
     uint rng_state;
     int current_energy;
 
-    if (beta_start == 0) {
+    // A window [sweep_start, sweep_end) of every rung in this chunk. Only the
+    // first window of the first rung initializes.
+    int sweep_end = min(sweep_start + sweep_count, sweeps_per_beta_val);
+    if (beta_start == 0 && sweep_start == 0) {
         // ── First chunk: random initialization ──────────────
         rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
 
@@ -227,24 +257,24 @@ kernel void pure_simulated_annealing(
 
         // Generate random initial state (bit-packed)
         for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
-            packed_state[byte_idx] = 0;
+            packed_state[uint(byte_idx) * stride] = 0;
         }
         for (int var = 0; var < n; var++) {
             uint rand_val = xorshift32(rng_state);
             int8_t spin = (rand_val & 1) ? -1 : 1;
-            set_spin_packed(var, spin, packed_state);
+            set_spin_packed(var, spin, packed_state, stride);
         }
 
         // Build initial delta_energy array
         for (int var = 0; var < n; var++) {
-            delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals, coef_scale);
+            delta_energy[uint(var) * stride] = get_flip_energy(var, packed_state, stride, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals, coef_scale);
         }
 
         // Compute initial energy
         current_energy = 0;
 #ifdef QUIP_DEVICE_ENERGY
         for (int i = 0; i < n; i++) {
-            int8_t spin_i = get_spin_packed(i, packed_state);
+            int8_t spin_i = get_spin_packed(i, packed_state, stride);
             current_energy += my_h_vals[i] * spin_i;
             int start = my_csr_row_ptr[i];
             int end = my_csr_row_ptr[i + 1];
@@ -252,7 +282,7 @@ kernel void pure_simulated_annealing(
                 int j = my_csr_col_ind[p];
                 if (j > i) {
                     coef_t Jij = my_csr_J_vals[p];
-                    int8_t spin_j = get_spin_packed(j, packed_state);
+                    int8_t spin_j = get_spin_packed(j, packed_state, stride);
                     current_energy += Jij * spin_i * spin_j;
                 }
             }
@@ -260,6 +290,7 @@ kernel void pure_simulated_annealing(
 #endif
     } else {
         // ── Continuation chunk: load from persistent buffers ──
+#ifndef QUIP_SA_GLOBAL
         device const int8_t* src_state = &persistent_state[thread_id * packed_size];
         for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
             packed_state[byte_idx] = src_state[byte_idx];
@@ -269,6 +300,7 @@ kernel void pure_simulated_annealing(
         for (int var = 0; var < n; var++) {
             delta_energy[var] = src_de[var];
         }
+#endif
 
         rng_state = persistent_rng[thread_id];
         current_energy = persistent_energy[thread_id];
@@ -287,10 +319,10 @@ kernel void pure_simulated_annealing(
         float threshold = 22.18f / beta;
 #endif
 
-        for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
+        for (int sweep = sweep_start; sweep < sweep_end; sweep++) {
             // Sequential variable ordering (matching D-Wave default)
             for (int var = 0; var < n; var++) {
-                delta_t de = delta_energy[var];
+                delta_t de = delta_energy[uint(var) * stride];
 
 #ifdef QUIP_WIDE
                 bool flip_spin = de <= 0;
@@ -328,7 +360,7 @@ kernel void pure_simulated_annealing(
 #endif
 
                     // Get current spin value
-                    int8_t var_spin = get_spin_packed(var, packed_state);
+                    int8_t var_spin = get_spin_packed(var, packed_state, stride);
 
                     // Update delta energies of all neighbors
 #ifdef QUIP_DEVICE_ENERGY
@@ -344,27 +376,30 @@ kernel void pure_simulated_annealing(
                     for (int p = start; p < end; ++p) {
                         int neighbor = my_csr_col_ind[p];
                         coef_t Jij = COEF(my_csr_J_vals[p], coef_scale);
-                        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
+                        int8_t neighbor_spin = get_spin_packed(neighbor, packed_state, stride);
+                        SA_STATE delta_t& neighbor_de = delta_energy[uint(neighbor) * stride];
 #ifdef QUIP_FLOAT
                         // 4*J may overflow even when the updated delta fits,
                         // so the update rounds once, as CUDA's sa.cu does.
-                        delta_energy[neighbor] = fma(float(multiplier * neighbor_spin), Jij, delta_energy[neighbor]);
+                        neighbor_de = fma(float(multiplier * neighbor_spin), Jij, neighbor_de);
 #else
-                        delta_energy[neighbor] += (delta_t)(multiplier * Jij * neighbor_spin);
+                        neighbor_de += (delta_t)(multiplier * Jij * neighbor_spin);
 #endif
                     }
 
                     // Flip the spin and negate its delta energy
-                    flip_spin_packed(var, packed_state);
-                    delta_energy[var] = -de;
+                    flip_spin_packed(var, packed_state, stride);
+                    delta_energy[uint(var) * stride] = -de;
                 }
             }
         }
     }
 
     // Persist state for next chunk (always write — the Python side
-    // decides whether there will be a next chunk or not)
+    // decides whether there will be a next chunk or not). The global build
+    // already holds spins and delta_energy in the persistent buffers.
     {
+#ifndef QUIP_SA_GLOBAL
         device int8_t* dst_state = &persistent_state[thread_id * packed_size];
         for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
             dst_state[byte_idx] = packed_state[byte_idx];
@@ -374,6 +409,7 @@ kernel void pure_simulated_annealing(
         for (int var = 0; var < n; var++) {
             dst_de[var] = delta_energy[var];
         }
+#endif
 
         persistent_rng[thread_id] = rng_state;
         persistent_energy[thread_id] = current_energy;
@@ -383,7 +419,7 @@ kernel void pure_simulated_annealing(
     // the last chunk, but writing every time is cheaper than branching)
     device int8_t* output = &final_samples[thread_id * packed_size];
     for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
-        output[byte_idx] = packed_state[byte_idx];
+        output[byte_idx] = packed_state[uint(byte_idx) * stride];
     }
 
     final_energies[thread_id] = current_energy;

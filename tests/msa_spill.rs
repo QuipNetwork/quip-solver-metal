@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::SampleParams;
 use quip_solver_metal::metal_device::MetalDevice;
-use quip_solver_metal::sampler::{sample_ising_tuned, Kernel, MsaTuning, TunedRun};
+use quip_solver_metal::sampler::{sample_ising_tuned, Kernel, TunedRun, Tuning};
 use quip_solver_metal::{IsingGraph, SamplerResult};
 
 /// Coefficient paths of the weighted lane.
@@ -96,7 +96,7 @@ fn params(reads: usize, sweeps: usize, sweeps_per_beta: usize, seed: u64) -> Sam
     }
 }
 
-fn run(dev: &MetalDevice, graph: &IsingGraph, p: &SampleParams, tuning: MsaTuning) -> TunedRun {
+fn run(dev: &MetalDevice, graph: &IsingGraph, p: &SampleParams, tuning: Tuning) -> TunedRun {
     sample_ising_tuned(dev, graph, p, Kernel::Msa, tuning).expect("msa samples")
 }
 
@@ -118,9 +118,9 @@ fn a_spilled_run_matches_an_all_threadgroup_run() {
         (Path::Int, 40),
     ] {
         let graph = circulant(5_000, degree, path);
-        let whole = MsaTuning {
+        let whole = Tuning {
             planning_rate: Some(ONE_CHUNK),
-            ..MsaTuning::default()
+            ..Tuning::default()
         };
         // K = 5,000: every word in threadgroup memory.
         let all = run(&dev, &graph, &p, whole);
@@ -134,9 +134,10 @@ fn a_spilled_run_matches_an_all_threadgroup_run() {
             // prefix persists across every chunk.
             (1_000, Some(1.0)),
         ] {
-            let tuning = MsaTuning {
+            let tuning = Tuning {
                 shared_spins_cap: Some(cap),
                 planning_rate: rate,
+                ..Tuning::default()
             };
             let spilled = run(&dev, &graph, &p, tuning);
             assert_eq!(
@@ -155,14 +156,14 @@ fn a_unit_model_past_threadgroup_memory_spills() {
     let dev = MetalDevice::open(0).unwrap();
     let p = params(64, 32, 4, 11);
     let graph = circulant(7_000, 20, Path::Unit);
-    let natural = run(&dev, &graph, &p, MsaTuning::default());
+    let natural = run(&dev, &graph, &p, Tuning::default());
     let small = run(
         &dev,
         &graph,
         &p,
-        MsaTuning {
+        Tuning {
             shared_spins_cap: Some(1_000),
-            ..MsaTuning::default()
+            ..Tuning::default()
         },
     );
     assert_eq!(spins(&small.reads), spins(&natural.reads));
@@ -184,9 +185,9 @@ fn a_long_rung_splits_into_sweep_windows() {
             &dev,
             &graph,
             &p,
-            MsaTuning {
+            Tuning {
                 planning_rate: Some(ONE_CHUNK),
-                ..MsaTuning::default()
+                ..Tuning::default()
             },
         );
         assert_eq!(unsplit.plan.len(), 1, "{path:?}");
@@ -196,9 +197,9 @@ fn a_long_rung_splits_into_sweep_windows() {
             &dev,
             &graph,
             &p,
-            MsaTuning {
+            Tuning {
                 planning_rate: Some(1.0),
-                ..MsaTuning::default()
+                ..Tuning::default()
             },
         );
         assert_eq!(split.plan.len(), 16, "{path:?}: {:?}", split.plan);
@@ -227,7 +228,7 @@ fn dense_reads_stay_distinct() {
         let mut counts = Vec::new();
         for path in [Path::Unit, Path::Int, Path::Float] {
             let graph = complete(28, 7, path);
-            let out = run(&dev, &graph, &p, MsaTuning::default());
+            let out = run(&dev, &graph, &p, Tuning::default());
             assert_eq!(out.reads.len(), reads);
             let distinct = spins(&out.reads).into_iter().collect::<HashSet<_>>().len();
             counts.push((path, distinct));
@@ -257,7 +258,7 @@ fn a_200k_node_model_completes() {
     let graph = circulant(200_000, 40, Path::Int);
     assert_eq!(graph.edges.len(), 4_000_000);
     let p = params(128, 16, 4, 11);
-    let out = run(&dev, &graph, &p, MsaTuning::default());
+    let out = run(&dev, &graph, &p, Tuning::default());
     writeln!(
         io::stdout().lock(),
         "200k nodes: {} chunks, max chunk {} us, GPU {} us",
@@ -291,9 +292,9 @@ fn spill_layout_rates() {
         let graph = circulant(nodes, degree, Path::Int);
         let mut prefix_reads = None;
         for (layout, cap) in [("prefix", None), ("device", Some(0)), ("prefix", None)] {
-            let tuning = MsaTuning {
+            let tuning = Tuning {
                 shared_spins_cap: cap,
-                ..MsaTuning::default()
+                ..Tuning::default()
             };
             let mut times: Vec<u64> = (0..3)
                 .map(|_| run(&dev, &graph, &p, tuning).gpu_time_us)

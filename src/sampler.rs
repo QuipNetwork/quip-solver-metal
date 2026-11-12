@@ -131,7 +131,9 @@ pub(crate) fn simd_rounded_reads(num_reads: usize) -> usize {
         .min(MAX_READS)
 }
 
-/// SA kernel `N` cap: `thread int8_t delta_energy[4593]` in `kernels/sa.metal`.
+/// SA local-build `N` cap: `thread int8_t delta_energy[4593]` in
+/// `kernels/sa.metal`. A larger model runs the `QUIP_SA_GLOBAL` build on the
+/// batch path, with each read's state in device memory.
 ///
 /// `crate::METAL_SA_IDENTITY` advertises this same cap, so the identity const
 /// and the kernel array have one source.
@@ -167,6 +169,10 @@ const WIDE_GIBBS_COST_FACTOR: f64 = 2.0;
 /// Weighted MSA work per word update for chunk sizing, measured in
 /// `docs/perf/2026-11-09-weighted-msa.md`.
 const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
+/// Extra SA work per spin update on the global build, which keeps each
+/// read's state in device memory, for chunk sizing. It multiplies the
+/// representation's factor. Measured in `docs/perf/2026-11-12-sa-global.md`.
+const SA_GLOBAL_COST_FACTOR: f64 = 2.0;
 /// Float32 SA work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-11-11-float-kernels.md`.
 const FLOAT_SA_COST_FACTOR: f64 = 1.3;
@@ -433,8 +439,8 @@ fn estimated_updates_per_sec(kernel: Kernel, groups: usize) -> f64 {
 /// One command buffer of an anneal: sweeps `sweep_start..sweep_start +
 /// sweep_count` of each rung in `beta_start..beta_start + beta_count`. A
 /// chunk is either whole rungs (`sweep_start == 0`, `sweep_count ==
-/// sweeps_per_beta`) or a window inside one rung (`beta_count == 1`); only
-/// the weighted multi-spin kernel takes windows.
+/// sweeps_per_beta`) or a window inside one rung (`beta_count == 1`); the
+/// SA and weighted multi-spin kernels take windows.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chunk {
@@ -461,17 +467,22 @@ impl Chunk {
     }
 }
 
-/// Test settings of the weighted multi-spin kernel. The default is
-/// production behaviour.
+/// Test settings of the batch kernels. The default is production behaviour.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MsaTuning {
-    /// Caps `K`, the spin words kept in threadgroup memory
-    /// ([`msa_shared_spins`]).
+pub struct Tuning {
+    /// Caps `K`, the spin words the weighted multi-spin kernel keeps in
+    /// threadgroup memory ([`msa_shared_spins`]).
     pub shared_spins_cap: Option<usize>,
     /// Plans chunks at this many updates per second instead of the measured
     /// rate.
     pub planning_rate: Option<f64>,
+    /// Runs an SA model of at most [`SA_MAX_NODES`] nodes on the global
+    /// build, which a larger model always takes.
+    pub sa_global: bool,
+    /// Refuses a model of more nodes, as a node cap below the kernel's own
+    /// limit does.
+    pub node_cap: Option<usize>,
 }
 
 /// Split a beta schedule into chunks whose dispatches each land near
@@ -981,7 +992,7 @@ impl EncodedBatch {
         bind_shared_args(encoder, &self.inputs, &self.out, &self.dims);
         match &self.kstate {
             KernelEncode::Sa { persist } => {
-                bind_sa_chunk(encoder, persist, beta_start, beta_count);
+                bind_sa_chunk(encoder, persist, chunk);
             }
             KernelEncode::Gibbs { persist } => {
                 self.bind_colors(encoder, 0);
@@ -1341,7 +1352,7 @@ pub(crate) fn validate_batch<'a>(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
-    validate_batch_within(graphs, params, kernel, host_device_limits(), false)
+    validate_batch_within(graphs, params, kernel, host_device_limits(), false, None)
         .map(|batch| (batch.first, batch.n, batch.rep))
 }
 
@@ -1378,6 +1389,7 @@ fn validate_batch_within<'a>(
     kernel: Kernel,
     limits: &DeviceLimits,
     allow_i8: bool,
+    node_cap: Option<usize>,
 ) -> Result<ValidBatch<'a>, SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
@@ -1388,11 +1400,15 @@ fn validate_batch_within<'a>(
     };
     let n = first.num_nodes();
     // The weighted multi-spin lane spills spin words past threadgroup
-    // memory, so the capacity footprint below bounds an MSA model instead.
+    // memory, and the SA global build keeps each read's state in device
+    // memory past its thread-private frame, so the capacity footprint below
+    // bounds those models instead. An explicit node cap is the limit itself,
+    // even below a kernel's frame.
     let cap = match kernel {
-        Kernel::Msa => crate::capacity::MAX_NODES,
-        Kernel::Sa | Kernel::Gibbs => kernel_max_nodes(kernel),
-    };
+        Kernel::Msa | Kernel::Sa => crate::capacity::MAX_NODES,
+        Kernel::Gibbs => kernel_max_nodes(kernel),
+    }
+    .min(node_cap.unwrap_or(usize::MAX));
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
         // before the sampler; this catches drift before it overruns the
@@ -1811,15 +1827,16 @@ fn bind_color_kernel_chunk(
 fn bind_sa_chunk(
     enc: &metal::ComputeCommandEncoderRef,
     persist: &[metal::Buffer; 4],
-    beta_start: i32,
-    beta_count: i32,
+    chunk: Chunk,
 ) {
-    set_bytes_i32(enc, 16, beta_start);
-    set_bytes_i32(enc, 17, beta_count);
+    set_bytes_i32(enc, 16, chunk.beta_start);
+    set_bytes_i32(enc, 17, chunk.beta_count);
     enc.set_buffer(18, Some(&persist[0]), 0);
     enc.set_buffer(19, Some(&persist[1]), 0);
     enc.set_buffer(20, Some(&persist[2]), 0);
     enc.set_buffer(21, Some(&persist[3]), 0);
+    set_bytes_i32(enc, 24, chunk.sweep_start);
+    set_bytes_i32(enc, 25, chunk.sweep_count);
 }
 
 /// Build one batch's device buffers and plan its chunks. Does **not** commit.
@@ -1859,13 +1876,13 @@ fn encode_batch_inner(
         plan_override,
         beta_override,
         true,
-        MsaTuning::default(),
+        Tuning::default(),
     )
 }
 
 /// [`encode_batch_inner`] with `wide_i8` false forcing every wide batch onto
 /// plain `int` coefficients, so tests compare the two storages, and with the
-/// weighted multi-spin kernel's test `tuning`.
+/// batch kernels' test `tuning`.
 #[expect(
     clippy::too_many_arguments,
     reason = "encode_batch_inner's arguments plus the storage switch and tuning"
@@ -1879,7 +1896,7 @@ fn encode_batch_storage(
     plan_override: Option<&[(i32, i32)]>,
     beta_override: Option<Vec<f32>>,
     wide_i8: bool,
-    tuning: MsaTuning,
+    tuning: Tuning,
 ) -> Result<EncodedBatch, SampleError> {
     // `K`, the spin words the weighted multi-spin kernel keeps in threadgroup
     // memory. A model past it runs the spill build, which holds `int`
@@ -1899,7 +1916,11 @@ fn encode_batch_storage(
         kernel,
         host_device_limits(),
         wide_i8 && !past_k,
+        tuning.node_cap,
     )?;
+    // A model past the SA thread-private frame runs the global build, which
+    // keeps each read's spins and `delta_energy` in the persistent buffers.
+    let sa_global = kernel == Kernel::Sa && (tuning.sa_global || n > SA_MAX_NODES);
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -1961,6 +1982,10 @@ fn encode_batch_storage(
     let pipeline = match kernel {
         Kernel::Msa if wide && past_k => &device.msa_weighted_spill,
         Kernel::Msa if float && past_k => &device.msa_float_spill,
+        Kernel::Sa if sa_global && i8_scale.is_some() => &device.sa_wide_i8_global,
+        Kernel::Sa if sa_global && wide => &device.sa_wide_global,
+        Kernel::Sa if sa_global && float => &device.sa_float_global,
+        Kernel::Sa if sa_global => &device.sa_global,
         Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
         Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
         Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
@@ -2046,6 +2071,17 @@ fn encode_batch_storage(
     let weighted_msa = kernel == Kernel::Msa && (wide || float);
     let shared_spins = weighted_msa.then_some(k);
     let state_bytes = (shared_spins.map_or(n, |k| k.min(n)).max(1) * 4).div_ceil(16) * 16;
+    if sa_global
+        && num_threads
+            .checked_mul(n.max(1))
+            .is_none_or(|entries| entries > u32::MAX as usize)
+    {
+        // The global build indexes entry `i` of thread `t` as
+        // `i * num_threads + t` in 32 bits.
+        return Err(SampleError::TooLarge(format!(
+            "{num_threads} SA reads of {n} spins exceed 32-bit indexing"
+        )));
+    }
     if kernel == Kernel::Msa {
         // The kernel indexes each threadgroup's persistent words as
         // `threadgroup * N` in 32 bits.
@@ -2097,6 +2133,10 @@ fn encode_batch_storage(
                 * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
         }
         (Representation::Binary | Representation::Int8, _) => 1.0,
+    } * if sa_global {
+        SA_GLOBAL_COST_FACTOR
+    } else {
+        1.0
     };
     let plan = match plan_override {
         Some(p) => p
@@ -2109,7 +2149,7 @@ fn encode_batch_storage(
             groups,
             in_flight,
             cost,
-            weighted_msa,
+            weighted_msa || kernel == Kernel::Sa,
             tuning.planning_rate,
         ),
     };
@@ -2339,8 +2379,10 @@ pub(crate) fn audit_device_energies(
 /// # Errors
 ///
 /// Returns [`SampleError::TooLarge`] (harness `SampleError::Capacity`) when:
-/// - `graph.num_nodes()` exceeds the algorithm's kernel node cap
-///   (`SA_MAX_NODES` / `GIBBS_MAX_NODES`);
+/// - `graph.num_nodes()` exceeds the Gibbs kernel node cap
+///   (`GIBBS_MAX_NODES`);
+/// - the model does not fit the device's memory (`capacity::footprint`),
+///   which bounds SA and MSA models;
 /// - `params.num_sweeps` exceeds `MAX_SWEEPS`, the sampler's guard against an
 ///   unbounded coordinator-supplied beta schedule.
 ///
@@ -2422,9 +2464,9 @@ pub struct TunedRun {
     pub gpu_time_us: u64,
 }
 
-/// [`sample_ising`] with the weighted multi-spin kernel's test `tuning`, so
-/// tests can compare a spilled or windowed anneal with a plain one of the
-/// same seed.
+/// [`sample_ising`] with the batch kernels' test `tuning`, so tests can
+/// compare a spilled, global-state, or windowed anneal with a plain one of
+/// the same seed.
 ///
 /// # Errors
 ///
@@ -2435,7 +2477,7 @@ pub fn sample_ising_tuned(
     graph: &IsingGraph,
     params: &SampleParams,
     kernel: Kernel,
-    tuning: MsaTuning,
+    tuning: Tuning,
 ) -> Result<TunedRun, SampleError> {
     run_planned(device, graph, params, kernel, None, true, tuning)
 }
@@ -2457,7 +2499,7 @@ fn sample_planned(
         kernel,
         plan,
         wide_i8,
-        MsaTuning::default(),
+        Tuning::default(),
     )
     .map(|run| run.reads)
 }
@@ -2470,7 +2512,7 @@ fn run_planned(
     kernel: Kernel,
     plan: Option<&[(i32, i32)]>,
     wide_i8: bool,
-    tuning: MsaTuning,
+    tuning: Tuning,
 ) -> Result<TunedRun, SampleError> {
     if graph.num_nodes() == 0 {
         let reads = params.num_reads.max(1);
@@ -3033,8 +3075,8 @@ mod tests {
             .then(|| crate::metal_device::MetalDevice::open(0).unwrap());
         let before = device.as_ref().map(|d| d.device.current_allocated_size());
         let g = ring();
-        let err =
-            validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits, false).unwrap_err();
+        let err = validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits, false, None)
+            .unwrap_err();
         let SampleError::TooLarge(message) = &err else {
             panic!("expected TooLarge, got {err:?}");
         };
@@ -3185,11 +3227,20 @@ mod tests {
 
     #[test]
     fn validate_batch_rejects_n_over_the_kernel_cap() {
-        let big = IsingGraph::new(vec![0.0; SA_MAX_NODES + 1], vec![], vec![]);
-        let err = validate_batch(&[&big], &params(64), Kernel::Sa).unwrap_err();
+        let big = IsingGraph::new(vec![0.0; GIBBS_MAX_NODES + 1], vec![], vec![]);
+        let err = validate_batch(&[&big], &params(64), Kernel::Gibbs).unwrap_err();
         let msg = too_large_msg(err);
         assert!(msg.contains("exceeds"), "{msg}");
-        assert!(msg.contains(&SA_MAX_NODES.to_string()), "{msg}");
+        assert!(msg.contains(&GIBBS_MAX_NODES.to_string()), "{msg}");
+    }
+
+    /// The SA global build takes a model past the thread-private frame, so
+    /// the memory footprint bounds it instead of the frame.
+    #[test]
+    fn validate_batch_admits_sa_past_the_local_frame() {
+        let big = IsingGraph::new(vec![0.0; SA_MAX_NODES + 1], vec![], vec![]);
+        let (_, n, _) = validate_batch(&[&big], &params(64), Kernel::Sa).unwrap();
+        assert_eq!(n, SA_MAX_NODES + 1);
     }
 
     #[test]
@@ -3421,7 +3472,7 @@ mod tests {
                 None,
                 None,
                 true,
-                MsaTuning::default(),
+                Tuning::default(),
             )
             .unwrap();
             assert!(
@@ -3551,7 +3602,7 @@ mod tests {
                 None,
                 None,
                 true,
-                MsaTuning::default(),
+                Tuning::default(),
             )
             .unwrap();
             let plain = encode_batch_storage(
@@ -3563,7 +3614,7 @@ mod tests {
                 None,
                 None,
                 false,
-                MsaTuning::default(),
+                Tuning::default(),
             )
             .unwrap();
             assert_eq!(

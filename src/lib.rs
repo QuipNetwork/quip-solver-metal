@@ -203,10 +203,11 @@ pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::Mo
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: quip_solver_core::quip_proto::v1::Backend::Metal,
     algorithm: quip_solver_core::quip_proto::v1::Algorithm::Sa,
-    // Single source of truth with the sampler's runtime guard: the advertised
-    // cap and the guard cannot drift because this is the same constant. A job
-    // over it would overrun the SA kernel's `thread int8_t delta_energy[4593]`
-    // (`kernels/sa.metal`), so it must reject `TooLarge` rather than clamp.
+    // Single source of truth with the streaming session's gate
+    // (`sampler::kernel_max_nodes`): the advertised cap and the gate cannot
+    // drift because this is the same constant, the local build's
+    // `thread int8_t delta_energy[4593]` (`kernels/sa.metal`). The batch path
+    // runs a larger model on the global build, bounded by device memory.
     // `const` context, so the narrowing cast is checked at compile time.
     max_nodes: crate::sampler::SA_MAX_NODES as u32,
     max_edges: DEFAULT_MAX_EDGES,

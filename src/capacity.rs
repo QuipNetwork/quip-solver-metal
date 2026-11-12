@@ -17,8 +17,10 @@
 //! - [`Storage::Spill`]: spin state past the threadgroup cap lives in device
 //!   memory. The weighted multi-spin kernel keeps it in the carry-over
 //!   buffer the threadgroup tier already counts, so the tier allocates the
-//!   same buffers. SA and Gibbs have no spill kernel yet; their formulas
-//!   follow the intended layout and later tasks correct them.
+//!   same buffers. The SA global build keeps each read's packed spins and
+//!   `delta_energy` in its carry-over buffers in the same way. Gibbs has no
+//!   spill kernel yet; its formula follows the intended layout and a later
+//!   task corrects it.
 //! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. Not yet
 //!   implemented, and no multi-spin model is admitted to it until a dense
 //!   multi-spin kernel exists.
@@ -429,8 +431,10 @@ fn threadgroup_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
 /// `nodes - K` nodes past its threadgroup cap `K` in their slots of the
 /// carry-over buffer (`persistent_state`, one `uint` per word and spin),
 /// which the threadgroup tier already counts, so the spill tier allocates
-/// the same buffers and adds none (`sampler::encode_batch_storage`). SA and
-/// Gibbs have no spill kernel yet and are sized the same way.
+/// the same buffers and adds none (`sampler::encode_batch_storage`). The SA
+/// global build likewise works in place in its carry-over buffers
+/// ([`sa_persistent`]): packed spins and `delta_energy` for every node of
+/// every read. Gibbs has no spill kernel yet and is sized the same way.
 fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     threadgroup_sizes(kernel, shape)
 }
@@ -771,6 +775,34 @@ mod tests {
         for kernel in KERNELS {
             let fp = footprint(kernel, &sparse_shape(), &ROOMY).unwrap();
             assert_eq!(fp.storage, Storage::Spill, "{kernel:?}");
+        }
+    }
+
+    /// The global build keeps packed spins and `delta_energy` for every
+    /// node of every read in its carry-over buffers.
+    #[test]
+    fn sa_past_the_local_frame_counts_the_per_read_state() {
+        for (precision, delta_bytes) in [(Precision::Binary, 1), (Precision::Int32, 4)] {
+            let shape = ModelShape {
+                nodes: 20_000,
+                edges: 200_000,
+                max_degree: 20,
+                precision,
+                betas: 64,
+                reads: 100,
+            };
+            let fp = footprint(Kernel::Sa, &shape, &ROOMY).unwrap();
+            assert_eq!(fp.storage, Storage::Spill, "{precision:?}");
+            assert_eq!(fp.storage.name(Kernel::Sa), "global");
+            let reads = simd_rounded_reads(100);
+            let state = reads * 20_000usize.div_ceil(8) + reads * 20_000 * delta_bytes;
+            assert!(fp.per_instance_bytes > state, "{precision:?}");
+            let smaller = ModelShape {
+                nodes: SA_MAX_NODES,
+                ..shape
+            };
+            let local = footprint(Kernel::Sa, &smaller, &ROOMY).unwrap();
+            assert_eq!(local.storage, Storage::Threadgroup, "{precision:?}");
         }
     }
 
