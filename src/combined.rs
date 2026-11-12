@@ -360,7 +360,7 @@ fn eligibility(
     // capacity footprint bounds.
     let mut metal = cfg.enable_metal
         && n <= crate::capacity::MAX_NODES
-        && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
+        && graph.edges.len() <= crate::advertised_edges(kernel)
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
     metal &= crate::sampler::kernel_representation(graph, kernel).is_ok();
     let mut ane = cfg.enable_ane
@@ -1286,6 +1286,33 @@ mod tests {
             thread.join().unwrap();
             assert_eq!(sampler.metal.get().is_some(), metal);
             assert_eq!(sampler.ane.lock().unwrap().is_some(), ane);
+        }
+    }
+
+    /// Each kernel's Metal gate refuses one coupler past the advertised
+    /// `max_edges`, and SA and Gibbs admit the limit. The couplers repeat one
+    /// pair, which the edge count gate reads only by count.
+    #[test]
+    fn the_metal_gate_refuses_one_edge_past_the_advertised_limit() {
+        let mut j = job(0);
+        let cfg = config(true, false);
+        let mut facts = EdgeFactsCache::default();
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let limit = crate::advertised_edges(kernel);
+            j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0; limit + 1], vec![(0, 1); limit + 1]);
+            assert_eq!(
+                eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                [false, false],
+                "{kernel:?}"
+            );
+            if kernel != Kernel::Msa {
+                j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0; limit], vec![(0, 1); limit]);
+                assert_eq!(
+                    eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                    [true, false],
+                    "{kernel:?}"
+                );
+            }
         }
     }
 

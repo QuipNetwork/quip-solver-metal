@@ -8,6 +8,7 @@ use quip_solver_conformance::driver::{
 };
 use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_proto::v1::RejectReason;
+use quip_solver_metal::{host_identity, Kernel};
 use std::process::Command;
 
 /// The jobs the driver expects a `Result` for, and the only ones a
@@ -280,28 +281,23 @@ async fn quip_metal_gibbs_passes_solve_conformance() {
 
 #[tokio::test]
 async fn quip_metal_msa_passes_solve_conformance() {
-    assert_solve_conformant(
-        "quip-metal-msa",
-        &[
-            "degree-limit-inside",
-            "degree-limit-outside",
-            "field-limit-inside",
-            "field-limit-outside",
-        ],
-    )
-    .await;
+    // MSA advertises no degree limit: dense-matrix storage runs any degree.
+    assert_solve_conformant("quip-metal-msa", FIELD_LIMIT_CASES).await;
 }
 
 #[test]
 fn capabilities_and_version_and_check() {
     ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
 
-    // Per binary: algorithm, node cap, and the advertised model limits.
-    for (bin, algo, nodes, degree, field, resolution) in [
-        ("quip-metal-sa", "sa", 4593, 0, 268_435_000, 1),
-        ("quip-metal-msa", "msa", 6016, 20, 268_435_000, 1),
-        ("quip-metal-gibbs", "gibbs", 4800, 0, 268_435_000, 1),
+    // Per binary: algorithm, the node and edge limits of this host, and the
+    // advertised model limits.
+    for (bin, algo, kernel) in [
+        ("quip-metal-sa", "sa", Kernel::Sa),
+        ("quip-metal-msa", "msa", Kernel::Msa),
+        ("quip-metal-gibbs", "gibbs", Kernel::Gibbs),
     ] {
+        let identity = host_identity(kernel, None).unwrap();
+        let (degree, field, resolution) = (0, 268_435_000, 1);
         let path = profile_bin(bin);
 
         let out = Command::new(&path).arg("--capabilities").output().unwrap();
@@ -323,7 +319,8 @@ fn capabilities_and_version_and_check() {
                 "{bin} lacks {feature}: {caps}"
             );
         }
-        assert_eq!(caps["maxNodes"], nodes, "{bin}: {caps}");
+        assert_eq!(caps["maxNodes"], identity.max_nodes, "{bin}: {caps}");
+        assert_eq!(caps["maxEdges"], identity.max_edges, "{bin}: {caps}");
         assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
         assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
         assert_eq!(caps["exactResolutionMilli"], resolution, "{bin}: {caps}");
@@ -346,6 +343,41 @@ fn capabilities_and_version_and_check() {
             status.unwrap().success(),
             "{bin} --check must succeed when a GPU is present"
         );
+    }
+}
+
+/// `--max-nodes` lowers the advertised node limit, and a value past the
+/// limit fails before the miner opens anything: exit 64 (configuration
+/// invalid), the limit on standard error, and no capabilities printed.
+#[test]
+fn max_nodes_above_the_limit_fails_at_open() {
+    ensure_built(&["quip-metal-sa", "quip-metal-gibbs", "quip-metal-msa"]);
+    for (bin, kernel) in [
+        ("quip-metal-sa", Kernel::Sa),
+        ("quip-metal-gibbs", Kernel::Gibbs),
+        ("quip-metal-msa", Kernel::Msa),
+    ] {
+        let path = profile_bin(bin);
+        let limit = host_identity(kernel, None).unwrap().max_nodes;
+        let capabilities = |nodes: u32| {
+            Command::new(&path)
+                .arg("--capabilities")
+                .arg("--max-nodes")
+                .arg(nodes.to_string())
+                .output()
+                .unwrap()
+        };
+        let out = capabilities(1_000);
+        assert!(out.status.success(), "{bin}");
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(caps["maxNodes"], 1_000, "{bin}: {caps}");
+        assert_eq!(capabilities(limit).status.code(), Some(0), "{bin}");
+
+        let out = capabilities(limit + 1);
+        assert_eq!(out.status.code(), Some(64), "{bin}");
+        assert!(out.stdout.is_empty(), "{bin}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(&limit.to_string()), "{bin}: {stderr}");
     }
 }
 

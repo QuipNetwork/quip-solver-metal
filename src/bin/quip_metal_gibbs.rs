@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use quip_solver_core::CommonArgs;
-use quip_solver_metal::{run_metal, GibbsTag, METAL_GIBBS_IDENTITY};
+use quip_solver_metal::{host_identity, run_metal, GibbsTag, Kernel};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -24,6 +24,11 @@ struct Cli {
     /// Yield to other GPU users under thermal/display pressure.
     #[arg(long, default_value_t = false)]
     yielding: bool,
+    /// Advertise at most this many nodes. Default: the largest count the
+    /// capacity model and the one-sweep limit admit on this host. A value
+    /// past that limit is a configuration error.
+    #[arg(long)]
+    max_nodes: Option<usize>,
     /// Print the largest model each connectivity and precision admits, then exit. Opens no device.
     #[arg(long, conflicts_with_all = ["quip_coordinator", "capabilities", "check", "solve"])]
     probe_capacity: bool,
@@ -45,8 +50,12 @@ fn main() -> ExitCode {
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("metal-{}", cli.device));
     }
+    let identity = match host_identity(Kernel::Gibbs, cli.max_nodes) {
+        Ok(identity) => identity,
+        Err(code) => return code,
+    };
     run_metal::<GibbsTag>(
-        METAL_GIBBS_IDENTITY,
+        identity,
         &cli.common,
         cli.device,
         cli.utilization,

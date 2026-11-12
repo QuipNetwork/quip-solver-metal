@@ -31,10 +31,10 @@
 //! correct one without touching the routing.
 
 use crate::sampler::{
-    simd_rounded_reads, Kernel, GIBBS_MAX_NODES, MSA_LANES, MSA_MAX_NODES, MSA_SPARSE_MAX_DEG,
-    MSA_THREADS, MSA_UNIT_MAX_DEG, SA_MAX_NODES,
+    simd_rounded_reads, Kernel, GIBBS_MAX_NODES, MAX_READS, MSA_LANES, MSA_MAX_NODES,
+    MSA_SPARSE_MAX_DEG, MSA_THREADS, MSA_UNIT_MAX_DEG, SA_MAX_NODES, SIMD_WIDTH,
 };
-use crate::streaming::batch_size_for_reads;
+use crate::streaming::{batch_size_for_reads, STREAM_IN_FLIGHT};
 use quip_solver_core::IsingGraph;
 
 /// Largest node count the 32-bit kernel indexing can address.
@@ -45,7 +45,7 @@ pub const MAX_NODES: usize = i32::MAX as usize;
 const MAX_NNZ: usize = u32::MAX as usize;
 /// Bytes of one `col_ind` entry.
 const COL_IND_ENTRY_BYTES: usize = 4;
-/// Beta entries the advertised limits plan against.
+/// Beta entries the advertised limits plan against: a 64-rung schedule.
 const ADVERTISED_BETAS: usize = 64;
 
 /// Memory headroom numerator, as CUDA's `MEMORY_HEADROOM_NUM`.
@@ -295,14 +295,18 @@ pub enum CapacityError {
 
 /// Models whose buffers exist at once.
 ///
-/// SA and Gibbs return twice [`batch_size_for_reads`], because the stream
-/// keeps two batches in flight. MSA returns the resident runner's bound on
+/// SA and Gibbs return [`STREAM_IN_FLIGHT`] times [`batch_size_for_reads`]:
+/// the stream keeps that many batches in flight, and its cap on the problems
+/// of one batch never passes [`batch_size_for_reads`]
+/// (`streaming::form_and_commit` and `sampler::one_sweep_problem_cap`). The
+/// footprint of one model times this count therefore bounds the stream's
+/// batches in flight. MSA returns the resident runner's bound on
 /// queued, preparing, and ready jobs (`PREP_BOUND`, "At most 40 jobs" in
 /// `src/resident.rs`).
 #[must_use]
 pub fn instances(kernel: Kernel, reads: usize) -> usize {
     match kernel {
-        Kernel::Sa | Kernel::Gibbs => 2 * batch_size_for_reads(kernel, reads),
+        Kernel::Sa | Kernel::Gibbs => STREAM_IN_FLIGHT * batch_size_for_reads(kernel, reads),
         Kernel::Msa => crate::resident::PREP_BOUND,
     }
 }
@@ -674,8 +678,27 @@ fn routed_on(
     limits: &DeviceLimits,
     tiers: &[Storage],
 ) -> Result<Footprint, CapacityError> {
+    route(kernel, shape, limits, tiers, || {
+        crate::topology::dense_candidate(graph)
+    })
+}
+
+/// The cheapest tier of `tiers` that fits, except that a model for which
+/// `dense_candidate` is false takes the cheapest of the other tiers. The
+/// check runs only when the cheapest tier is [`Storage::Dense`].
+///
+/// # Errors
+///
+/// The errors of [`footprint`].
+pub(crate) fn route(
+    kernel: Kernel,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+    tiers: &[Storage],
+    dense_candidate: impl FnOnce() -> bool,
+) -> Result<Footprint, CapacityError> {
     let chosen = footprint_in(kernel, shape, limits, tiers)?;
-    if chosen.storage == Storage::Dense && !crate::topology::dense_candidate(graph) {
+    if chosen.storage == Storage::Dense && !dense_candidate() {
         let sparse: Vec<Storage> = tiers
             .iter()
             .copied()
@@ -782,12 +805,6 @@ pub(crate) fn footprint_in(
     }))
 }
 
-/// Reads the advertised limits plan against: the kernel's read cap, so a
-/// limit holds for every read count the miner accepts.
-fn advertised_reads(kernel: Kernel) -> usize {
-    crate::streaming::max_reads(kernel) as usize
-}
-
 /// How many couplings a model has for a given node count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Connectivity {
@@ -858,44 +875,128 @@ pub fn max_model(
     best
 }
 
-/// The most nodes a miner advertises: the largest Binary model with no
-/// edges. `cap` lowers it.
+/// Read counts the miner accepts, after the dispatch rounds each up to a
+/// whole SIMD group: 32, 64, ..., [`MAX_READS`].
+fn accepted_reads() -> impl Iterator<Item = usize> {
+    (1..=MAX_READS / SIMD_WIDTH).map(|groups| groups * SIMD_WIDTH)
+}
+
+/// The `(CSR, dense)` coefficient layouts the batch path runs a model of
+/// `kernel` on (`sampler::model_shape`). SA and Gibbs hold a unit model as
+/// Int8. A multi-spin unit model past the unit lane walks `int` rows but
+/// keeps a bit matrix, and a wide one whose rows pass one chunk walks `int`
+/// rows but may keep an `int8_t` matrix.
+const fn layouts(kernel: Kernel) -> &'static [(Precision, Precision)] {
+    match kernel {
+        Kernel::Sa | Kernel::Gibbs => &[
+            (Precision::Int8, Precision::Int8),
+            (Precision::Int8Scaled, Precision::Int8Scaled),
+            (Precision::Int32, Precision::Int32),
+            (Precision::Float32, Precision::Float32),
+        ],
+        Kernel::Msa => &[
+            (Precision::Binary, Precision::Binary),
+            (Precision::Int32, Precision::Binary),
+            (Precision::Int8Scaled, Precision::Int8Scaled),
+            (Precision::Int32, Precision::Int8Scaled),
+            (Precision::Int32, Precision::Int32),
+            (Precision::Float32, Precision::Float32),
+        ],
+    }
+}
+
+/// Whether the session admits one model of `nodes` nodes and `edges`
+/// couplers, spread as evenly as a simple graph allows, with
+/// [`ADVERTISED_BETAS`] betas: at every read count the miner accepts, on
+/// every coefficient layout, under the capacity model, the 32-bit index
+/// guards, and the one-sweep limit (`sampler::session_admits_shape`).
+#[must_use]
+pub fn session_admits(kernel: Kernel, nodes: usize, edges: usize, limits: &DeviceLimits) -> bool {
+    let complete = nodes.saturating_mul(nodes.saturating_sub(1)) / 2;
+    if nodes == 0 || edges > complete {
+        return false;
+    }
+    let max_degree = edges.saturating_mul(2).div_ceil(nodes).min(nodes - 1);
+    accepted_reads().all(|reads| {
+        layouts(kernel).iter().all(|&(precision, dense_precision)| {
+            let shape = ModelShape {
+                nodes,
+                edges,
+                max_degree,
+                precision,
+                dense_precision,
+                betas: ADVERTISED_BETAS,
+                reads,
+            };
+            crate::sampler::session_admits_shape(kernel, &shape, limits)
+        })
+    })
+}
+
+/// The largest `n` in `0..=high` for which `fits(n)` holds, or 0. A binary
+/// search: it returns an `n` that fits and whose successor does not, which
+/// is the largest when `fits` is monotone.
+fn largest_fitting(high: usize, fits: impl Fn(usize) -> bool) -> usize {
+    // Invariant: `low` fits or is 0; `high + 1` does not fit.
+    let (mut low, mut high) = (0, high);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
+/// The node count past which no dense-matrix sweep fits one chunk on any
+/// kernel: the dense row index alone stops below it ([`check_indices`]).
+const DENSE_SEARCH_NODES: usize = 1 << 16;
+
+/// The most couplers a miner advertises: the couplers of the largest
+/// complete model the session admits ([`session_admits`]), or 0 when none
+/// fits. Admission of a complete model falls as its nodes grow, so the
+/// search finds the largest.
+#[must_use]
+pub fn advertised_couplers(kernel: Kernel, limits: &DeviceLimits) -> usize {
+    let complete = |n: usize| n * n.saturating_sub(1) / 2;
+    complete(largest_fitting(DENSE_SEARCH_NODES, |n| {
+        session_admits(kernel, n, complete(n), limits)
+    }))
+}
+
+/// The most nodes a miner advertises: the largest node count the session
+/// admits with the advertised couplers ([`advertised_couplers`]), or every
+/// coupler of a complete model when it has fewer. The reference degree of
+/// that model is `2 * couplers / nodes`. `cap` lowers the limit.
+///
+/// Admission is not monotone in the node count at a fixed coupler count: a
+/// model just past the largest complete one takes dense-matrix storage and
+/// fails the one-sweep limit, and a larger one takes CSR storage and fits.
+/// The binary search returns a node count that the session admits and whose
+/// successor it refuses.
 ///
 /// # Errors
 ///
-/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it.
+/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it, or when
+/// the limit is 0: a zero `max_nodes` would advertise no bound at all.
 pub fn advertised_nodes(
     kernel: Kernel,
     limits: &DeviceLimits,
     cap: Option<usize>,
 ) -> Result<usize, CapacityError> {
-    let limit = max_model(
-        kernel,
-        Connectivity::Degree(0),
-        Precision::Binary,
-        limits,
-        advertised_reads(kernel),
-    )
-    .map_or(0, |(shape, _)| shape.nodes);
+    let couplers = advertised_couplers(kernel, limits);
+    let limit = largest_fitting(MAX_NODES, |n| {
+        let complete = n * n.saturating_sub(1) / 2;
+        session_admits(kernel, n, couplers.min(complete), limits)
+    });
     match cap {
+        _ if limit == 0 => Err(CapacityError::Nodes { max: 0 }),
         Some(cap) if cap > limit => Err(CapacityError::Nodes { max: limit }),
         Some(cap) => Ok(cap),
         None => Ok(limit),
     }
-}
-
-/// The most couplers a miner advertises: the couplers of the largest
-/// complete Binary model, or 0 when none fits.
-#[must_use]
-pub fn advertised_couplers(kernel: Kernel, limits: &DeviceLimits) -> usize {
-    max_model(
-        kernel,
-        Connectivity::Complete,
-        Precision::Binary,
-        limits,
-        advertised_reads(kernel),
-    )
-    .map_or(0, |(shape, _)| shape.edges)
 }
 
 /// Saturating sum of buffer sizes.
@@ -1342,6 +1443,41 @@ mod tests {
         assert_eq!(instances(Kernel::Msa, 100), 40);
     }
 
+    /// A stream batch holds at most `batch_size_for_reads` problems, and the
+    /// stream keeps `STREAM_IN_FLIGHT` batches on the GPU, so a footprint
+    /// that fits at `instances` covers every batch in flight at every read
+    /// count. One sweep of a capped batch also stays inside the cap.
+    #[test]
+    fn the_priced_instances_cover_the_stream_batches_in_flight() {
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            for reads in accepted_reads() {
+                let batch = batch_size_for_reads(kernel, reads);
+                assert_eq!(
+                    instances(kernel, reads),
+                    STREAM_IN_FLIGHT * batch,
+                    "{kernel:?} {reads}"
+                );
+                let graph = complete_graph(8);
+                let params = quip_solver_core::SampleParams {
+                    num_reads: reads,
+                    num_sweeps: 64,
+                    ..Default::default()
+                };
+                let cap = crate::sampler::one_sweep_problem_cap(
+                    &graph,
+                    &params,
+                    kernel,
+                    STREAM_IN_FLIGHT,
+                    batch,
+                );
+                assert!(
+                    cap.is_none_or(|cap| cap <= batch),
+                    "{kernel:?} {reads}: {cap:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn total_adds_shared_bytes_once() {
         let fp = Footprint {
@@ -1508,7 +1644,7 @@ mod tests {
     fn max_model_is_the_last_shape_that_fits() {
         for kernel in KERNELS {
             let connectivity = Connectivity::Degree(20);
-            let reads = advertised_reads(kernel);
+            let reads = MAX_READS;
             let (shape, fp) = max_model(kernel, connectivity, Precision::Binary, &BIG, reads)
                 .unwrap_or_else(|| panic!("{kernel:?}: nothing fits"));
             assert_eq!(footprint(kernel, &shape, &BIG), Ok(fp), "{kernel:?}");
@@ -1523,30 +1659,37 @@ mod tests {
         }
     }
 
+    /// The advertised corners are admitted at every read count and layout,
+    /// and one node more is refused: `max_nodes` with `max_edges` couplers,
+    /// and the complete model of `max_edges` couplers.
     #[test]
-    fn a_model_near_both_limits_is_refused() {
+    fn the_advertised_corners_are_the_last_admitted_shapes() {
         for kernel in KERNELS {
             let nodes = advertised_nodes(kernel, &BIG, None).unwrap();
             let couplers = advertised_couplers(kernel, &BIG);
-            let shape = ModelShape {
-                nodes,
-                edges: couplers,
-                // The fewest neighbours the busiest node needs to carry
-                // `couplers` edges over `nodes` nodes.
-                max_degree: (2 * couplers).div_ceil(nodes).min(nodes - 1),
-                precision: Precision::Binary,
-                dense_precision: Precision::Binary,
-                betas: 64,
-                reads: advertised_reads(kernel),
-            };
-            let err = footprint(kernel, &shape, &BIG).unwrap_err();
+            assert!(session_admits(kernel, nodes, couplers, &BIG), "{kernel:?}");
             assert!(
-                matches!(
-                    err,
-                    CapacityError::Memory { .. } | CapacityError::Index { .. }
-                ),
-                "{kernel:?}: {err:?}"
+                !session_admits(kernel, nodes + 1, couplers, &BIG),
+                "{kernel:?}"
             );
+            let complete = largest_fitting(DENSE_SEARCH_NODES, |n| n * (n - 1) / 2 <= couplers);
+            assert_eq!(complete * (complete - 1) / 2, couplers, "{kernel:?}");
+            let past = complete + 1;
+            assert!(
+                !session_admits(kernel, past, past * complete / 2, &BIG),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    /// A count with more couplers than a simple graph holds is never
+    /// admitted, and neither is an empty model.
+    #[test]
+    fn session_admits_only_simple_graphs() {
+        for kernel in KERNELS {
+            assert!(session_admits(kernel, 4, 6, &BIG), "{kernel:?}");
+            assert!(!session_admits(kernel, 4, 7, &BIG), "{kernel:?}");
+            assert!(!session_admits(kernel, 0, 0, &BIG), "{kernel:?}");
         }
     }
 
@@ -1693,7 +1836,7 @@ mod tests {
             max_buffer_bytes: 1 << 25,
         };
         for kernel in KERNELS {
-            let reads = advertised_reads(kernel);
+            let reads = MAX_READS;
             for connectivity in [Connectivity::Degree(20), Connectivity::Complete] {
                 let mut failed = false;
                 for nodes in (1..40_000).step_by(97) {
@@ -1717,14 +1860,19 @@ mod tests {
             max_buffer_bytes: 16,
         };
         for kernel in KERNELS {
-            let reads = advertised_reads(kernel);
+            let reads = MAX_READS;
             for connectivity in [Connectivity::Degree(20), Connectivity::Complete] {
                 assert!(
                     max_model(kernel, connectivity, Precision::Binary, &tiny, reads).is_none(),
                     "{kernel:?} {connectivity:?}"
                 );
             }
-            assert_eq!(advertised_nodes(kernel, &tiny, None), Ok(0));
+            // A zero `max_nodes` would advertise no bound, so the limit is
+            // an error.
+            assert_eq!(
+                advertised_nodes(kernel, &tiny, None),
+                Err(CapacityError::Nodes { max: 0 })
+            );
             assert_eq!(advertised_couplers(kernel, &tiny), 0);
         }
     }

@@ -78,6 +78,48 @@ quip-metal-sa --capabilities   # capabilities JSON
 quip-metal-sa --check          # probe the backend is runnable
 ```
 
+## Advertised limits
+
+Each binary derives `maxNodes` and `maxEdges` at startup from the unified
+memory of the host and from the one-sweep limit of its kernels. The session
+admission applies the same capacity model and the same one-sweep rule, so
+`--capabilities` prints the limits that the session enforces.
+
+- `maxEdges` is the coupler count of the largest complete model that the
+  session admits.
+- `maxNodes` is the largest node count that the session admits for a model
+  with `maxEdges` couplers. The reference degree of that model is
+  `2 * maxEdges / maxNodes`.
+- Both corners hold at every read count from 32 to 256, at 64 betas, and on
+  every coefficient layout that the kernel runs.
+- `--max-nodes N` lowers `maxNodes`. A value past the limit is a
+  configuration error (exit code 64), and the binary opens nothing.
+- MSA advertises no degree limit, because a model past the sparse degree
+  limit runs on dense-matrix storage.
+
+On the calibration host, an Apple M4 Max with a 40-core GPU and 128 GB of
+memory, the limits are:
+
+| Binary | `maxNodes` | `maxEdges` | Reference degree |
+|---|---:|---:|---:|
+| `quip-metal-sa` | 41,647 | 998,991 | 48.0 |
+| `quip-metal-gibbs` | 5,684,919 | 1,398,628 | 0.49 |
+| `quip-metal-msa` | 13,724,198 | 11,992,753 | 1.75 |
+
+The session can refuse some models inside both limits. A model just past
+the largest complete model takes dense-matrix storage, so the one-sweep
+limit refuses it. That refusal is a non-fatal `Capacity` reject with one
+refund.
+
+The sweep-time tables come from that one GPU
+(`docs/perf/2026-11-metal-capacity.md`). On another chip, the limits scale
+only with the GPU core count. The scaling is conservative for a GPU with
+fewer cores, but not for a GPU whose cores are slower. The planner plans
+each chunk against 500 ms (`TARGET_DISPATCH_MS`), and the one-sweep limit
+keeps a measured chunk below 400 ms. The `TARGET_DISPATCH_MS` comment in
+`src/sampler.rs` records the macOS GPU watchdog: MLX measured watchdog
+kills at about 1.2 s per operation with a display attached.
+
 ## Engine selection
 
 All binaries accept `enable_ane` and `enable_metal` in `backend_toml`. Both default to `true`.

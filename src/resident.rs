@@ -522,9 +522,9 @@ impl Pool {
 /// Bounds every resident job. The node count is not bounded here: a job past
 /// the unit kernel's nodes takes the batch path, whose spill build the
 /// capacity footprint bounds ([`admit_batch`]). The edge bound is the one the
-/// backend identity advertises.
+/// backend identity advertises (`crate::advertised_edges`).
 fn validate(job: &StreamJob) -> Result<(), SampleError> {
-    if job.graph.edges.len() > crate::DEFAULT_MAX_EDGES as usize
+    if job.graph.edges.len() > crate::advertised_edges(Kernel::Msa)
         || job.params.num_sweeps > sampler::MAX_SWEEPS
     {
         return Err(SampleError::TooLarge(
@@ -4503,16 +4503,29 @@ mod tests {
             .is_some());
     }
 
+    /// A job of `edges` couplers on two nodes: `validate` reads only the
+    /// counts, so the repeated pair keeps the test small.
+    fn edge_count_job(edges: usize) -> StreamJob {
+        StreamJob {
+            graph: IsingGraph::new(vec![0.0; 2], vec![1.0; edges], vec![(0, 1); edges]),
+            ..unit_ring(2)
+        }
+    }
+
+    /// The resident gate refuses one coupler past the advertised
+    /// `max_edges` as a non-fatal capacity reject, and admits the limit.
     #[test]
-    fn validate_refuses_more_edges_than_advertised() {
-        let mut edges = unit_ring(1 << 20);
-        assert!(edges.graph.edges.len() > crate::DEFAULT_MAX_EDGES as usize);
+    fn validate_refuses_one_edge_past_the_advertised_limit() {
+        let limit = crate::advertised_edges(Kernel::Msa);
+        let identity = crate::metal_msa_identity(sampler::host_device_limits(), None).unwrap();
+        assert_eq!(limit, identity.max_edges as usize);
         assert_eq!(
-            validate(&edges).unwrap_err().to_sample_error(),
+            validate(&edge_count_job(limit + 1))
+                .unwrap_err()
+                .to_sample_error(),
             quip_solver_core::SampleError::Capacity
         );
-        edges = unit_ring(crate::DEFAULT_MAX_EDGES as usize);
-        validate(&edges).unwrap();
+        validate(&edge_count_job(limit)).unwrap();
     }
 
     #[test]

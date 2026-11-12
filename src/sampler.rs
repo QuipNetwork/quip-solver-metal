@@ -133,18 +133,14 @@ pub(crate) fn simd_rounded_reads(num_reads: usize) -> usize {
 
 /// SA local-build `N` cap: `thread int8_t delta_energy[4593]` in
 /// `kernels/sa.metal`. A larger model runs the `QUIP_SA_GLOBAL` build on the
-/// batch path, with each read's state in device memory.
-///
-/// `crate::METAL_SA_IDENTITY` advertises this same cap, so the identity const
-/// and the kernel array have one source.
+/// batch path, with each read's state in device memory, so the advertised
+/// node limit (`capacity::advertised_nodes`) is not bounded by this cap.
 pub(crate) const SA_MAX_NODES: usize = 4593;
 /// Gibbs threadgroup-build `N` cap: `threadgroup int8_t shared_state[4800]` of
 /// the chromatic kernel and `thread int8_t packed_state[600]` (600*8) of the
 /// sequential kernel in `kernels/gibbs.metal`. The batch path runs a larger
 /// model on the chromatic kernel's spill build, which keeps the spins past
 /// this prefix in device memory.
-///
-/// Single source of truth with the identity const, as for [`SA_MAX_NODES`].
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 
 /// Replicas per 32-bit word in `kernels/msa.metal`.
@@ -655,10 +651,9 @@ pub(crate) const MSA_STATIC_TG_BYTES: usize = MSA_LANES * 4;
 /// spin does not fit Advantage2's 4577 spins.
 const APPLE_TG_MEMORY_BYTES: usize = 32 * 1024;
 /// Multi-spin kernel `N` cap: `N * 4` bytes of spin words must fit beside the
-/// lane totals under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 128 = 24,192).
-///
-/// `crate::METAL_MSA_IDENTITY` advertises this same cap, so the identity
-/// const and the dispatch guard have one source.
+/// lane totals under [`APPLE_TG_MEMORY_BYTES`] (6016 * 4 + 128 = 24,192). A
+/// larger weighted model runs the spill build, so the advertised node limit
+/// is not bounded by this cap.
 pub(crate) const MSA_MAX_NODES: usize = 6016;
 const _: () = assert!(
     MSA_MAX_NODES * 4 + MSA_STATIC_TG_BYTES <= APPLE_TG_MEMORY_BYTES,
@@ -2042,7 +2037,7 @@ fn validate_batch_within<'a>(
     // itself, even below a kernel's frame.
     let cap = crate::capacity::MAX_NODES.min(node_cap.unwrap_or(usize::MAX));
     if n > cap {
-        // Defense in depth: the harness rejects N > max_nodes (identity const)
+        // Defense in depth: the harness rejects N > max_nodes (the identity)
         // before the sampler. This applies the memory-scale bound or an
         // explicit node cap.
         return Err(SampleError::TooLarge(format!(
@@ -2089,32 +2084,85 @@ fn validate_batch_within<'a>(
     let i8_scale = batch_i8_scale(graphs, rep, i8.csr && !dense_rows);
     let dense_i8 = !unit && batch_i8_scale(graphs, rep, i8.dense).is_some();
     let shape = model_shape(first, params, rep, unit, i8_scale.is_some(), dense_i8);
+    if dense == DenseMode::Forced {
+        if !crate::capacity::runnable_storages(kernel).contains(&Storage::Dense) {
+            return Err(SampleError::TooLarge(format!(
+                "the {kernel:?} kernel has no dense-matrix build"
+            )));
+        }
+        if !crate::topology::dense_candidate(first) {
+            return Err(SampleError::TooLarge(
+                "dense-matrix storage needs a model without a repeated coupler or a self-loop"
+                    .into(),
+            ));
+        }
+    }
+    let storage = admit_shape(
+        kernel,
+        &shape,
+        limits,
+        dense,
+        || crate::topology::dense_candidate(first),
+        over_budget,
+        graphs.len(),
+        in_flight,
+    )?;
+    Ok(ValidBatch {
+        first,
+        n,
+        rep,
+        i8_scale,
+        dense_rows,
+        storage,
+        shape,
+        unit,
+    })
+}
+
+/// The admission of `problems` problems of `shape` that needs no graph: the
+/// tier the capacity model routes the batch to under `dense`, the degree
+/// budget of a CSR tier (`over_budget`, the refusal of a multi-spin row past
+/// it), the 32-bit kernel indices, and the one-sweep limit with `in_flight`
+/// batches on the GPU. `dense_candidate` says whether the model may take
+/// dense-matrix storage under [`DenseMode::Auto`]; it runs only when the
+/// capacity model picks that tier. Returns the tier.
+///
+/// [`validate_batch_within`] applies it to a batch, and the advertised limits
+/// ([`session_admits_shape`]) to the shapes they state, so both apply one
+/// rule.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shape, its limits, the storage switch, and the batch geometry"
+)]
+fn admit_shape(
+    kernel: Kernel,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+    dense: DenseMode,
+    dense_candidate: impl FnOnce() -> bool,
+    over_budget: Option<String>,
+    problems: usize,
+    in_flight: usize,
+) -> Result<Storage, SampleError> {
     let too_large = |e: crate::capacity::CapacityError| {
-        SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}"))
+        SampleError::TooLarge(format!("{kernel:?} model of {} nodes: {e}", shape.nodes))
     };
     let footprint = match dense {
         DenseMode::Off => crate::capacity::footprint_in(
             kernel,
-            &shape,
+            shape,
             limits,
             &[Storage::Threadgroup, Storage::Spill],
         ),
-        DenseMode::Auto => {
-            crate::capacity::routed_runnable_footprint(kernel, first, &shape, limits)
-        }
+        DenseMode::Auto => crate::capacity::route(
+            kernel,
+            shape,
+            limits,
+            crate::capacity::runnable_storages(kernel),
+            dense_candidate,
+        ),
         DenseMode::Forced => {
-            if !crate::capacity::runnable_storages(kernel).contains(&Storage::Dense) {
-                return Err(SampleError::TooLarge(format!(
-                    "the {kernel:?} kernel has no dense-matrix build"
-                )));
-            }
-            if !crate::topology::dense_candidate(first) {
-                return Err(SampleError::TooLarge(
-                    "dense-matrix storage needs a model without a repeated coupler or a self-loop"
-                        .into(),
-                ));
-            }
-            crate::capacity::footprint_in(kernel, &shape, limits, &[Storage::Dense])
+            crate::capacity::footprint_in(kernel, shape, limits, &[Storage::Dense])
         }
     }
     .map_err(too_large)?;
@@ -2124,8 +2172,8 @@ fn validate_batch_within<'a>(
         }
     }
     // The capacity model checks the indices of one problem; a batch holds
-    // `graphs.len()`.
-    crate::capacity::check_indices(kernel, footprint.storage, &shape, graphs.len())
+    // `problems`.
+    crate::capacity::check_indices(kernel, footprint.storage, shape, problems)
         .map_err(too_large)?;
     // A chunk is at least one sweep, so a batch whose one sweep would pass
     // the limit is refused before any buffer exists, on every tier and under
@@ -2134,23 +2182,27 @@ fn validate_batch_within<'a>(
     check_one_sweep(&SweepShape {
         kernel,
         storage: footprint.storage,
-        nodes: n,
-        degree: mean_degree(first),
-        problems: graphs.len(),
-        reads: simd_rounded_reads(params.num_reads),
+        nodes: shape.nodes,
+        // The mean CSR degree, as `mean_degree` gives it for a graph.
+        degree: 2.0 * shape.edges as f64 / shape.nodes.max(1) as f64,
+        problems,
+        reads: simd_rounded_reads(shape.reads),
         in_flight,
         cores: host_gpu_cores(),
     })?;
-    Ok(ValidBatch {
-        first,
-        n,
-        rep,
-        i8_scale,
-        dense_rows,
-        storage: footprint.storage,
-        shape,
-        unit,
-    })
+    Ok(footprint.storage)
+}
+
+/// Whether the session admits one model of `shape` on its own: what
+/// [`admit_one`] applies to a graph that is a dense candidate, whose degree
+/// is within the budget of the tier the capacity model routes it to, and
+/// whose coefficients take the layout `shape` states.
+pub(crate) fn session_admits_shape(
+    kernel: Kernel,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+) -> bool {
+    admit_shape(kernel, shape, limits, DenseMode::Auto, || true, None, 1, 1).is_ok()
 }
 
 /// The scale of a wide batch stored as `int8_t` coefficients, or `None` when

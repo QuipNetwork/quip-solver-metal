@@ -32,7 +32,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 const DEFAULT_GPU_CORES: usize = 10;
 
 /// Batches the stream keeps on the GPU at once ([`run_stream`]).
-const STREAM_IN_FLIGHT: usize = 2;
+pub(crate) const STREAM_IN_FLIGHT: usize = 2;
 
 /// Backend-facing read cap for [`crate::MetalSampler::max_reads`] (mirrors CUDA).
 ///

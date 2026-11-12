@@ -32,7 +32,7 @@ use quip_solver_core::quip_proto::v1::{
 };
 use quip_solver_core::quip_protocol::wire::{decode_spins_packed, encode_i32_le};
 use quip_solver_core::BackendIdentity;
-use quip_solver_metal::{METAL_GIBBS_IDENTITY, METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
+use quip_solver_metal::{host_identity, Kernel};
 use serde_json::{json, Map, Value};
 use std::process::Command;
 use std::time::Duration;
@@ -40,11 +40,11 @@ use support::{target, Session};
 
 const LONG: Duration = Duration::from_secs(120);
 
-/// One Metal binary and the identity it is built from.
+/// One Metal binary and the identity it is built from on this host.
 struct Bin {
     name: &'static str,
     path: &'static str,
-    identity: &'static BackendIdentity,
+    identity: BackendIdentity,
 }
 
 fn bins() -> [Bin; 3] {
@@ -52,17 +52,17 @@ fn bins() -> [Bin; 3] {
         Bin {
             name: "quip-metal-sa",
             path: env!("CARGO_BIN_EXE_quip-metal-sa"),
-            identity: &METAL_SA_IDENTITY,
+            identity: host_identity(Kernel::Sa, None).unwrap(),
         },
         Bin {
             name: "quip-metal-gibbs",
             path: env!("CARGO_BIN_EXE_quip-metal-gibbs"),
-            identity: &METAL_GIBBS_IDENTITY,
+            identity: host_identity(Kernel::Gibbs, None).unwrap(),
         },
         Bin {
             name: "quip-metal-msa",
             path: env!("CARGO_BIN_EXE_quip-metal-msa"),
-            identity: &METAL_MSA_IDENTITY,
+            identity: host_identity(Kernel::Msa, None).unwrap(),
         },
     ]
 }

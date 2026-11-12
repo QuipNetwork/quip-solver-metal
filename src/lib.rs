@@ -75,10 +75,9 @@ pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
 pub use sampler::{sample_ising, Kernel};
 
+use crate::capacity::{CapacityError, DeviceLimits};
 use quip_solver_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
-
-const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
 // Compile-time guard that the sampler's `num_sweeps` rejection threshold
 // still admits every job this backend advertises it will accept.
@@ -176,96 +175,176 @@ pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::Mod
 /// Gibbs's model limits, the same wide bound as [`METAL_SA_LIMITS`].
 pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = METAL_SA_LIMITS;
 
-/// MSA's model limits. The unit kernel and the ANE unroll
-/// `sampler::MSA_UNIT_MAX_DEG` neighbours, which caps the advertised degree.
-/// Unit models run on the unit kernel (or the ANE); any other milli-exact
-/// model, and a library unit model denser than that cap, runs on the weighted
-/// kernel, which walks up to `sampler::MSA_SPARSE_MAX_DEG` neighbours and
-/// whose field bound is the wide SA path's.
+/// MSA's model limits. A unit model runs on the unit kernel (or the ANE) up
+/// to `sampler::MSA_UNIT_MAX_DEG` neighbours, a weighted model on the
+/// weighted kernel up to `sampler::MSA_SPARSE_MAX_DEG`, and a denser model of
+/// either kind on dense-matrix storage, so no degree limit is advertised. The
+/// field bound is the wide SA path's.
 pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
-    max_degree: Some(crate::sampler::MSA_UNIT_MAX_DEG as u32),
+    max_degree: Some(0),
     max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
     exact_resolution_milli: Some(1),
 };
 
-/// Backend identity for `quip-metal-sa`.
-///
-/// # Examples
-///
-/// ```
-/// use quip_solver_metal::METAL_SA_IDENTITY;
-/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
-///
-/// assert_eq!(METAL_SA_IDENTITY.backend, Backend::Metal);
-/// assert_eq!(METAL_SA_IDENTITY.algorithm, Algorithm::Sa);
-/// assert!(METAL_SA_IDENTITY.max_nodes > 0);
-/// ```
-pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
-    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Sa,
-    // Single source of truth with the streaming session's gate
-    // (`sampler::kernel_max_nodes`): the advertised cap and the gate cannot
-    // drift because this is the same constant, the local build's
-    // `thread int8_t delta_energy[4593]` (`kernels/sa.metal`). The batch path
-    // runs a larger model on the global build, bounded by device memory.
-    // `const` context, so the narrowing cast is checked at compile time.
-    max_nodes: crate::sampler::SA_MAX_NODES as u32,
-    max_edges: DEFAULT_MAX_EDGES,
-    features: FEATURES,
-    adapt: METAL_ADAPT,
-    limits: METAL_SA_LIMITS,
-};
+/// The identity of `kernel` on a device with `limits`: `max_nodes` is
+/// [`capacity::advertised_nodes`], lowered to `cap`, and `max_edges` is
+/// [`capacity::advertised_couplers`]. Both come from the admission the
+/// session applies (`capacity::session_admits`), so a job at the stated
+/// corners is admitted.
+fn identity(
+    kernel: Kernel,
+    adapt: quip_solver_core::adapt::AdaptBounds,
+    model_limits: quip_solver_core::ModelLimits,
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, CapacityError> {
+    use quip_solver_core::quip_proto::v1::Algorithm as Proto;
+    let nodes = capacity::advertised_nodes(kernel, limits, cap)?;
+    let edges = capacity::advertised_couplers(kernel, limits);
+    let to_u32 = |count: usize| {
+        u32::try_from(count).map_err(|_| CapacityError::Nodes {
+            max: u32::MAX as usize,
+        })
+    };
+    Ok(BackendIdentity {
+        backend: quip_solver_core::quip_proto::v1::Backend::Metal,
+        algorithm: match kernel {
+            Kernel::Sa => Proto::Sa,
+            Kernel::Gibbs => Proto::Gibbs,
+            Kernel::Msa => Proto::Msa,
+        },
+        max_nodes: to_u32(nodes)?,
+        max_edges: to_u32(edges)?,
+        features: FEATURES,
+        adapt,
+        limits: model_limits,
+    })
+}
 
-/// Backend identity for `quip-metal-gibbs`.
+/// Backend identity for `quip-metal-sa` on a device with `limits`, with
+/// `max_nodes` lowered to `cap` (`--max-nodes`).
+///
+/// # Errors
+///
+/// [`CapacityError::Nodes`] naming the limit when `cap` exceeds it, or when
+/// no model fits `limits`.
 ///
 /// # Examples
 ///
 /// ```
-/// use quip_solver_metal::METAL_GIBBS_IDENTITY;
+/// use quip_solver_metal::{capacity, metal_sa_identity};
 /// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_GIBBS_IDENTITY.backend, Backend::Metal);
-/// assert_eq!(METAL_GIBBS_IDENTITY.algorithm, Algorithm::Gibbs);
-/// assert!(METAL_GIBBS_IDENTITY.max_nodes > 0);
+/// let identity = metal_sa_identity(&capacity::host_limits(), None).unwrap();
+/// assert_eq!(identity.backend, Backend::Metal);
+/// assert_eq!(identity.algorithm, Algorithm::Sa);
+/// assert!(identity.max_nodes > 0);
 /// ```
-pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
-    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Gibbs,
-    // Same single-source-of-truth rule as SA above; the Gibbs cap comes from
-    // `thread int8_t packed_state[600]` (600*8 bits) in `kernels/gibbs.metal`.
-    max_nodes: crate::sampler::GIBBS_MAX_NODES as u32,
-    max_edges: DEFAULT_MAX_EDGES,
-    features: FEATURES,
-    adapt: METAL_ADAPT,
-    limits: METAL_GIBBS_LIMITS,
-};
+pub fn metal_sa_identity(
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, CapacityError> {
+    identity(Kernel::Sa, METAL_ADAPT, METAL_SA_LIMITS, limits, cap)
+}
 
-/// Backend identity for `quip-metal-msa`.
+/// Backend identity for `quip-metal-gibbs`; see [`metal_sa_identity`].
+///
+/// # Errors
+///
+/// The errors of [`metal_sa_identity`].
 ///
 /// # Examples
 ///
 /// ```
-/// use quip_solver_metal::METAL_MSA_IDENTITY;
+/// use quip_solver_metal::{capacity, metal_gibbs_identity};
 /// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
 ///
-/// assert_eq!(METAL_MSA_IDENTITY.backend, Backend::Metal);
-/// assert_eq!(METAL_MSA_IDENTITY.algorithm, Algorithm::Msa);
-/// assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads, 64);
+/// let identity = metal_gibbs_identity(&capacity::host_limits(), None).unwrap();
+/// assert_eq!(identity.backend, Backend::Metal);
+/// assert_eq!(identity.algorithm, Algorithm::Gibbs);
+/// assert!(identity.max_nodes > 0);
 /// ```
-pub const METAL_MSA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: quip_solver_core::quip_proto::v1::Backend::Metal,
-    algorithm: quip_solver_core::quip_proto::v1::Algorithm::Msa,
-    // The GPU kernel's capacity, the same constant as its dispatch guard. The
-    // ANE holds up to 16,384 nodes, but only with unit coefficients, at most
-    // 128 reads, and while it is enabled, so advertising its cap would admit
-    // models that the binary then refuses. `const` context, so the narrowing
-    // cast is checked at compile time.
-    max_nodes: crate::sampler::MSA_MAX_NODES as u32,
-    max_edges: DEFAULT_MAX_EDGES,
-    features: FEATURES,
-    adapt: METAL_MSA_ADAPT,
-    limits: METAL_MSA_LIMITS,
-};
+pub fn metal_gibbs_identity(
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, CapacityError> {
+    identity(Kernel::Gibbs, METAL_ADAPT, METAL_GIBBS_LIMITS, limits, cap)
+}
+
+/// Backend identity for `quip-metal-msa`; see [`metal_sa_identity`]. The
+/// limits are the GPU's. The ANE holds up to 16,384 nodes, but only with
+/// unit coefficients, at most 128 reads, and while it is enabled, so its
+/// bounds do not widen the identity.
+///
+/// # Errors
+///
+/// The errors of [`metal_sa_identity`].
+///
+/// # Examples
+///
+/// ```
+/// use quip_solver_metal::{capacity, metal_msa_identity};
+/// use quip_solver_core::quip_proto::v1::{Algorithm, Backend};
+///
+/// let identity = metal_msa_identity(&capacity::host_limits(), None).unwrap();
+/// assert_eq!(identity.backend, Backend::Metal);
+/// assert_eq!(identity.algorithm, Algorithm::Msa);
+/// assert_eq!(identity.adapt.min_reads, 64);
+/// ```
+pub fn metal_msa_identity(
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, CapacityError> {
+    identity(Kernel::Msa, METAL_MSA_ADAPT, METAL_MSA_LIMITS, limits, cap)
+}
+
+/// The identity of `kernel` on this host with `max_nodes` lowered to `cap`,
+/// or, when `cap` passes the limit, the exit code of an invalid
+/// configuration after a message on standard error. The binaries call it
+/// before they open anything, so `--capabilities` prints the same limits.
+///
+/// # Errors
+///
+/// [`quip_solver_core::quip_protocol::session::ExitCode::ConfigInvalid`]
+/// (64) when the identity is an error.
+pub fn host_identity(kernel: Kernel, cap: Option<usize>) -> Result<BackendIdentity, ExitCode> {
+    let limits = capacity::host_limits();
+    let identity = match kernel {
+        Kernel::Sa => metal_sa_identity(&limits, cap),
+        Kernel::Gibbs => metal_gibbs_identity(&limits, cap),
+        Kernel::Msa => metal_msa_identity(&limits, cap),
+    };
+    identity.map_err(|e| {
+        #[expect(
+            clippy::print_stderr,
+            reason = "the binary exits before the session installs its subscriber"
+        )]
+        {
+            match (cap, e) {
+                (Some(cap), CapacityError::Nodes { max }) => eprintln!(
+                    "--max-nodes {cap} exceeds the {max} nodes this host admits for {kernel:?}"
+                ),
+                (_, e) => eprintln!("no {kernel:?} model fits this host: {e}"),
+            }
+        }
+        let code = quip_solver_core::quip_protocol::session::ExitCode::ConfigInvalid.as_i32();
+        ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
+    })
+}
+
+/// The couplers the identity of `kernel` advertises on this host, computed
+/// once per kernel. The session gates that bound a job by edge count read
+/// it, so they refuse exactly past `max_edges`.
+pub(crate) fn advertised_edges(kernel: Kernel) -> usize {
+    static EDGES: [std::sync::OnceLock<usize>; 3] = [const { std::sync::OnceLock::new() }; 3];
+    let slot = match kernel {
+        Kernel::Sa => 0,
+        Kernel::Gibbs => 1,
+        Kernel::Msa => 2,
+    };
+    *EDGES[slot]
+        .get_or_init(|| capacity::advertised_couplers(kernel, crate::sampler::host_device_limits()))
+}
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization
 /// governor. macOS-only.
@@ -956,7 +1035,7 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
 ///
 /// ```no_run
 /// use quip_solver_core::CommonArgs;
-/// use quip_solver_metal::{run_metal, SaTag, METAL_SA_IDENTITY};
+/// use quip_solver_metal::{host_identity, run_metal, Kernel, SaTag};
 ///
 /// let common = CommonArgs {
 ///     quip_coordinator: None,
@@ -967,7 +1046,8 @@ impl<A: KernelTag> quip_solver_core::Sampler for TaggedSampler<A> {
 ///     log_level: "info".into(),
 ///     sweeps_per_beta: None,
 /// };
-/// let _code = run_metal::<SaTag>(METAL_SA_IDENTITY, &common, 0, 100, false);
+/// let identity = host_identity(Kernel::Sa, None).unwrap();
+/// let _code = run_metal::<SaTag>(identity, &common, 0, 100, false);
 /// ```
 pub fn run_metal<A: KernelTag>(
     id: BackendIdentity,
@@ -1014,88 +1094,211 @@ mod tests {
         );
     }
 
+    fn host_identities() -> [(super::Kernel, quip_solver_core::BackendIdentity); 3] {
+        use super::Kernel;
+        let limits = crate::sampler::host_device_limits();
+        [
+            (Kernel::Sa, super::metal_sa_identity(limits, None).unwrap()),
+            (
+                Kernel::Gibbs,
+                super::metal_gibbs_identity(limits, None).unwrap(),
+            ),
+            (
+                Kernel::Msa,
+                super::metal_msa_identity(limits, None).unwrap(),
+            ),
+        ]
+    }
+
     #[test]
     fn msa_identity_advertises_the_multi_spin_kernel() {
-        use super::METAL_MSA_IDENTITY;
+        let [_, _, (_, msa)] = host_identities();
         assert_eq!(
-            METAL_MSA_IDENTITY.backend,
+            msa.backend,
             quip_solver_core::quip_proto::v1::Backend::Metal
         );
         assert_eq!(
-            METAL_MSA_IDENTITY.algorithm,
+            msa.algorithm,
             quip_solver_core::quip_proto::v1::Algorithm::Msa
         );
-        assert_eq!(METAL_MSA_IDENTITY.max_nodes, 6016);
-        assert_eq!(METAL_MSA_IDENTITY.features, super::FEATURES);
+        assert_eq!(msa.features, super::FEATURES);
         // Reads are pinned to whole words.
-        assert_eq!(METAL_MSA_IDENTITY.adapt.min_reads % 32, 0);
-        assert_eq!(
-            METAL_MSA_IDENTITY.adapt.min_reads,
-            METAL_MSA_IDENTITY.adapt.max_reads
-        );
-        const {
-            assert!(METAL_MSA_IDENTITY.adapt.min_sweeps <= METAL_MSA_IDENTITY.adapt.max_sweeps);
-        }
+        assert_eq!(msa.adapt.min_reads % 32, 0);
+        assert_eq!(msa.adapt.min_reads, msa.adapt.max_reads);
+        assert!(msa.adapt.min_sweeps <= msa.adapt.max_sweeps);
     }
 
-    /// Every identity lists `linear-schedule` and states its node cap and
-    /// model limits, and claims exact coefficients.
-    /// Device-free, like `--capabilities`.
+    /// Every identity lists `linear-schedule` and its model limits, and
+    /// claims exact coefficients. Device-free, like `--capabilities`.
     #[test]
     fn identities_advertise_linear_schedule_and_their_limits() {
-        use super::{METAL_GIBBS_IDENTITY, METAL_MSA_IDENTITY, METAL_SA_IDENTITY};
         use quip_solver_core::ModelLimits;
-        let wide = ModelLimits {
+        let limits = ModelLimits {
             max_degree: Some(0),
             max_local_field_milli: Some(268_435_000),
             exact_resolution_milli: Some(1),
         };
-        let msa = ModelLimits {
-            max_degree: Some(20),
-            ..wide
-        };
-        for (identity, nodes, limits) in [
-            (&METAL_SA_IDENTITY, 4593, wide),
-            (&METAL_GIBBS_IDENTITY, 4800, wide),
-            (&METAL_MSA_IDENTITY, 6016, msa),
-        ] {
-            let algorithm = identity.algorithm;
+        for (kernel, identity) in host_identities() {
+            for feature in [
+                quip_solver_core::LINEAR_SCHEDULE_FEATURE,
+                quip_solver_core::EXACT_COEFFICIENTS_FEATURE,
+            ] {
+                assert!(identity.features.contains(&feature), "{kernel:?}");
+            }
+            assert_eq!(identity.limits, limits, "{kernel:?}");
+        }
+    }
+
+    /// The identity states the limits the session admits: `max_nodes` and
+    /// `max_edges` are the capacity model's advertised values on this host,
+    /// and the edge gates of the session read the same `max_edges`.
+    #[test]
+    fn the_identity_matches_the_capacity_model() {
+        use crate::capacity::{advertised_couplers, advertised_nodes, session_admits};
+        let limits = crate::sampler::host_device_limits();
+        for (kernel, identity) in host_identities() {
+            let nodes = advertised_nodes(kernel, limits, None).unwrap();
+            let edges = advertised_couplers(kernel, limits);
+            assert_eq!(identity.max_nodes as usize, nodes, "{kernel:?}");
+            assert_eq!(identity.max_edges as usize, edges, "{kernel:?}");
+            assert_eq!(super::advertised_edges(kernel), edges, "{kernel:?}");
+            assert!(session_admits(kernel, nodes, edges, limits), "{kernel:?}");
+            // The kernel arrays no longer bound the identity.
             assert!(
-                identity
-                    .features
-                    .contains(&quip_solver_core::LINEAR_SCHEDULE_FEATURE),
-                "{algorithm:?}"
+                nodes > crate::sampler::kernel_max_nodes(kernel),
+                "{kernel:?}: {nodes}"
+            );
+            // `--max-nodes` lowers the node limit only.
+            let capped =
+                super::identity(kernel, identity.adapt, identity.limits, limits, Some(1_000))
+                    .unwrap();
+            assert_eq!(capped.max_nodes, 1_000, "{kernel:?}");
+            assert_eq!(capped.max_edges, identity.max_edges, "{kernel:?}");
+        }
+    }
+
+    /// A `--max-nodes` past the limit fails before any device opens, with
+    /// the limit in the error.
+    #[test]
+    fn max_nodes_above_the_limit_fails_at_open() {
+        let limits = crate::sampler::host_device_limits();
+        for (kernel, identity) in host_identities() {
+            let limit = identity.max_nodes as usize;
+            let over = super::identity(
+                kernel,
+                identity.adapt,
+                identity.limits,
+                limits,
+                Some(limit + 1),
+            );
+            assert_eq!(
+                over.map(|_| ()),
+                Err(crate::capacity::CapacityError::Nodes { max: limit }),
+                "{kernel:?}"
             );
             assert!(
-                identity
-                    .features
-                    .contains(&quip_solver_core::EXACT_COEFFICIENTS_FEATURE),
-                "{algorithm:?}"
+                super::host_identity(kernel, Some(limit + 1)).is_err(),
+                "{kernel:?}"
             );
-            assert_eq!(identity.max_nodes, nodes, "{algorithm:?}");
-            assert_eq!(identity.limits, limits, "{algorithm:?}");
+            assert_eq!(
+                super::host_identity(kernel, Some(limit)).map(|id| id.max_nodes),
+                Ok(identity.max_nodes),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    /// `nodes` nodes with `edges` couplers: every pair when `edges` is the
+    /// complete count, else circulant offsets 1, 2, ... in turn. `coupling`
+    /// gives coupler `k` its value.
+    fn corner_graph(nodes: usize, edges: usize, coupling: fn(usize) -> f64) -> super::IsingGraph {
+        let mut pairs = Vec::with_capacity(edges);
+        if edges == nodes * (nodes - 1) / 2 {
+            pairs.extend((0..nodes).flat_map(|u| ((u + 1)..nodes).map(move |v| (u, v))));
+        } else {
+            'offsets: for offset in 1..=nodes / 2 {
+                for u in 0..nodes {
+                    // The offset of half an even ring meets each pair twice.
+                    if 2 * offset == nodes && u >= offset {
+                        continue;
+                    }
+                    if pairs.len() == edges {
+                        break 'offsets;
+                    }
+                    pairs.push((u, (u + offset) % nodes));
+                }
+            }
+        }
+        assert_eq!(pairs.len(), edges);
+        let j = (0..edges).map(coupling).collect();
+        super::IsingGraph::new(vec![0.0; nodes], j, pairs)
+    }
+
+    /// The advertised corners run through the session admission
+    /// (`sampler::admit_one`): `max_nodes` with `max_edges` couplers, at the
+    /// reference degree `2 * max_edges / max_nodes`, and the complete model
+    /// of `max_edges` couplers. Both are admitted on unit and on wide
+    /// coefficients, at the smallest and the largest read count, and one
+    /// node more is refused as a capacity error.
+    #[test]
+    fn the_advertised_corners_pass_the_session_admission() {
+        use quip_solver_core::SampleParams;
+        let unit: fn(usize) -> f64 = |k| if k % 2 == 0 { 1.0 } else { -1.0 };
+        let wide: fn(usize) -> f64 = |k| if k % 2 == 0 { 1.3 } else { -0.127 };
+        for (kernel, identity) in host_identities() {
+            let nodes = identity.max_nodes as usize;
+            let edges = identity.max_edges as usize;
+            let complete = (2..).find(|n| n * (n - 1) / 2 >= edges).unwrap();
+            assert_eq!(complete * (complete - 1) / 2, edges, "{kernel:?}");
+            let graphs: Vec<super::IsingGraph> = [unit, wide]
+                .into_iter()
+                .flat_map(|coupling| {
+                    [
+                        corner_graph(nodes, edges, coupling),
+                        corner_graph(complete, edges, coupling),
+                        corner_graph(nodes + 1, edges, coupling),
+                    ]
+                })
+                .collect();
+            for reads in [32, 256] {
+                let params = SampleParams {
+                    num_reads: reads,
+                    num_sweeps: 64,
+                    ..Default::default()
+                };
+                for corners in graphs.chunks(3) {
+                    for graph in &corners[..2] {
+                        if let Err(e) = crate::sampler::admit_one(graph, &params, kernel) {
+                            panic!(
+                                "{kernel:?}: {} nodes, {reads} reads: {e:?}",
+                                graph.num_nodes()
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        crate::sampler::admit_one(&corners[2], &params, kernel)
+                            .map(|_| ())
+                            .map_err(|e| e.to_sample_error()),
+                        Err(quip_solver_core::SampleError::Capacity),
+                        "{kernel:?}: {reads} reads"
+                    );
+                }
+            }
         }
     }
 
     #[test]
     fn msa_envelope_resolves_to_the_measured_shape_at_the_testnet_target() {
-        use super::METAL_MSA_IDENTITY;
         use quip_solver_core::adapt::adapt_params;
+        let [_, _, (_, msa)] = host_identities();
         // Aglais qblock 3278: zero-field Advantage2 graph, target below the
         // adapt model's hardest energy, so the difficulty saturates at 1.0 and
         // the job is the envelope's maximum: the shape the sweeps study picked.
-        let job = adapt_params(
-            -14_624_068,
-            1,
-            4_577,
-            41_514,
-            &[0],
-            &METAL_MSA_IDENTITY.adapt,
-        );
+        let job = adapt_params(-14_624_068, 1, 4_577, 41_514, &[0], &msa.adapt);
         assert_eq!(job.num_reads, 64);
         assert_eq!(job.num_sweeps, 14_336);
         // An easy target lands on the floor, still a whole number of words.
-        let easy = adapt_params(0, 1, 4_577, 41_514, &[0], &METAL_MSA_IDENTITY.adapt);
+        let easy = adapt_params(0, 1, 4_577, 41_514, &[0], &msa.adapt);
         assert_eq!(easy.num_reads, 64);
         assert_eq!(easy.num_sweeps, 4_096);
     }

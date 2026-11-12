@@ -253,8 +253,12 @@ and returns each job's credit after its committed chunk finishes.
   Rates were 13.64, 14.23, 12.16, 11.57, and 10.85 jobs/s at T=1, 2, 4, 6,
   and 8. T=1 is the smallest within 10% of the peak at T=2.
   `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by `words`.
-- **Identity.** `METAL_MSA_IDENTITY`: backend `metal`, algorithm `msa`,
-  `max_nodes = MSA_MAX_NODES`, features `streaming` and `governor`. Adapt
+- **Identity.** `metal_msa_identity(limits, cap)`: `Backend::Metal`,
+  `Algorithm::Msa`, features `streaming` and `governor`. `max_nodes` is
+  `capacity::advertised_nodes` and `max_edges` is
+  `capacity::advertised_couplers`. Both come from the unified memory of the
+  host and the one-sweep limit, as the README section "Advertised limits"
+  describes. The identity states no degree limit. Adapt
   envelope `4096..14336` sweeps, with `64` reads fixed at two words.
   On the same fixture and machine, the 2026-09-15 reference reached 1.02
   jobs/s at 2048 sweeps and 256 reads, using its production T=6.
