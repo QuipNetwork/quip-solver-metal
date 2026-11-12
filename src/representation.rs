@@ -26,8 +26,9 @@ pub(crate) const WIDE_MAX_FIELD_MILLI: u32 = 268_435_000;
 /// The smallest coefficient tier that represents a model exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Representation {
-    /// Every `h` and `J` is -1, 0 or 1. For MSA, the unit kernel. For SA and
-    /// Gibbs, a unit model whose local field fits the int8 path.
+    /// Every `h` and `J` is -1, 0 or 1. MSA uses the unit kernel.
+    /// SA and Gibbs require each absolute local field to be at most 63.
+    /// Both use Int8 storage.
     Binary,
     /// Whole units in `int8_t` with a local field of at most
     /// [`INT8_MAX_FIELD_MILLI`], and not [`Representation::Binary`]. SA and
@@ -37,7 +38,7 @@ pub(crate) enum Representation {
     /// `msa_anneal_weighted`.
     Wide,
     /// Every other finite model: a value off the milli grid, or a local field
-    /// past [`WIDE_MAX_FIELD_MILLI`]. No kernel runs it yet.
+    /// past [`WIDE_MAX_FIELD_MILLI`]. All three kernels have a Float32 build.
     Float32,
 }
 
@@ -79,8 +80,8 @@ pub(crate) fn wide_i8_scale(graph: &IsingGraph) -> Option<i32> {
 }
 
 /// The scale for the graphs of one batch, which share one scale: the gcd over
-/// every graph, and every quotient must fit `i8`. [`wide_i8_scale`] is the
-/// one-graph case.
+/// every graph, and every quotient must fit `i8`. A one-element slice gives
+/// the scale of one graph.
 pub(crate) fn batch_wide_i8_scale(graphs: &[&IsingGraph]) -> Option<i32> {
     let mut milli = Vec::new();
     for graph in graphs {

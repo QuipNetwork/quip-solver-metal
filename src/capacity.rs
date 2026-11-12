@@ -133,8 +133,8 @@ pub fn host_limits() -> DeviceLimits {
 /// Numeric type of the couplings and fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Unit coefficients: two bit planes in a dense matrix (2 bits per
-    /// cell); one byte in CSR.
+    /// Unit coefficients: two bits per dense matrix cell, one byte in CSR.
+    /// SA uses Int8 storage and requires each absolute local field to be at most 63.
     Binary,
     /// Signed 8-bit coefficients.
     Int8,
