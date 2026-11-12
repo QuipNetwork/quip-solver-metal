@@ -126,25 +126,40 @@ fn complete_graphs_at_16_64_65_and_200_nodes_report_exact_energies() {
 
 /// K_63 with unit antiferromagnetic couplings, degree 62: past the unit
 /// kernel's 20 neighbours, so MSA runs it on the weighted lane. With `M` the
-/// spin sum, `E = sum_{i<j} s_i s_j = (M^2 - 63) / 2`, and 63 spins make `M`
-/// odd, so the ground energy is `(1 - 63) / 2 = -31`, at `|M| = 1`.
-#[test]
-fn a_degree_62_model_runs_on_msa() {
+/// spin sum, `E = sum_{i<j} s_i s_j = (M^2 - n) / 2`, and odd `n` makes `M`
+/// odd, so the ground energy is `(1 - n) / 2`, at `|M| = 1`.
+fn a_dense_unit_model_with_degree_over_20_runs_on_msa(n: usize, sweeps: usize) {
     let Some(dev) = device() else { return };
-    let n = 63;
     let edges: Vec<(usize, usize)> = (0..n)
         .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
         .collect();
     let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
-    let reads = sample_ising(&dev, &graph, &params(1000), Kernel::Msa).unwrap();
+    let ground = (1 - n as i64) * 500;
+    let reads = sample_ising(&dev, &graph, &params(sweeps), Kernel::Msa).unwrap();
     assert_eq!(reads.len(), 64);
     for r in &reads {
         assert_eq!(
             r.energy_milli,
             energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
         );
-        assert_eq!(r.energy_milli, -31_000, "every read reaches the ground");
+        assert_eq!(r.energy_milli, ground, "every read reaches the ground");
     }
+}
+
+/// The smallest odd complete graph above the unit kernel degree limit still
+/// exercises MSA's weighted lane, with the same exact-ground assertion.
+#[test]
+fn a_small_dense_model_with_degree_over_20_runs_on_msa() {
+    a_dense_unit_model_with_degree_over_20_runs_on_msa(23, 1000);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "long-tests"),
+    ignore = "degree 62 model takes over 5 s: run with --features long-tests"
+)]
+fn a_degree_62_model_runs_on_msa() {
+    a_dense_unit_model_with_degree_over_20_runs_on_msa(63, 1000);
 }
 
 /// A weighted star whose hub has 30 leaves, so the hub's row takes two row
