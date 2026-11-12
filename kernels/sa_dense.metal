@@ -228,7 +228,15 @@ kernel void sa_matrix_anneal(
 #endif
 
         for (int sweep = sweep_start; sweep < sweep_end; sweep++) {
+            // The sparse kernel's node left out: one draw per sweep, made on
+            // the last sweep too, which leaves no node out.
+            uint sit_out_draw = xorshift32(rng_state);
+            bool last_sweep = beta_idx == num_betas - 1 && sweep == sweeps_per_beta_val - 1;
+            uint skip = last_sweep ? SA_NO_SIT_OUT : sit_out_node(sit_out_draw, n);
             for (int var = 0; var < n; var++) {
+                if (uint(var) == skip) {
+                    continue;
+                }
                 delta_t de = delta_energy[uint(var) * stride];
 
 #ifdef QUIP_WIDE
