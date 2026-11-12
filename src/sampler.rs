@@ -1380,6 +1380,16 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
+    /// Bytes still allocated in the free list, unavailable to other device users.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
+    }
+
     /// Smallest free buffer with `len <= length <= 2 * len`, else a new
     /// shared buffer, refusing as a capacity error when the device cannot
     /// allocate one.
@@ -1861,7 +1871,7 @@ pub(crate) fn kernel_representation(
 /// cached SA delta updated with `fma(±4, J, delta)`.
 /// The beta rule also keeps `2 * beta` finite in Gibbs and MSA; CUDA's
 /// `build_planned_beta_schedule` checks only that beta itself is finite.
-fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
+pub(crate) fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
     if let Some(index) = beta.iter().position(|b| !b.is_finite()) {
         return Err(SampleError::TooLarge(format!(
             "beta schedule value at index {index} is outside the finite f32 range"
@@ -2009,6 +2019,8 @@ struct ValidBatch<'a> {
     rep: Representation,
     /// The `int8_t` storage scale, when the batch takes that storage.
     i8_scale: Option<i32>,
+    /// The scale for dense storage, which has no CSR row restriction.
+    dense_i8_scale: Option<i32>,
     /// An MSA batch with a CSR row past one chunk of [`MSA_UNIT_MAX_DEG`]:
     /// on CSR storage it runs on the dense-rows weighted pipeline.
     dense_rows: bool,
@@ -2167,9 +2179,17 @@ fn validate_batch_within<'a>(
             return Err(SampleError::TooLarge(message));
         }
     }
-    let i8_scale = batch_i8_scale(graphs, rep, i8.csr && !dense_rows);
-    let dense_i8 = !unit && batch_i8_scale(graphs, rep, i8.dense).is_some();
-    let shape = model_shape(first, params, rep, unit, i8_scale.is_some(), dense_i8);
+    let scale = batch_i8_scale(graphs, rep, i8.csr || i8.dense);
+    let i8_scale = scale.filter(|_| i8.csr && !dense_rows);
+    let dense_i8_scale = scale.filter(|_| i8.dense && !unit);
+    let shape = model_shape(
+        first,
+        params,
+        rep,
+        unit,
+        i8_scale.is_some(),
+        dense_i8_scale.is_some(),
+    );
     if dense == DenseMode::Forced {
         if !crate::capacity::runnable_storages(kernel).contains(&Storage::Dense) {
             return Err(SampleError::TooLarge(format!(
@@ -2198,6 +2218,7 @@ fn validate_batch_within<'a>(
         n,
         rep,
         i8_scale,
+        dense_i8_scale,
         dense_rows,
         storage: footprint.storage,
         footprint,
@@ -2935,6 +2956,7 @@ fn encode_batch_storage(
         n,
         rep,
         i8_scale,
+        dense_i8_scale,
         dense_rows,
         storage,
         shape: _,
@@ -3065,11 +3087,7 @@ fn encode_batch_storage(
     // unit model, holds the narrowest matrix its coefficients fit: `int8_t`
     // storage needs no CSR rule here.
     let (pipeline, i8_scale) = if matrix {
-        let dense_i8 = if unit {
-            None
-        } else {
-            batch_i8_scale(graphs, rep, wide_i8)
-        };
+        let dense_i8 = dense_i8_scale;
         let pipeline = match kernel {
             Kernel::Sa if dense_i8.is_some() => &device.sa_matrix_wide_i8,
             Kernel::Sa if wide => &device.sa_matrix_int,
@@ -3616,30 +3634,6 @@ pub fn sample_ising(
     kernel: Kernel,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     sample_planned(device, graph, params, kernel, None, true)
-}
-
-/// [`sample_ising`] with the beta schedule split into chunks of
-/// `rungs_per_chunk` rungs, so tests can compare a chunked anneal with an
-/// unchunked one of the same seed.
-///
-/// # Errors
-///
-/// The same as [`sample_ising`].
-#[doc(hidden)]
-pub fn sample_ising_chunked(
-    device: &crate::metal_device::MetalDevice,
-    graph: &IsingGraph,
-    params: &SampleParams,
-    kernel: Kernel,
-    rungs_per_chunk: usize,
-) -> Result<Vec<SamplerResult>, SampleError> {
-    let num_betas = (params.num_sweeps / params.sweeps_per_beta.max(1)).max(1);
-    let step = rungs_per_chunk.clamp(1, num_betas);
-    let plan: Vec<(i32, i32)> = (0..num_betas)
-        .step_by(step)
-        .map(|start| (start as i32, step.min(num_betas - start) as i32))
-        .collect();
-    sample_planned(device, graph, params, kernel, Some(&plan), true)
 }
 
 /// The reads of [`sample_ising_tuned`] and how its anneal was split.
@@ -6370,6 +6364,71 @@ mod tests {
                 };
             }
             prop_assert_eq!(cursor, (cover, 0), "plan does not cover full schedule");
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_chunk_tests {
+    use super::*;
+
+    fn twelve_node_model() -> IsingGraph {
+        let n = 12;
+        let mut edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        edges.extend((0..n / 2).map(|i| (i, i + n / 2)));
+        let palette = [0.37, -1.25e-3, -0.8125, 0.0421, 1.3333, -0.5005];
+        let j = (0..edges.len())
+            .map(|k| palette[k % palette.len()])
+            .collect();
+        let h = (0..n)
+            .map(|i| palette[(i * 5 + 1) % palette.len()] * 0.5)
+            .collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    fn complete_real_model() -> IsingGraph {
+        let n = 32;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let palette = [0.37, -1.25e-3, -0.8125, 0.0421, 1.3333, -0.5005];
+        let j = (0..edges.len())
+            .map(|k| palette[(k * 7 + 3) % palette.len()] * 0.1)
+            .collect();
+        let h = (0..n).map(|i| palette[i % palette.len()]).collect();
+        IsingGraph::new(h, j, edges)
+    }
+
+    fn chunked_and_unchunked_real_anneals_match(kernel: Kernel) {
+        let Ok(dev) = crate::metal_device::MetalDevice::open(0) else {
+            return;
+        };
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 96,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.1, 3.0)),
+            seed: 9,
+            ..Default::default()
+        };
+        // The complete model has degree 31, two row chunks in the multi-spin
+        // float lane.
+        for graph in [twelve_node_model(), complete_real_model()] {
+            let whole = sample_ising(&dev, &graph, &params, kernel).unwrap();
+            let plan: Vec<_> = (0..params.num_sweeps as i32)
+                .map(|rung| (rung, 1))
+                .collect();
+            let split = sample_planned(&dev, &graph, &params, kernel, Some(&plan), true).unwrap();
+            assert_eq!(whole, split, "{} nodes", graph.num_nodes());
+            // The anneal moved: the reads are not all one state.
+            assert!(whole.iter().any(|r| r.spins != whole[0].spins));
+        }
+    }
+
+    #[test]
+    fn chunked_and_unchunked_float_anneals_match() {
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            chunked_and_unchunked_real_anneals_match(kernel);
         }
     }
 }

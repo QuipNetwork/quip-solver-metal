@@ -374,7 +374,19 @@ fn eligibility(
         && n <= crate::capacity::MAX_NODES
         && graph.edges.len() <= crate::advertised_edges(kernel)
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
-    metal &= crate::sampler::kernel_representation(graph, kernel).is_ok();
+    metal &= crate::sampler::kernel_representation(graph, kernel).is_ok_and(|rep| {
+        if !metal || rep != crate::representation::Representation::Float32 {
+            return true;
+        }
+        let (beta, _) = crate::sampler::build_beta_schedule(
+            graph,
+            params.num_sweeps,
+            params.sweeps_per_beta,
+            params.beta_range,
+            params.schedule,
+        );
+        crate::sampler::check_float_schedule(graph, &beta).is_ok()
+    });
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa
         && n <= 16_384
@@ -1485,6 +1497,17 @@ mod tests {
                 eligibility(kernel, &off_step, &params, cfg, &mut facts),
                 [true, false],
                 "{kernel:?}"
+            );
+        }
+        let unsafe_schedule = SampleParams {
+            beta_range: Some((2e38, 3e38)),
+            ..params.clone()
+        };
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert_eq!(
+                eligibility(kernel, &off_step, &unsafe_schedule, cfg, &mut facts),
+                [false, false],
+                "{kernel:?} must refuse a Float32 schedule whose double overflows"
             );
         }
         let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);

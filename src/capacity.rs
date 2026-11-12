@@ -142,8 +142,8 @@ pub fn host_limits() -> DeviceLimits {
 /// Numeric type of the couplings and fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
-    /// Unit coefficients: two bit planes in a dense matrix (2 bits per
-    /// cell); one byte in CSR.
+    /// Unit coefficients: two bits per dense matrix cell, one byte in CSR.
+    /// SA uses Int8 storage and requires each absolute local field to be at most 63.
     Binary,
     /// Signed 8-bit coefficients.
     Int8,
@@ -733,9 +733,9 @@ pub fn footprint(
 ///
 /// # Errors
 ///
-/// The errors of [`footprint`]. A non-candidate that no sparse tier admits,
-/// such as a multi-spin model past the sparse degree, is a
-/// [`CapacityError::Degree`].
+/// The errors of [`footprint`]. A non-candidate uses the sparse tiers and
+/// returns their error, including [`CapacityError::Degree`],
+/// [`CapacityError::Memory`], or [`CapacityError::Buffer`].
 #[cfg(test)]
 pub fn routed_footprint(
     kernel: Kernel,
@@ -760,8 +760,9 @@ pub fn routed_footprint(
 ///
 /// # Errors
 ///
-/// The errors of [`footprint`]. A non-candidate that no sparse tier admits
-/// is a [`CapacityError::Degree`].
+/// The errors of [`footprint`]. A non-candidate uses the sparse tiers and
+/// returns their error, including [`CapacityError::Degree`],
+/// [`CapacityError::Memory`], or [`CapacityError::Buffer`].
 pub fn routed_runnable_footprint(
     kernel: Kernel,
     graph: &IsingGraph,

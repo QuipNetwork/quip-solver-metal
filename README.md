@@ -295,13 +295,12 @@ RUST_TEST_TIME_DOCTEST=10000,30000 \
 cargo test -- --test-threads=1 -Z unstable-options --ensure-time
 ```
 
-Conformance/golden and handshake tests drive the binary in isolation via
-`quip-solver-conformance`'s scripted driver and check energies against
-`conformance/golden_vectors.json`. The tests run on a Mac with a Metal device.
-CI runs the default run on a macOS runner, which is the only configuration this
-crate builds in. CI fails any test that takes more than 30 seconds. The default
-run skips the tests that take more than ten seconds in a dev build, and CI does
-not run them. Run them with `--features long-tests` before a release.
+Conformance and handshake tests use the scripted driver from
+`quip-solver-conformance`. They check energies against
+`conformance/golden_vectors.json`. These tests need a Mac with a Metal device.
+CI uses a macOS runner and fails any test that takes more than 30 seconds.
+The default run skips tests that take more than ten seconds in a dev build.
+Run those tests with `--features long-tests` before a release.
 
 The measurement tests carry a plain `#[ignore]`, and `long-tests` does not
 run them. Each one takes minutes to hours of device time, or reports a timing

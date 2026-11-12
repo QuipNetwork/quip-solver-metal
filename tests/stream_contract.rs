@@ -291,10 +291,9 @@ fn complete_int32(n: usize) -> IsingGraph {
     IsingGraph::new(h, j, edges)
 }
 
-/// A complete Int32 model of `nodes` nodes (200 by default, 1,000 under
-/// `long-tests`) runs on dense-matrix storage. The stream runs it as `sample_ising` does: two
-/// jobs of the same topology each return the reads of `sample_ising` with
-/// their seed, every one scored exactly.
+/// Check dense Int32 models at 200 nodes, or 1,000 with `long-tests`.
+/// Each streamed job must match `sample_ising` with the same seed.
+/// Check every returned energy against the host score.
 fn complete_model_runs_dense_in_the_stream(nodes: usize) {
     let graph = complete_int32(nodes);
     each_kernel(|kernel| {
