@@ -31,6 +31,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 /// correctness.
 const DEFAULT_GPU_CORES: usize = 10;
 
+/// Batches the stream keeps on the GPU at once ([`run_stream`]).
+const STREAM_IN_FLIGHT: usize = 2;
+
 /// Backend-facing read cap for [`crate::MetalSampler::max_reads`] (mirrors CUDA).
 ///
 /// # Examples
@@ -614,6 +617,17 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         // whole duration of the dispatch rather than only in the gaps.
         let nominal = batch_size_for_reads(ctx.kernel, seed_job.params.num_reads);
         let cap = scale_budget(nominal, ctx.gov.budget_scale());
+        // Fewer problems when one sweep of the whole batch, beside the other
+        // batch in flight, would pass the chunk limit. The rest of the queue
+        // waits for the next batches. A job that fails alone gets a batch of
+        // one, and the admission refuses it.
+        let cap = sampler::one_sweep_problem_cap(
+            &seed_job.graph,
+            &seed_job.params,
+            ctx.kernel,
+            STREAM_IN_FLIGHT,
+            cap,
+        );
         // Keep `seed_job` live while `key` borrows its edge list; collect further
         // matches into a side vec, then assemble the full batch.
         let mut matches = Vec::with_capacity(cap.saturating_sub(1));
@@ -651,7 +665,13 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         }
         let encoded = {
             let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel, 2)
+            sampler::encode_batch(
+                device,
+                &graphs,
+                &batch[0].params,
+                ctx.kernel,
+                STREAM_IN_FLIGHT,
+            )
         };
         match encoded {
             Ok(enc) => {
@@ -939,6 +959,67 @@ mod tests {
             );
             assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
         }
+    }
+
+    /// A queue of jobs that pass alone but not in one full batch runs in
+    /// several capped batches, and no job is rejected: 240 SA jobs of 4,593
+    /// nodes, mean degree 150 and 256 reads. Run:
+    /// `cargo test --release --lib a_queue_past_one_sweep -- --ignored`.
+    #[test]
+    #[ignore = "seconds of device time and host scoring; see the doc comment"]
+    fn a_queue_past_one_sweep_runs_in_several_batches() {
+        struct CountBatches(std::cell::Cell<usize>);
+        impl GpuGovernor for CountBatches {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                self.0.set(self.0.get() + 1);
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let n = sampler::kernel_max_nodes(Kernel::Sa);
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=75).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j: Vec<f64> = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let graph = IsingGraph::new(vec![0.0; n], j, edges);
+        let jobs = 240;
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(jobs);
+        for index in 0..jobs {
+            let id = format!("job-{index}");
+            job_tx
+                .blocking_send(job(id.as_bytes(), graph.clone(), 256, 2, 1))
+                .unwrap();
+        }
+        drop(job_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(jobs);
+        let gov = CountBatches(std::cell::Cell::new(0));
+        let device = MetalDevice::open(0).unwrap();
+        run_stream(
+            &device,
+            Kernel::Sa,
+            job_rx,
+            &out_tx,
+            &gov,
+            &CancelToken::default(),
+        );
+        let mut completed = 0;
+        while let Ok(result) = out_rx.try_recv() {
+            let StreamOutcome::Completed(Ok(samples)) = result.outcome else {
+                panic!(
+                    "{:?} was not completed",
+                    String::from_utf8_lossy(&result.job_id)
+                );
+            };
+            assert_eq!(samples.len(), 256);
+            completed += 1;
+        }
+        assert_eq!(completed, jobs);
+        assert!(gov.0.get() >= 2, "{} batches", gov.0.get());
     }
 
     #[test]

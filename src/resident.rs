@@ -766,6 +766,8 @@ impl Preparer {
             && crate::representation::classify_msa(&job.graph)
                 == Ok(crate::representation::Representation::Binary);
         if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
+            // One problem: the batch path runs this job alone and checks its
+            // one-sweep limit again in `encode_batch`.
             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
             return Ok(None);
         }
@@ -793,6 +795,11 @@ impl Preparer {
                         // established only after validate_batch, and coefficient filling
                         // checks exact topology equality on every hit. Recounting degree
                         // would allocate and walk the same 41,515 edges on every job.
+                        // This checks the one-sweep limit for one problem, while a
+                        // slot pool runs up to `batch_size_for_reads` jobs at once.
+                        // That is safe only because the unit lane (6,016 nodes or
+                        // fewer, degree 20 or less) estimates a full pool at 1.7 ms
+                        // or less. A larger lane needs the pool's real problems.
                         let (_, _, rep) =
                             sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
                         // A unit model denser than the unit kernel's rows runs on the

@@ -699,6 +699,16 @@ The grid ran most rows in chunks of 4 to 32 sweeps, and that hides two costs of 
 
 The GPU runs a fixed number of reads side by side: one problem of 256 reads per core for SA, 6.4 reads per core for Gibbs, and one 32-replica word per core for MSA. Past that count, the estimate grows with the reads of the batch. Past it, a batch of two or more problems costs 2 times more on Gibbs and MSA. Every problem has a copy of its couplings, and the copies compete for the cache. A batch of fewer than 256 reads costs as much as 256 reads. One SA problem of 64 reads took about as long as one of 256.
 
+The stream keeps two batches on the GPU at once, so its estimate counts the reads of both. Every single-batch path counts one batch, and the limits in the next table are for one batch. The stream also caps the problems of each batch at the largest count whose estimate fits 400 ms (`one_sweep_problem_cap`). The rest of the queue waits for the next batches, so the stream does not refuse a batch whose jobs pass alone.
+
+| Kernel | Advantage2 stream batch at 64 reads | At 256 reads |
+|---|---|---|
+| SA | 240 | 240 |
+| Gibbs | 10 | 3 |
+| MSA | 20 | 5 |
+
+The cap leaves these batch sizes as they were before it.
+
 The multi-problem and first-chunk runs come from the ignored test `batch_sweep_probe` in `src/sampler.rs`. Every chunk of that test is one sweep. Its records are in `docs/perf/2026-11-metal-sweep-probe.jsonl`, and the `run` field names the batch of runs. The command for one run is:
 
 ```sh
@@ -706,6 +716,8 @@ QUIP_PROBE_KERNEL=gibbs QUIP_PROBE_NODES=358494 QUIP_PROBE_DEGREE=62 \
   QUIP_PROBE_PROBLEMS=1 QUIP_PROBE_READS=256 QUIP_PROBE_SWEEPS=16 \
   cargo test --release --lib batch_sweep_probe -- --ignored --nocapture
 ```
+
+The Gibbs tables come from the chromatic kernel. The limits are not calibrated for the sequential Gibbs kernel that the operator override `QUIP_METAL_GIBBS_SEQUENTIAL=1` selects, and that override also raises the Gibbs stream batch to 640 problems.
 
 The probes ran on the same M4 Max as the grid, with other sessions on the machine. On small models, the first chunk of a run on an idle GPU took up to 38 ms more than later chunks, a cost that the estimate does not model and that matters only far below 400 ms.
 
@@ -739,7 +751,7 @@ Five verification runs passed 400 ms. Their constants rose, and the runs repeate
 - Gibbs spill at degree 62 and 553,665 nodes took 537.3 ms in its seventh chunk. The point rose from 2.454 to 3.79 ns.
 - Gibbs spill at degree 20 and 1,170,280 nodes took 415.8 ms, and at degree 4 and 8,335,556 nodes it took 509.6 ms in the second of two runs. The points rose to 1.388 and 0.239 ns.
 - SA global at degree 4 and 196,343 nodes took 408.4 ms in its first chunk. The point rose from 6.92 to 8.13 ns.
-- Gibbs shared on a complete `binary` model of 3,098 nodes took 785.8 ms, with 11 chunks past 600 ms. The complete points from 2,000 nodes up now come from runs of 16 one-sweep chunks at 2,000, 2,500, 2,700 and 2,900 nodes, and the point at degree 3,097 is 991 ns. These runs are in `docs/perf/2026-11-metal-capacity-5.3b.jsonl`, after the grid rerun.
+- Gibbs shared on a complete `binary` model of 3,098 nodes took 785.8 ms, with 11 chunks past 600 ms. The complete points from 2,000 nodes up now come from runs of 16 one-sweep chunks at 2,000, 2,500, 2,700 and 2,900 nodes, and the point at degree 3,097 is 991 ns. These runs are in `docs/perf/2026-11-metal-capacity-5.3b.jsonl`, after the grid rerun. In the same file, the `int32` run at 3,098 nodes reached 534.7 ms, and the tightened limit of 2,915 nodes now refuses that model.
 
 The device tests `the_largest_admitted_high_degree_sweeps_stay_under_400_ms` in `tests/sa_capacity.rs` and `tests/gibbs_capacity.rs`, and `the_largest_admitted_spill_sweep_stays_under_400_ms` in `tests/msa_spill.rs`, run the high-degree limits with the production planner. They assert that the longest chunk is below 400 ms and that the admission refuses one node more:
 

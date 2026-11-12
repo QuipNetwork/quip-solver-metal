@@ -287,6 +287,10 @@ impl SlotPool {
             num_sweeps: 1,
             ..Default::default()
         };
+        // This checks the one-sweep limit for one problem, while the pool
+        // runs up to `capacity` slots at once. That is safe only because the
+        // unit lane (6,016 nodes or fewer, degree 20 or less) estimates a full
+        // pool at 1.7 ms or less. A larger lane needs the pool's real problems.
         sampler::validate_batch(&[graph], &params, Kernel::Msa)?;
         // The batch path spills a larger model; the slot kernel keeps every
         // spin word in threadgroup memory, up to the advertised nodes.

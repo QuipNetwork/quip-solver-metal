@@ -293,8 +293,17 @@ struct SweepShape {
     problems: usize,
     /// Dispatched reads per problem ([`simd_rounded_reads`]).
     reads: usize,
+    /// Batches of this shape on the GPU at once: 2 for the stream, which
+    /// keeps a second batch in flight, and 1 for every single-batch path.
+    in_flight: usize,
     /// GPU cores of the device.
     cores: usize,
+}
+
+/// GPU cores of this host, or 10 when IOKit does not report them, as the
+/// stream's batch budget assumes.
+fn host_gpu_cores() -> usize {
+    crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1)
 }
 
 /// Margin on the worst measured sparse sweep, for contention from other GPU
@@ -343,7 +352,7 @@ const SA_GLOBAL_SWEEP_NS: [(f64, f64); 4] =
 /// sparse at 1,000 (`int8`) and 1,414 (`int32`) nodes. The complete points
 /// from 2,000 nodes up are the worst one-sweep chunks of 16-sweep runs in
 /// `docs/perf/2026-11-metal-capacity-5.3b.jsonl` (2,000 nodes `binary`,
-/// 2,500 nodes `binary`, 2,700 nodes `int8`, 2,900 nodes `int32`), and at
+/// 2,500 nodes `binary`, 2,700 nodes `binary`, 2,900 nodes `int32`), and at
 /// 3,098 nodes the 785.8 ms chunk of a `binary` run of
 /// `the_largest_admitted_high_degree_sweeps_stay_under_400_ms`. That run
 /// shared the GPU, but its chunks stayed past 600 ms for 11 sweeps, so the
@@ -466,7 +475,12 @@ fn mean_degree(graph: &IsingGraph) -> f64 {
 /// [`parallel_reads_per_core`] times the GPU cores costs that many units of
 /// one problem, times [`crowd_factor`] when it holds several problems. Fewer
 /// reads than one unit cost a whole unit, as measured: one SA problem of 64
-/// reads takes about as long as one of 256.
+/// reads takes about as long as one of 256. Batches in flight together share
+/// the GPU, so the reads of all of them count.
+///
+/// The tables come from the chromatic Gibbs kernel. The limits are not
+/// calibrated for the sequential Gibbs kernel that the
+/// `QUIP_METAL_GIBBS_SEQUENTIAL` operator override selects.
 fn one_sweep_ms(shape: &SweepShape) -> f64 {
     let n = shape.nodes as f64;
     let table: &[(f64, f64)] = match (shape.kernel, shape.storage) {
@@ -487,8 +501,9 @@ fn one_sweep_ms(shape: &SweepShape) -> f64 {
     };
     let unit_ms = MAX_READS as f64 * n * piecewise_linear(table, shape.degree) / 1e6;
     let parallel = parallel_reads_per_core(shape.kernel) * shape.cores.max(1) as f64;
-    let units = ((shape.problems * shape.reads) as f64 / parallel).max(1.0);
-    let crowd = if shape.problems > 1 && units > 1.0 {
+    let batch_problems = shape.problems * shape.in_flight.max(1);
+    let units = ((batch_problems * shape.reads) as f64 / parallel).max(1.0);
+    let crowd = if batch_problems > 1 && units > 1.0 {
         crowd_factor(shape.kernel)
     } else {
         1.0
@@ -512,6 +527,56 @@ fn check_one_sweep(shape: &SweepShape) -> Result<(), SampleError> {
          problems of {} reads, past the {ONE_SWEEP_MAX_MS:.0} ms limit of one chunk",
         shape.kernel, shape.nodes, shape.problems, shape.reads
     )))
+}
+
+/// The most problems of `graph` that one batch of the CSR gates may hold,
+/// at most `max` and at least 1, so that [`one_sweep_ms`] of the whole batch
+/// with `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`]. The stream
+/// caps its batches with it, so a batch is never refused when its jobs pass
+/// alone. A job that fails alone gets 1, and the admission refuses it.
+pub(crate) fn one_sweep_problem_cap(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    in_flight: usize,
+    max: usize,
+) -> usize {
+    let max = max.max(1);
+    let Ok(batch) = validate_batch_within(
+        &[graph],
+        params,
+        kernel,
+        host_device_limits(),
+        true,
+        None,
+        DenseMode::Off,
+        in_flight,
+    ) else {
+        return 1;
+    };
+    let fits = |problems: usize| {
+        one_sweep_ms(&SweepShape {
+            kernel,
+            storage: batch.storage,
+            nodes: batch.n,
+            degree: mean_degree(graph),
+            problems,
+            reads: simd_rounded_reads(params.num_reads),
+            in_flight,
+            cores: host_gpu_cores(),
+        }) <= ONE_SWEEP_MAX_MS
+    };
+    // The estimate never falls as the problems grow, and one problem fits.
+    let (mut lo, mut hi) = (1, max);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// Mean GPU time per spin update relative to degree 20, for the SA chunk
@@ -1801,7 +1866,8 @@ fn batch_representation(
 /// and coefficient representation.
 ///
 /// Split out of [`encode_batch`] so both rejections are reachable without a
-/// Metal device.
+/// Metal device. It checks the one-sweep limit for the batch of `graphs`
+/// with one batch in flight.
 pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
@@ -1815,6 +1881,7 @@ pub(crate) fn validate_batch<'a>(
         false,
         None,
         DenseMode::Off,
+        1,
     )
     .map(|batch| (batch.first, batch.n, batch.rep))
 }
@@ -1865,7 +1932,12 @@ pub(crate) fn host_device_limits() -> &'static DeviceLimits {
 ///
 /// The footprint check comes last and runs before any buffer exists, so a
 /// model that does not fit is refused without allocating. `dense` says
-/// whether the batch may take dense-matrix storage.
+/// whether the batch may take dense-matrix storage, and `in_flight` how many
+/// batches of its shape share the GPU ([`SweepShape::in_flight`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validate_batch's inputs plus the test limits, the storage switches and the batches in flight"
+)]
 fn validate_batch_within<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
@@ -1874,6 +1946,7 @@ fn validate_batch_within<'a>(
     allow_i8: bool,
     node_cap: Option<usize>,
     dense: DenseMode,
+    in_flight: usize,
 ) -> Result<ValidBatch<'a>, SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
@@ -1982,7 +2055,8 @@ fn validate_batch_within<'a>(
         degree: mean_degree(first),
         problems: graphs.len(),
         reads: simd_rounded_reads(params.num_reads),
-        cores: crate::iokit_gov::gpu_core_count().unwrap_or(10).max(1),
+        in_flight,
+        cores: host_gpu_cores(),
     })?;
     Ok(ValidBatch {
         first,
@@ -2635,6 +2709,7 @@ fn encode_batch_storage(
         wide_i8 && !past_k,
         tuning.node_cap,
         dense,
+        in_flight,
     )?;
     let matrix = storage == Storage::Dense;
     // A model past the SA thread-private frame runs the global build, which
@@ -3828,6 +3903,7 @@ mod tests {
             true,
             None,
             DenseMode::Off,
+            1,
         )
         .map_or_else(|e| format!("\"{e:?}\""), |b| format!("\"{:?}\"", b.storage));
         let mut batch = encode_batch_storage(
@@ -4122,6 +4198,7 @@ mod tests {
             true,
             None,
             DenseMode::Auto,
+            1,
         )
         .unwrap();
         assert_eq!(admitted.storage, Storage::Dense);
@@ -4140,6 +4217,7 @@ mod tests {
             true,
             None,
             DenseMode::Auto,
+            1,
         )
         .unwrap_err();
         assert_eq!(
@@ -4158,6 +4236,7 @@ mod tests {
             true,
             None,
             DenseMode::Forced,
+            1,
         )
         .unwrap_err();
         assert!(too_large_msg(err).contains("one dense-matrix sweep"));
@@ -4185,6 +4264,7 @@ mod tests {
                 true,
                 None,
                 dense,
+                1,
             )
         };
         let below: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_414)));
@@ -4237,6 +4317,7 @@ mod tests {
                 true,
                 None,
                 dense,
+                1,
             )
         };
         let below: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_673)));
@@ -4281,6 +4362,7 @@ mod tests {
             degree,
             problems,
             reads,
+            in_flight: 1,
             cores: 40,
         }
     }
@@ -4563,9 +4645,76 @@ mod tests {
             true,
             None,
             DenseMode::Auto,
+            1,
         )
         .unwrap_err();
         assert!(too_large_msg(err).contains("one dense-matrix sweep"));
+    }
+
+    /// The stream caps a batch whose jobs pass alone at the most problems
+    /// whose one sweep fits, beside the second batch in flight: 240 SA jobs
+    /// of 4,593 nodes, mean degree 150 and 256 reads split into several
+    /// batches, and each batch passes the admission.
+    #[test]
+    fn the_stream_cap_splits_a_batch_whose_jobs_pass_alone() {
+        let p = SampleParams {
+            num_reads: 256,
+            num_sweeps: 16,
+            ..Default::default()
+        };
+        let graph = circulant_int32(SA_MAX_NODES, 150);
+        assert!(close(mean_degree(&graph), 150.0));
+        validate_batch(&[&graph], &p, Kernel::Sa).unwrap();
+        let cap = one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 240);
+        assert!((1..240).contains(&cap), "{cap}");
+        assert!(240_usize.div_ceil(cap) >= 2, "{cap}");
+        let admit = |problems: usize| {
+            let batch: Vec<&IsingGraph> = vec![&graph; problems];
+            validate_batch_within(
+                &batch,
+                &p,
+                Kernel::Sa,
+                host_device_limits(),
+                true,
+                None,
+                DenseMode::Off,
+                2,
+            )
+        };
+        admit(cap).unwrap();
+        let err = admit(cap + 1).unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        // The cap never reaches 0: a job that fails alone gets a batch of
+        // one, which the admission refuses.
+        let complete = complete_int32(1_500);
+        validate_batch(&[&complete], &p, Kernel::Sa).unwrap_err();
+        assert_eq!(one_sweep_problem_cap(&complete, &p, Kernel::Sa, 2, 240), 1);
+        assert_eq!(one_sweep_problem_cap(&graph, &p, Kernel::Sa, 2, 0), 1);
+    }
+
+    /// Two batches in flight count the reads of both, so one batch of a
+    /// shape past the parallel reads takes the time of twice its problems.
+    #[test]
+    fn one_sweep_counts_the_batches_in_flight() {
+        let ms = |problems, in_flight| {
+            one_sweep_ms(&SweepShape {
+                in_flight,
+                ..sweep_shape(Kernel::Sa, Storage::Spill, 10_000, 62.0, problems, 256)
+            })
+        };
+        assert!(close(ms(60, 2), ms(120, 1)));
+        assert!(close(ms(1, 2), ms(1, 1)));
+        let gibbs = |problems, in_flight| {
+            one_sweep_ms(&SweepShape {
+                in_flight,
+                ..sweep_shape(Kernel::Gibbs, Storage::Spill, 100_000, 62.0, problems, 256)
+            })
+        };
+        // Two one-problem batches compete for the cache as two problems do.
+        assert!(close(gibbs(1, 2), gibbs(2, 1)));
     }
 
     /// The Advantage2 path is admitted at every batch size the stream
@@ -4584,6 +4733,7 @@ mod tests {
             .map(|k| if k % 3 == 0 { 1.0 } else { -1.0 })
             .collect();
         let graph = IsingGraph::new(vec![1.0; 4577], j, edges);
+        let mut sizes = Vec::new();
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             for reads in [64, 256] {
                 let p = SampleParams {
@@ -4595,7 +4745,29 @@ mod tests {
                 let batch: Vec<&IsingGraph> = vec![&graph; problems];
                 validate_batch(&batch, &p, kernel)
                     .unwrap_or_else(|e| panic!("{kernel:?} {problems} x {reads}: {e:?}"));
+                // The stream's cap, beside a second batch in flight, keeps
+                // the batch size.
+                assert_eq!(
+                    one_sweep_problem_cap(&graph, &p, kernel, 2, problems),
+                    problems,
+                    "{kernel:?} {reads}"
+                );
+                sizes.push((kernel, reads, problems));
             }
+        }
+        // The batch sizes of the stream on the 40-core calibration GPU.
+        if host_gpu_cores() == 40 && gibbs_node_parallel() {
+            assert_eq!(
+                sizes,
+                [
+                    (Kernel::Sa, 64, 240),
+                    (Kernel::Sa, 256, 240),
+                    (Kernel::Gibbs, 64, 10),
+                    (Kernel::Gibbs, 256, 3),
+                    (Kernel::Msa, 64, 20),
+                    (Kernel::Msa, 256, 5),
+                ]
+            );
         }
     }
 
@@ -4620,6 +4792,7 @@ mod tests {
             false,
             None,
             DenseMode::Auto,
+            1,
         )
         .unwrap_err();
         let SampleError::TooLarge(message) = &err else {
@@ -4781,6 +4954,7 @@ mod tests {
             false,
             Some(GIBBS_MAX_NODES),
             DenseMode::Auto,
+            1,
         )
         .map(drop)
         .unwrap_err();
