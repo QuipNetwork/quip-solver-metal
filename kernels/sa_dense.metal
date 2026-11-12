@@ -12,13 +12,11 @@
 // the kernel holds a complete or near-complete model of any degree.
 //
 // Matrix element per build, row-major, one row per node:
-// - QUIP_SA_MATRIX_BITS (with the default int8 build): two bit planes per 32
-//   columns, the words (negative, nonzero) for columns 32b .. 32b + 31, so a
-//   row is 2 * ceil(N / 32) contiguous `uint`. A unit model only.
 // - QUIP_WIDE_I8: `int8_t` times the integer `coef_scale` (buffer 23).
 // - QUIP_FLOAT: `float`.
 // - QUIP_WIDE: milli `int`.
-// - otherwise: `int8_t`.
+// - otherwise: `int8_t`. A unit model runs here too, as the sparse SA
+//   kernels hold it.
 // The diagonal is zero: the host routes a model with a self-loop or a
 // repeated coupler to CSR storage.
 //
@@ -35,19 +33,11 @@
 //   with a model whose fields round differently in another order.
 // The host scores every read, so no energy is kept on the device.
 
-#ifdef QUIP_SA_MATRIX_BITS
-typedef uint matrix_elem_t;
-#else
 typedef stored_t matrix_elem_t;
-#endif
 
 // The elements a row of the matrix occupies.
 inline uint matrix_row_elems(int n) {
-#ifdef QUIP_SA_MATRIX_BITS
-    return 2u * uint((n + 31) / 32);
-#else
     return uint(n);
-#endif
 }
 
 // The couplings of the eight columns [base, base + 8) of a row, as the
@@ -61,24 +51,10 @@ inline void matrix_group(
     int coef_scale,
     thread coef_t* coefficients
 ) {
-#ifdef QUIP_SA_MATRIX_BITS
-    // Bits [base % 32, base % 32 + 8) of the two words of the block.
-    uint shift = uint(base) & 31u;
-    uint block = uint(base) >> 5;
-    uint present = (row[2u * block + 1u] >> shift) & 0xFFu;
-    uint negative = (row[2u * block] >> shift) & 0xFFu;
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        coefficients[k] = ((present >> uint(k)) & 1u)
-            ? (((negative >> uint(k)) & 1u) ? coef_t(-1) : coef_t(1))
-            : coef_t(0);
-    }
-#else
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
         coefficients[k] = (base + k < n) ? COEF(row[base + k], coef_scale) : coef_t(0);
     }
-#endif
 }
 
 // Delta energy of flipping `var`, from the matrix row of `var`.

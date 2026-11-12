@@ -84,10 +84,6 @@ fn float(source: &str) -> String {
 /// and spin helpers; see `kernels/sa_dense.metal`.
 const SA_DENSE_SRC: &str = include_str!("../kernels/sa_dense.metal");
 
-/// Prepended to a dense-matrix SA variant whose matrix holds two bit planes
-/// per 32 columns (a unit model).
-const SA_MATRIX_BITS_DEFINE: &str = "#define QUIP_SA_MATRIX_BITS 1\n";
-
 /// The dense-matrix SA kernel source after the `defines` of its variant. The
 /// kernel keeps each read's state in the persistent buffers, so every
 /// variant is a global build.
@@ -225,10 +221,8 @@ pub struct MetalDevice {
     /// Dense-matrix multi-spin with a `float` matrix and the float lane's
     /// acceptance.
     pub(crate) msa_matrix_float: ComputePipelineState,
-    /// Dense-matrix SA (`kernels/sa_dense.metal`) with a bit matrix and
-    /// `int8_t` deltas, for a unit model.
-    pub(crate) sa_matrix_bits: ComputePipelineState,
-    /// Dense-matrix SA with an `int8_t` matrix and `int8_t` deltas.
+    /// Dense-matrix SA (`kernels/sa_dense.metal`) with an `int8_t` matrix and
+    /// `int8_t` deltas. A unit model runs here too.
     pub(crate) sa_matrix_i8: ComputePipelineState,
     /// Dense-matrix SA with an `int8_t` matrix times one integer scale and
     /// milli `int` deltas.
@@ -357,7 +351,6 @@ impl MetalDevice {
         let msa_matrix_float = matrix(FLOAT_DEFINE)?;
         let sa_matrix_pipeline =
             |defines: &str| compile_pipeline(&device, &sa_matrix(defines), "sa_matrix_anneal");
-        let sa_matrix_bits = sa_matrix_pipeline(SA_MATRIX_BITS_DEFINE)?;
         let sa_matrix_i8 = sa_matrix_pipeline("")?;
         let sa_matrix_wide_i8 = sa_matrix_pipeline(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
         let sa_matrix_int = sa_matrix_pipeline(WIDE_DEFINE)?;
@@ -404,7 +397,6 @@ impl MetalDevice {
             msa_matrix_i8,
             msa_matrix_int,
             msa_matrix_float,
-            sa_matrix_bits,
             sa_matrix_i8,
             sa_matrix_wide_i8,
             sa_matrix_int,
@@ -550,7 +542,6 @@ mod tests {
             ("msa_matrix_i8", &dev.msa_matrix_i8),
             ("msa_matrix_int", &dev.msa_matrix_int),
             ("msa_matrix_float", &dev.msa_matrix_float),
-            ("sa_matrix_bits", &dev.sa_matrix_bits),
             ("sa_matrix_i8", &dev.sa_matrix_i8),
             ("sa_matrix_wide_i8", &dev.sa_matrix_wide_i8),
             ("sa_matrix_int", &dev.sa_matrix_int),

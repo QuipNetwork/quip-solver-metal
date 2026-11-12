@@ -25,7 +25,7 @@ use quip_solver_metal::{IsingGraph, SamplerResult};
 /// Coefficient precisions of the dense matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Precision {
-    /// Couplings and fields in {-1, 0, 1}: a bit matrix while the local
+    /// Couplings and fields in {-1, 0, 1}: an `int8_t` matrix while the local
     /// field fits `int8_t`.
     Binary,
     /// Whole units whose local field fits `int8_t`: an `int8_t` matrix.
@@ -193,8 +193,9 @@ fn a_complete_model_reaches_its_ground_state_at_each_precision() {
     }
 }
 
-/// The bit matrix and the whole-unit `int8_t` matrix need a local field under
-/// 63 units, which 64 nodes pass, so they run on 20-node complete models.
+/// A unit model and a whole-unit model run on the `int8_t` matrix with
+/// `int8_t` deltas, which needs a local field under 63 units. A complete model
+/// of 64 nodes passes that, so these run on 20-node complete models.
 #[test]
 fn a_narrow_complete_model_reaches_its_ground_state() {
     let dev = MetalDevice::open(0).unwrap();
@@ -387,22 +388,20 @@ fn the_largest_admitted_dense_sweep_runs() {
 }
 
 /// A complete model one node past the one-sweep limit cannot plan dense
-/// chunks. Auto routing runs it on the sparse tiers, and forced dense
-/// refuses it.
+/// chunks. Auto routing and forced dense both refuse it before any buffer,
+/// as Capacity.
 #[test]
-fn a_model_past_the_sweep_limit_runs_sparse_unless_forced_dense() {
+fn a_model_past_the_sweep_limit_is_refused_under_auto_and_forced_dense() {
     let dev = MetalDevice::open(0).unwrap();
     let (graph, _) = planted_complete(LIMIT_NODES + 1, Precision::Int32);
     let p = params(32, 2, 1, 5);
-    let out = run(&dev, &graph, &p, Tuning::default());
-    assert_ne!(out.storage, Storage::Dense);
-    assert_eq!(out.reads.len(), 32);
-    let err =
-        sample_ising_tuned(&dev, &graph, &p, Kernel::Sa, dense(Tuning::default())).unwrap_err();
-    assert!(
-        matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
-        "{err:?}"
-    );
+    for tuning in [Tuning::default(), dense(Tuning::default())] {
+        let err = sample_ising_tuned(&dev, &graph, &p, Kernel::Sa, tuning).unwrap_err();
+        assert!(
+            matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
+            "{err:?}"
+        );
+    }
 }
 
 fn portfolio_dir() -> PathBuf {

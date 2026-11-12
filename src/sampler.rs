@@ -1667,30 +1667,16 @@ fn validate_batch_within<'a>(
         }
     }
     .map_err(too_large)?;
-    let mut footprint = footprint;
     if footprint.storage == Storage::Dense {
         // A chunk is at least one sweep, so a dense batch whose one sweep
-        // would pass the limit cannot be planned. Auto routing then prices
-        // the sparse tiers the kernel runs and takes the cheapest that fits;
-        // forced dense, and a model no sparse tier admits (such as a
-        // multi-spin model past the sparse degree), is refused before any
-        // buffer exists.
+        // would pass the limit is refused before any buffer exists, under
+        // Auto and Forced alike.
         let sweep_ms = matrix_sweep_ms(kernel, n);
         if sweep_ms > MSA_MATRIX_MAX_SWEEP_MS {
-            let sparse: Vec<Storage> = crate::capacity::runnable_storages(kernel)
-                .iter()
-                .copied()
-                .filter(|&tier| tier != Storage::Dense)
-                .collect();
-            match crate::capacity::footprint_in(kernel, &shape, limits, &sparse) {
-                Ok(fit) if dense == DenseMode::Auto => footprint = fit,
-                _ => {
-                    return Err(SampleError::TooLarge(format!(
-                        "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
-                         {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
-                    )));
-                }
-            }
+            return Err(SampleError::TooLarge(format!(
+                "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
+                 {sweep_ms:.3} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
+            )));
         }
     }
     if footprint.storage != Storage::Dense {
@@ -2324,6 +2310,10 @@ fn encode_batch_storage(
     let tg_limit = device.device.max_threadgroup_memory_length() as usize;
     let k = msa_shared_spins(tg_limit, tuning.shared_spins_cap);
     let past_k = kernel == Kernel::Msa && graphs.first().is_some_and(|g| g.num_nodes() > k);
+    debug_assert!(
+        !(tuning.force_dense && tuning.force_sparse),
+        "force_dense and force_sparse exclude each other"
+    );
     let dense = match dense {
         DenseMode::Auto if tuning.force_dense => DenseMode::Forced,
         DenseMode::Auto if tuning.force_sparse => DenseMode::Off,
@@ -2459,7 +2449,6 @@ fn encode_batch_storage(
             batch_i8_scale(graphs, rep, wide_i8)
         };
         let pipeline = match kernel {
-            Kernel::Sa if unit => &device.sa_matrix_bits,
             Kernel::Sa if dense_i8.is_some() => &device.sa_matrix_wide_i8,
             Kernel::Sa if wide => &device.sa_matrix_int,
             Kernel::Sa if float => &device.sa_matrix_float,
@@ -3718,7 +3707,8 @@ mod tests {
 
     /// One dense-matrix SA sweep of 1,414 nodes is estimated at 399.88 ms and
     /// one of 1,415 nodes at 400.445 ms, at any read count. The longer sweep
-    /// is refused before any buffer exists; the shorter one is admitted dense.
+    /// is refused before any buffer exists, under Auto and Forced; the shorter
+    /// one is admitted dense.
     #[test]
     fn a_dense_sa_sweep_past_one_chunk_is_refused_before_allocation() {
         assert!(matrix_sweep_ms(Kernel::Sa, 1_414) <= MSA_MATRIX_MAX_SWEEP_MS);
@@ -3748,20 +3738,17 @@ mod tests {
         // `encode_batch_storage` validates before it touches the device, so
         // a refusal here allocates nothing.
         let above: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_415)));
-        // Forced dense is refused. Auto prices the sparse tiers instead, which
-        // fit this model.
-        let err = admit(above, DenseMode::Forced).unwrap_err();
-        assert_eq!(
-            err.to_sample_error(),
-            quip_solver_core::SampleError::Capacity
-        );
-        let message = too_large_msg(err);
-        assert!(message.contains("one dense-matrix sweep"), "{message}");
-        assert!(message.contains("400.445 ms"), "{message}");
-        assert_ne!(
-            admit(above, DenseMode::Auto).unwrap().storage,
-            Storage::Dense
-        );
+        // Auto and Forced both refuse it as Capacity.
+        for mode in [DenseMode::Auto, DenseMode::Forced] {
+            let err = admit(above, mode).unwrap_err();
+            assert_eq!(
+                err.to_sample_error(),
+                quip_solver_core::SampleError::Capacity
+            );
+            let message = too_large_msg(err);
+            assert!(message.contains("one dense-matrix sweep"), "{message}");
+            assert!(message.contains("400.445 ms"), "{message}");
+        }
         // The CSR gates never take dense storage, so the limit does not
         // reach them.
         assert_ne!(
