@@ -189,7 +189,7 @@ fn a_weighted_star_past_one_row_chunk_reaches_its_ground_state() {
     }
     // The 32 lanes of a word share each acceptance threshold, so on a star a
     // whole word can freeze with the hub against the ground orientation. Over
-    // seeds 1 to 24 about one word in four does, with or without the node
+    // seeds 1 to 24 about three words in ten do, with or without the node
     // each sweep leaves out. No read may pass the ground energy, and the best
     // read must reach it.
     assert!(reads.iter().all(|r| r.energy_milli >= want), "want {want}");
