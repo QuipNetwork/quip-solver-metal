@@ -237,6 +237,32 @@ impl ResidentJob {
             0
         }
     }
+
+    /// The leg that started the anneal leg `leg` belongs to. A fresh leg is
+    /// its own anneal; the legs before the first fresh one continue leg 0.
+    fn anneal_leg(&self, leg: usize) -> usize {
+        if leg >= self.job.fresh_from {
+            leg
+        } else {
+            0
+        }
+    }
+
+    /// Schedule position where the anneal that leg `leg` belongs to ends: the
+    /// leg's own checkpoint for a fresh leg, else the start of the first fresh
+    /// leg, or the end of the schedule when no leg is fresh.
+    fn anneal_end(&self, leg: usize) -> usize {
+        let checkpoints = &self.job.checkpoints;
+        let end = if leg >= self.job.fresh_from {
+            checkpoints.get(leg)
+        } else {
+            self.job
+                .fresh_from
+                .checked_sub(1)
+                .and_then(|last| checkpoints.get(last))
+        };
+        end.copied().unwrap_or(self.job.schedule.len())
+    }
 }
 
 pub(crate) struct SlotPool {
@@ -625,8 +651,10 @@ impl SlotPool {
                 beta_start: r.position as i32,
                 beta_count: count as i32,
                 num_betas: r.job.schedule.len() as i32,
-                seed: slot_seed(leg_seed(r.job.seed, leg)),
+                seed: slot_seed(leg_seed(r.job.seed, r.anneal_leg(leg))),
                 flags,
+                anneal_start: r.anneal_start(leg) as i32,
+                anneal_end: r.anneal_end(leg) as i32,
             });
         }
         self.progress.0 += full.0;
@@ -932,8 +960,16 @@ pub(crate) struct SlotStep {
     pub(crate) beta_start: i32,
     pub(crate) beta_count: i32,
     pub(crate) num_betas: i32,
+    /// Seed of the anneal this step belongs to: the seed of the leg that
+    /// started it. The device seeds a fresh anneal from it and derives the
+    /// node each sweep leaves out from it, so it holds for the whole anneal.
     pub(crate) seed: u32,
     pub(crate) flags: u32,
+    /// Schedule position where this step's anneal started.
+    pub(crate) anneal_start: i32,
+    /// Schedule position where this step's anneal ends. Its last sweep, at
+    /// `anneal_end - 1`, leaves no node out.
+    pub(crate) anneal_end: i32,
 }
 
 pub(crate) const SLOT_WRITE_OUTPUT: u32 = 1;
@@ -1515,6 +1551,8 @@ mod tests {
             } else {
                 0
             },
+            anneal_start: 0,
+            anneal_end: total,
         }
     }
 
@@ -1641,7 +1679,7 @@ mod tests {
 
     #[test]
     fn slot_step_layout_matches_msl() {
-        assert_eq!(std::mem::size_of::<SlotStep>(), 24);
+        assert_eq!(std::mem::size_of::<SlotStep>(), 32);
         assert_eq!(std::mem::align_of::<SlotStep>(), 4);
         assert_eq!(std::mem::offset_of!(SlotStep, slot), 0);
         assert_eq!(std::mem::offset_of!(SlotStep, beta_start), 4);
@@ -1649,6 +1687,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(SlotStep, num_betas), 12);
         assert_eq!(std::mem::offset_of!(SlotStep, seed), 16);
         assert_eq!(std::mem::offset_of!(SlotStep, flags), 20);
+        assert_eq!(std::mem::offset_of!(SlotStep, anneal_start), 24);
+        assert_eq!(std::mem::offset_of!(SlotStep, anneal_end), 28);
     }
 
     #[test]
