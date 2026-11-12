@@ -5,8 +5,9 @@
 //!
 //! Validation and the strong/weak split follow the CPU Otsuka graph contract.
 //! Family contexts come from the session after canonical metadata validation.
-//! Preparation performs no Metal calls.
+//! Preparation performs no Metal calls; `device` runs the anneal.
 
+pub mod device;
 mod prepare;
 
 use std::collections::HashMap;

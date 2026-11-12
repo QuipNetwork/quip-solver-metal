@@ -286,7 +286,8 @@ pub struct ClusterShape {
 ///
 /// `shared_bytes` counts the uploaded arrays that every anneal reads: tiles,
 /// gauges, pairs, both degree and ELL tables, colour offsets, fields, and the
-/// two weight arrays. Each empty upload reserves one element. Permutations
+/// two weight arrays, plus the 4-byte descent flag. Each empty upload
+/// reserves one element. Permutations
 /// and the original graph stay on the host. `per_instance_bytes` counts the
 /// device regions of one anneal: `parent`, `acc`, the spins, and the
 /// per-thread random state. The tier is [`Storage::Spill`] because no anneal
@@ -314,8 +315,11 @@ pub fn cluster_footprint(shape: ClusterShape) -> Footprint {
     ] {
         uploads = uploads.saturating_add(int_bytes(count));
     }
-    // One gauge byte per tile position.
-    uploads = uploads.saturating_add(t.saturating_mul(4).max(1));
+    // One gauge byte per tile position, then the `int` flag that a final
+    // descent pass sets when a spin flips.
+    uploads = uploads
+        .saturating_add(t.saturating_mul(4).max(1))
+        .saturating_add(4);
     Footprint {
         storage: Storage::Spill,
         per_instance_bytes: n
@@ -1146,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_footprint_at_advantage2_size_counts_uploads_and_anneal_state() {
+    fn cluster_footprint_at_4577_nodes_counts_uploads_and_anneal_state() {
         let shape = ClusterShape {
             nodes: 4_577,
             tiles: 1_000,
@@ -1159,18 +1163,20 @@ mod tests {
         // Ints, four bytes each: 4 000 tile nodes, 1 600 pair nodes,
         // 4 577 weak degrees, 4 577 * 6 weak ELL slots, 4 577 all degrees,
         // 4 577 * 15 all ELL slots, 11 colour offsets, 4 577 fields,
-        // 1 000 tile weights, and 800 link weights. Then 4 000 gauge bytes.
+        // 1 000 tile weights, and 800 link weights. Then 4 000 gauge bytes
+        // and the 4-byte descent flag. The tile, link, width, and colour
+        // counts are arbitrary.
         let int_entries =
             4_000 + 1_600 + 4_577 + 4_577 * 6 + 4_577 + 4_577 * 15 + 11 + 4_577 + 1_000 + 800;
         assert_eq!(int_entries, 117_259);
-        assert_eq!(footprint.shared_bytes, int_entries * 4 + 4_000);
-        assert_eq!(footprint.shared_bytes, 473_036);
+        assert_eq!(footprint.shared_bytes, int_entries * 4 + 4_000 + 4);
+        assert_eq!(footprint.shared_bytes, 473_040);
         // One anneal: parent and acc (8 bytes) plus one spin byte per node,
         // and 512 threads of 8 bytes of random state.
         assert_eq!(footprint.per_instance_bytes, 4_577 * 9 + 512 * 8);
         assert_eq!(footprint.per_instance_bytes, 45_289);
         assert_eq!(footprint.storage, Storage::Spill);
-        assert_eq!(footprint.total(3, 1), 473_036 + 3 * 45_289);
+        assert_eq!(footprint.total(3, 1), 473_040 + 3 * 45_289);
         let huge = ClusterShape {
             nodes: usize::MAX,
             ..shape

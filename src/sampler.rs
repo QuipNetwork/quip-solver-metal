@@ -219,7 +219,7 @@ const MSA_MATRIX_MEASURED_GROUPS: usize = MAX_READS / MSA_LANES;
 /// least one sweep, so the planner cannot split a longer sweep, and a
 /// measured chunk must stay below 400 ms. [`check_one_sweep`] applies it to
 /// every build.
-const ONE_SWEEP_MAX_MS: f64 = 400.0;
+pub(crate) const ONE_SWEEP_MAX_MS: f64 = 400.0;
 
 /// Planned column updates per second of `groups` dense-matrix threadgroups
 /// that share the GPU with `in_flight` batches of the same shape.
@@ -994,6 +994,54 @@ fn chunk_plan(
         start += count;
     }
     plan
+}
+
+/// The command buffers of one Otsuka cluster anneal.
+pub(crate) struct ClusterPlan {
+    /// `(first sweep, sweeps)` of each command buffer, covering the schedule
+    /// in order.
+    pub(crate) windows: Vec<(usize, usize)>,
+    /// Planned milliseconds of one sweep of every anneal.
+    pub(crate) sweep_ms: f64,
+}
+
+/// [`chunk_plan`] for a cluster anneal: one rung of `sweeps` sweeps, split
+/// into windows, for `anneals` threadgroups of an `n`-node model at `cost`
+/// times the SA rate. The SA occupancy curve is linear below its first
+/// point, so a few threadgroups are not credited with the rate of a full
+/// GPU. `forced_rate` replaces the measured rate, for tests.
+pub(crate) fn cluster_plan(
+    anneals: usize,
+    n: usize,
+    sweeps: usize,
+    cost: f64,
+    forced_rate: Option<f64>,
+) -> ClusterPlan {
+    let dims = BatchDims {
+        n,
+        num_betas: 1,
+        sweeps_per: sweeps,
+        base_seed: 0,
+        num_threads: anneals,
+        num_problems: 1,
+        num_reads: anneals,
+        packed_size: 0,
+    };
+    let windows = chunk_plan(Kernel::Sa, &dims, anneals, 1, cost, true, forced_rate)
+        .into_iter()
+        .map(|c| {
+            (
+                usize::try_from(c.sweep_start).unwrap_or(0),
+                usize::try_from(c.sweep_count).unwrap_or(0),
+            )
+        })
+        .collect();
+    let budget = dispatch_budget(Kernel::Sa, anneals, 1, forced_rate);
+    let per_sweep = anneals.max(1) as f64 * n.max(1) as f64 * cost;
+    ClusterPlan {
+        windows,
+        sweep_ms: per_sweep / budget * TARGET_DISPATCH_MS,
+    }
 }
 
 /// Updates one dispatch may run: [`TARGET_DISPATCH_MS`] at the estimated

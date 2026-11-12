@@ -416,12 +416,12 @@ fn footprint_counts_padded_tables_weights_state_and_rng() {
     };
     let f = cluster_footprint(shape);
     // 32 tile + 8 gauge + 16 pair + 64 degree + 288 ELL + 20 colors
-    // + 32 field + 8 tile weight + 8 link weight.
-    assert_eq!(f.shared_bytes, 476);
+    // + 32 field + 8 tile weight + 8 link weight + 4 descent flag.
+    assert_eq!(f.shared_bytes, 480);
     // parent and acc (8 bytes) plus one spin byte per node, then the
     // per-thread random state.
     assert_eq!(f.per_instance_bytes, 8 * 9 + 512 * 8);
-    assert_eq!(f.total(3, 1), 476 + 3 * (8 * 9 + 512 * 8));
+    assert_eq!(f.total(3, 1), 480 + 3 * (8 * 9 + 512 * 8));
     let huge = ClusterShape {
         nodes: usize::MAX,
         ..shape

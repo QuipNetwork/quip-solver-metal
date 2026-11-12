@@ -511,9 +511,29 @@ fn compile_pipeline(
     source: &str,
     entry: &str,
 ) -> Result<ComputePipelineState, MetalError> {
+    compile_with(device, source, entry, &CompileOptions::new())
+}
+
+/// [`compile_pipeline`] with fast math off, for a kernel whose `exp` and
+/// `pow` must round as a host reference does (`kernels/cluster.metal`).
+pub(crate) fn compile_precise_pipeline(
+    device: &Device,
+    source: &str,
+    entry: &str,
+) -> Result<ComputePipelineState, MetalError> {
     let options = CompileOptions::new();
+    options.set_fast_math_enabled(false);
+    compile_with(device, source, entry, &options)
+}
+
+fn compile_with(
+    device: &Device,
+    source: &str,
+    entry: &str,
+    options: &CompileOptions,
+) -> Result<ComputePipelineState, MetalError> {
     let library = device
-        .new_library_with_source(source, &options)
+        .new_library_with_source(source, options)
         .map_err(|e| MetalError::Compile(format!("{entry}: {e}")))?;
     let function = library
         .get_function(entry, None)

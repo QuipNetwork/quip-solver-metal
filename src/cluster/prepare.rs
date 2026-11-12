@@ -54,7 +54,7 @@ pub enum PrepareError {
     DeviceMemory {
         /// Required device bytes.
         requested: usize,
-        /// Usable global bytes after headroom.
+        /// Usable device bytes after headroom.
         budget: usize,
     },
 }
@@ -120,7 +120,7 @@ impl PreparedGraph {
     ///
     /// This low-level entry checks the same graph rules as the CPU port.
     /// The caller verifies the family metadata before supplying motifs.
-    /// `anneals` counts concurrent blocks at the fixed cluster thread count.
+    /// `anneals` counts concurrent anneals, one threadgroup each.
     ///
     /// # Errors
     /// Returns a graph, width, accumulator, launch, or capacity rejection before
