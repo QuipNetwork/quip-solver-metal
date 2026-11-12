@@ -67,6 +67,15 @@ pub struct DeviceLimits {
 }
 
 impl DeviceLimits {
+    /// Keep the host memory budget, but cap one buffer at the device limit.
+    #[must_use]
+    pub(crate) fn with_device_buffer_limit(mut self, max_buffer_length: u64) -> Self {
+        self.max_buffer_bytes = self
+            .max_buffer_bytes
+            .min(usize::try_from(max_buffer_length).unwrap_or(usize::MAX));
+        self
+    }
+
     /// Bytes available to buffers after the memory headroom: 4/5 of
     /// [`Self::memory_bytes`].
     #[must_use]
@@ -1239,6 +1248,17 @@ mod tests {
         let limits = host_limits();
         assert!(limits.memory_bytes > 0);
         assert_eq!(limits.max_buffer_bytes, limits.memory_bytes);
+    }
+
+    #[test]
+    fn device_buffer_limit_cannot_exceed_host_or_device() {
+        let host = DeviceLimits {
+            memory_bytes: 1000,
+            max_buffer_bytes: 500,
+        };
+        assert_eq!(host.with_device_buffer_limit(300).max_buffer_bytes, 300);
+        assert_eq!(host.with_device_buffer_limit(700).max_buffer_bytes, 500);
+        assert_eq!(host.with_device_buffer_limit(300).memory_bytes, 1000);
     }
 
     #[test]

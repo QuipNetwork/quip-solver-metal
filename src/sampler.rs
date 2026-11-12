@@ -1388,6 +1388,12 @@ impl BufferPool {
         device: &metal::DeviceRef,
         len: u64,
     ) -> Result<metal::Buffer, SampleError> {
+        let max_buffer_bytes = device_limits(device).max_buffer_bytes as u64;
+        if len > max_buffer_bytes {
+            return Err(SampleError::TooLarge(format!(
+                "buffer needs {len} bytes, limit is {max_buffer_bytes}"
+            )));
+        }
         match self.take_free(len) {
             Some(buf) => Ok(buf),
             None => {
@@ -1924,6 +1930,7 @@ fn batch_representation(
 /// Split out of [`encode_batch`] so both rejections are reachable without a
 /// Metal device. It checks the one-sweep limit for the batch of `graphs`
 /// with one batch in flight.
+#[cfg(test)]
 pub(crate) fn validate_batch<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
@@ -1934,6 +1941,26 @@ pub(crate) fn validate_batch<'a>(
         params,
         kernel,
         host_device_limits(),
+        I8Storage::NONE,
+        None,
+        DenseMode::Off,
+        1,
+    )
+    .map(|batch| (batch.first, batch.n, batch.rep))
+}
+
+/// Apply batch admission to an already opened device.
+pub(crate) fn validate_batch_on_device<'a>(
+    device: &crate::metal_device::MetalDevice,
+    graphs: &[&'a IsingGraph],
+    params: &SampleParams,
+    kernel: Kernel,
+) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
+    validate_batch_within(
+        graphs,
+        params,
+        kernel,
+        &device_limits(&device.device),
         I8Storage::NONE,
         None,
         DenseMode::Off,
@@ -2044,6 +2071,11 @@ impl I8Storage {
 pub(crate) fn host_device_limits() -> &'static DeviceLimits {
     static LIMITS: std::sync::OnceLock<DeviceLimits> = std::sync::OnceLock::new();
     LIMITS.get_or_init(host_limits)
+}
+
+/// Host memory budget with the opened device's single-buffer limit.
+pub(crate) fn device_limits(device: &metal::DeviceRef) -> DeviceLimits {
+    host_device_limits().with_device_buffer_limit(device.max_buffer_length())
 }
 
 /// [`validate_batch`] against explicit memory `limits`. `i8` says where a
@@ -2911,7 +2943,7 @@ fn encode_batch_storage(
         graphs,
         params,
         kernel,
-        host_device_limits(),
+        &device_limits(&device.device),
         I8Storage {
             csr: wide_i8 && !past_k,
             dense: wide_i8,
