@@ -43,6 +43,19 @@ typedef coef_t stored_t;
 #define COEF(v, s) (v)
 #endif
 
+// QUIP_GIBBS_SPILL (the chromatic kernel only) keeps the first `shared_spins`
+// spins of each read in the threadgroup array and the rest in the read's slice
+// of `persistent_state`, so a model past the array runs. The host scores every
+// Gibbs read, so this build skips the device energy.
+#if defined(QUIP_GIBBS_SPILL)
+#undef QUIP_DEVICE_ENERGY
+// Spins past the threadgroup prefix live in device memory, so a barrier that
+// orders one color block's updates before the next must order those too.
+#define COLOR_BARRIER() threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)
+#else
+#define COLOR_BARRIER() threadgroup_barrier(mem_flags::mem_threadgroup)
+#endif
+
 // ==============================================================================
 // RNG - xoshiro128** (128-bit state, passes BigCrush)
 // ==============================================================================
@@ -536,6 +549,60 @@ inline field_t compute_effective_field_unpacked(
     return h_eff;
 }
 
+#ifdef QUIP_GIBBS_SPILL
+// Spin `var` of one read: the threadgroup prefix below `shared_spins`, else
+// the read's slice of the persistent buffer.
+inline int8_t get_spin_spill(
+    int var,
+    threadgroup const int8_t* state,
+    device const int8_t* spill,
+    int shared_spins
+) {
+    return var < shared_spins ? state[var] : spill[var];
+}
+
+inline void set_spin_spill(
+    int var,
+    int8_t spin,
+    threadgroup int8_t* state,
+    device int8_t* spill,
+    int shared_spins
+) {
+    if (var < shared_spins) {
+        state[var] = spin;
+    } else {
+        spill[var] = spin;
+    }
+}
+
+inline field_t compute_effective_field_spill(
+    int var,
+    threadgroup const int8_t* state,
+    device const int8_t* spill,
+    int shared_spins,
+    device const int* csr_row_ptr,
+    device const int* csr_col_ind,
+    device const stored_t* csr_J_vals,
+    device const stored_t* h_vals,
+    int coef_scale
+) {
+    int start = csr_row_ptr[var];
+    int end = csr_row_ptr[var + 1];
+
+    field_t h_eff = field_t(COEF(h_vals[var], coef_scale));
+
+    #pragma unroll 20
+    for (int p = start; p < end; ++p) {
+        int neighbor = csr_col_ind[p];
+        coef_t Jij = COEF(csr_J_vals[p], coef_scale);
+        int8_t neighbor_spin = get_spin_spill(neighbor, state, spill, shared_spins);
+        h_eff += field_t(Jij) * field_t(neighbor_spin);
+    }
+
+    return h_eff;
+}
+#endif
+
 kernel void block_gibbs_parallel(
     // CSR graph structure (concatenated for all problems)
     device const int* csr_row_ptr [[buffer(0)]],
@@ -590,6 +657,14 @@ kernel void block_gibbs_parallel(
     constant int& coef_scale [[buffer(26)]],               // milli value of one stored unit
 #endif
 
+    // A window [sweep_start, sweep_start + sweep_count) of every rung in this
+    // chunk, so a rung too long for one dispatch splits across several.
+    constant int& sweep_start [[buffer(27)]],
+    constant int& sweep_count [[buffer(28)]],
+#ifdef QUIP_GIBBS_SPILL
+    constant int& shared_spins [[buffer(29)]],             // spins kept in threadgroup memory
+#endif
+
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
@@ -626,9 +701,19 @@ kernel void block_gibbs_parallel(
     // Support up to ~4800 nodes
     threadgroup int8_t shared_state[4800];
 
+#ifdef QUIP_GIBBS_SPILL
+    // This read's slice of the persistent buffer. It holds the spins past the
+    // prefix for the whole anneal. The first chunk writes every one of them
+    // before any read, so a pooled buffer needs no zeroing.
+    device int8_t* spill = persistent_state + ulong(sample_id) * ulong(n);
+#endif
+
+    // A window of every rung; the whole rung when sweep_count == sweeps_per_beta.
+    int sweep_end = min(sweep_start + sweep_count, sweeps_per_beta);
+
     RngState rng_state;
 
-    if (beta_start == 0) {
+    if (beta_start == 0 && sweep_start == 0) {
         // ── First chunk: random initialization ──────────────
         // Initialize RNG with unique seed per thread (xoshiro128** with splitmix32 seeding)
         rng_state = seed_rng(
@@ -638,7 +723,11 @@ kernel void block_gibbs_parallel(
         // Collaboratively generate random initial state (unpacked)
         for (uint var = thread_in_group; var < n; var += group_size) {
             uint rand_val = xoshiro128starstar(rng_state);
+#ifdef QUIP_GIBBS_SPILL
+            set_spin_spill(var, (rand_val & 1) ? -1 : 1, shared_state, spill, shared_spins);
+#else
             shared_state[var] = (rand_val & 1) ? -1 : 1;
+#endif
         }
     } else {
         // ── Continuation chunk: load from persistent buffers ──
@@ -650,12 +739,19 @@ kernel void block_gibbs_parallel(
         rng_state.s2 = src_rng[2];
         rng_state.s3 = src_rng[3];
 
+#ifdef QUIP_GIBBS_SPILL
+        // Only the prefix is rebuilt; the rest never left device memory.
+        for (uint var = thread_in_group; var < shared_spins; var += group_size) {
+            shared_state[var] = spill[var];
+        }
+#else
         device const int8_t* src_state = &persistent_state[sample_id * uint(n)];
         for (uint var = thread_in_group; var < n; var += group_size) {
             shared_state[var] = src_state[var];
         }
+#endif
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    COLOR_BARRIER();
 
     // Block Gibbs annealing with TRUE parallel updates over this chunk
     int chunk_end = min(beta_start + beta_count, num_betas);
@@ -666,7 +762,7 @@ kernel void block_gibbs_parallel(
         float beta = beta_schedule[beta_idx];
 #endif
 
-        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+        for (int sweep = sweep_start; sweep < sweep_end; sweep++) {
             // Process each color block
             for (int color = 0; color < num_colors; color++) {
                 int block_start = color_block_starts[color];
@@ -678,10 +774,17 @@ kernel void block_gibbs_parallel(
                     int var = color_node_indices[block_start + i];
 
                     // Compute effective field from shared state
+#ifdef QUIP_GIBBS_SPILL
+                    field_t h_eff = compute_effective_field_spill(
+                        var, shared_state, spill, shared_spins,
+                        my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals, coef_scale
+                    );
+#else
                     field_t h_eff = compute_effective_field_unpacked(
                         var, shared_state,
                         my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals, coef_scale
                     );
+#endif
 
                     // Update spin based on mode
                     int8_t new_spin;
@@ -700,7 +803,11 @@ kernel void block_gibbs_parallel(
                         new_spin = (rand_normalized < prob_plus) ? 1 : -1;
                     } else {
                         // Metropolis update
+#ifdef QUIP_GIBBS_SPILL
+                        int8_t current_spin = get_spin_spill(var, shared_state, spill, shared_spins);
+#else
                         int8_t current_spin = shared_state[var];
+#endif
                         float delta = -2.0f * float(current_spin) * h_eff;
                         if (delta <= 0) {
                             new_spin = -current_spin;
@@ -713,12 +820,16 @@ kernel void block_gibbs_parallel(
                     }
 #endif
 
+#ifdef QUIP_GIBBS_SPILL
+                    set_spin_spill(var, new_spin, shared_state, spill, shared_spins);
+#else
                     shared_state[var] = new_spin;
+#endif
                 }
 
                 // CRITICAL: Barrier between colors to ensure all updates complete
                 // before next color reads the state
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                COLOR_BARRIER();
             }
         }
     }
@@ -734,10 +845,17 @@ kernel void block_gibbs_parallel(
         dst_rng[2] = rng_state.s2;
         dst_rng[3] = rng_state.s3;
 
+#ifdef QUIP_GIBBS_SPILL
+        // The spins past the prefix are already in place.
+        for (uint var = thread_in_group; var < shared_spins; var += group_size) {
+            spill[var] = shared_state[var];
+        }
+#else
         device int8_t* dst_state = &persistent_state[sample_id * uint(n)];
         for (uint var = thread_in_group; var < n; var += group_size) {
             dst_state[var] = shared_state[var];
         }
+#endif
     }
 
 #ifndef QUIP_DEVICE_ENERGY
@@ -783,6 +901,22 @@ kernel void block_gibbs_parallel(
     // Write final state to output - convert unpacked to packed format
     device int8_t* output = &final_samples[sample_id * packed_size];
 
+#ifdef QUIP_GIBBS_SPILL
+    // Each thread packs whole bytes: a model past the prefix has far more
+    // bytes than one thread should walk. The barrier closing the last color
+    // block orders every thread's spin updates, device ones included.
+    for (uint byte_idx = thread_in_group; byte_idx < packed_size; byte_idx += group_size) {
+        uchar bits = 0;
+        for (uint bit_idx = 0; bit_idx < 8; bit_idx++) {
+            uint var = byte_idx * 8 + bit_idx;
+            if (var < n && get_spin_spill(var, shared_state, spill, shared_spins) < 0) {
+                bits |= uchar(1 << bit_idx);
+            }
+        }
+        output[byte_idx] = int8_t(bits);
+    }
+#else
+
     // First, collaboratively zero out the output
     for (uint i = thread_in_group; i < packed_size; i += group_size) {
         output[i] = 0;
@@ -818,4 +952,5 @@ kernel void block_gibbs_parallel(
             }
         }
     }
+#endif
 }

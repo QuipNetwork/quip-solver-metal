@@ -47,6 +47,14 @@ fn global_state(source: &str) -> String {
     format!("{SA_GLOBAL_DEFINE}{source}")
 }
 
+/// Prepended to a chromatic Gibbs variant that keeps the spins past its
+/// threadgroup prefix in each read's slice of the persistent buffer.
+const GIBBS_SPILL_DEFINE: &str = "#define QUIP_GIBBS_SPILL 1\n";
+
+fn gibbs_spill(source: &str) -> String {
+    format!("{GIBBS_SPILL_DEFINE}{source}")
+}
+
 fn msa_dense(source: &str) -> String {
     format!("{MSA_DENSE_DEFINE}{source}")
 }
@@ -139,6 +147,15 @@ pub struct MetalDevice {
     pub(crate) gibbs_parallel_float: ComputePipelineState,
     /// `gibbs_parallel_wide` with `int8_t` coefficients times one integer scale.
     pub(crate) gibbs_parallel_wide_i8: ComputePipelineState,
+    /// `gibbs_parallel` on the spill build (`QUIP_GIBBS_SPILL`), for a model
+    /// past the threadgroup array of `sampler::GIBBS_MAX_NODES` spins.
+    pub(crate) gibbs_parallel_spill: ComputePipelineState,
+    /// `gibbs_parallel_wide` on the spill build.
+    pub(crate) gibbs_parallel_wide_spill: ComputePipelineState,
+    /// `gibbs_parallel_float` on the spill build.
+    pub(crate) gibbs_parallel_float_spill: ComputePipelineState,
+    /// `gibbs_parallel_wide_i8` on the spill build.
+    pub(crate) gibbs_parallel_wide_i8_spill: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
@@ -245,6 +262,23 @@ impl MetalDevice {
             compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_parallel")?;
         let gibbs_parallel_wide_i8 =
             compile_pipeline(&device, &wide_i8(GIBBS_SRC), "block_gibbs_parallel")?;
+        let gibbs_parallel_spill =
+            compile_pipeline(&device, &gibbs_spill(GIBBS_SRC), "block_gibbs_parallel")?;
+        let gibbs_parallel_wide_spill = compile_pipeline(
+            &device,
+            &gibbs_spill(&wide(GIBBS_SRC)),
+            "block_gibbs_parallel",
+        )?;
+        let gibbs_parallel_float_spill = compile_pipeline(
+            &device,
+            &gibbs_spill(&float(GIBBS_SRC)),
+            "block_gibbs_parallel",
+        )?;
+        let gibbs_parallel_wide_i8_spill = compile_pipeline(
+            &device,
+            &gibbs_spill(&wide_i8(GIBBS_SRC)),
+            "block_gibbs_parallel",
+        )?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_float = compile_pipeline(&device, &float(MSA_SRC), "msa_anneal_weighted")?;
@@ -281,6 +315,10 @@ impl MetalDevice {
             gibbs_parallel_wide,
             gibbs_parallel_float,
             gibbs_parallel_wide_i8,
+            gibbs_parallel_spill,
+            gibbs_parallel_wide_spill,
+            gibbs_parallel_float_spill,
+            gibbs_parallel_wide_i8_spill,
             msa,
             msa_weighted,
             msa_float,
@@ -411,6 +449,15 @@ mod tests {
             ("sa_wide_i8", &dev.sa_wide_i8),
             ("gibbs_wide_i8", &dev.gibbs_wide_i8),
             ("gibbs_parallel_wide_i8", &dev.gibbs_parallel_wide_i8),
+            ("gibbs_parallel_wide_spill", &dev.gibbs_parallel_wide_spill),
+            (
+                "gibbs_parallel_float_spill",
+                &dev.gibbs_parallel_float_spill,
+            ),
+            (
+                "gibbs_parallel_wide_i8_spill",
+                &dev.gibbs_parallel_wide_i8_spill,
+            ),
             ("msa_weighted_i8", &dev.msa_weighted_i8),
             ("msa_weighted_dense", &dev.msa_weighted_dense),
             ("msa_weighted_spill", &dev.msa_weighted_spill),

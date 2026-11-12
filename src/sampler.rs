@@ -138,8 +138,11 @@ pub(crate) fn simd_rounded_reads(num_reads: usize) -> usize {
 /// `crate::METAL_SA_IDENTITY` advertises this same cap, so the identity const
 /// and the kernel array have one source.
 pub(crate) const SA_MAX_NODES: usize = 4593;
-/// Gibbs kernel `N` cap: `thread int8_t packed_state[600]` (600*8) in
-/// `kernels/gibbs.metal`.
+/// Gibbs threadgroup-build `N` cap: `threadgroup int8_t shared_state[4800]` of
+/// the chromatic kernel and `thread int8_t packed_state[600]` (600*8) of the
+/// sequential kernel in `kernels/gibbs.metal`. The batch path runs a larger
+/// model on the chromatic kernel's spill build, which keeps the spins past
+/// this prefix in device memory.
 ///
 /// Single source of truth with the identity const, as for [`SA_MAX_NODES`].
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
@@ -173,6 +176,11 @@ const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
 /// read's state in device memory, for chunk sizing. It multiplies the
 /// representation's factor. Measured in `docs/perf/2026-11-12-sa-global.md`.
 const SA_GLOBAL_COST_FACTOR: f64 = 2.0;
+/// Extra Gibbs work per spin update on the spill build, which reads and
+/// writes the spins past its threadgroup prefix in device memory, for chunk
+/// sizing. It multiplies the representation's factor. Measured in
+/// `docs/perf/2026-11-12-gibbs-spill.md`.
+const GIBBS_SPILL_COST_FACTOR: f64 = 3.0;
 /// Float32 SA work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-11-11-float-kernels.md`.
 const FLOAT_SA_COST_FACTOR: f64 = 1.3;
@@ -483,6 +491,10 @@ pub struct Tuning {
     /// Refuses a model of more nodes, as a node cap below the kernel's own
     /// limit does.
     pub node_cap: Option<usize>,
+    /// Caps `K`, the spins the chromatic Gibbs kernel keeps in threadgroup
+    /// memory, at most [`GIBBS_MAX_NODES`]. A model of more nodes runs the
+    /// spill build.
+    pub gibbs_prefix_cap: Option<usize>,
 }
 
 /// Split a beta schedule into chunks whose dispatches each land near
@@ -994,9 +1006,19 @@ impl EncodedBatch {
             KernelEncode::Sa { persist } => {
                 bind_sa_chunk(encoder, persist, chunk);
             }
-            KernelEncode::Gibbs { persist } => {
+            KernelEncode::Gibbs {
+                persist,
+                shared_spins,
+            } => {
                 self.bind_colors(encoder, 0);
                 bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
+                // Only the chromatic kernel declares these; the sequential
+                // kernel ignores them and its plans never window a rung.
+                set_bytes_i32(encoder, 27, sweep_start);
+                set_bytes_i32(encoder, 28, sweep_count);
+                if let Some(shared) = shared_spins {
+                    set_bytes_i32(encoder, 29, *shared);
+                }
             }
             KernelEncode::Msa {
                 persist,
@@ -1400,20 +1422,16 @@ fn validate_batch_within<'a>(
     };
     let n = first.num_nodes();
     // The weighted multi-spin lane spills spin words past threadgroup
-    // memory, and the SA global build keeps each read's state in device
-    // memory past its thread-private frame, so the capacity footprint below
-    // bounds those models instead. An explicit node cap is the limit itself,
-    // even below a kernel's frame.
-    let cap = match kernel {
-        Kernel::Msa | Kernel::Sa => crate::capacity::MAX_NODES,
-        Kernel::Gibbs => kernel_max_nodes(kernel),
-    }
-    .min(node_cap.unwrap_or(usize::MAX));
+    // memory, the SA global build keeps each read's state in device memory
+    // past its thread-private frame, and the chromatic Gibbs kernel spills
+    // spins past its threadgroup array, so the capacity footprint below
+    // bounds every kernel's model instead. An explicit node cap is the limit
+    // itself, even below a kernel's frame.
+    let cap = crate::capacity::MAX_NODES.min(node_cap.unwrap_or(usize::MAX));
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
-        // before the sampler. For Gibbs this catches drift before it overruns
-        // the kernel's fixed-size thread-local arrays. For SA and MSA it
-        // applies the memory-scale bound or an explicit node cap.
+        // before the sampler. This applies the memory-scale bound or an
+        // explicit node cap.
         return Err(SampleError::TooLarge(format!(
             "graph N={n} exceeds {kernel:?} kernel limit {cap}"
         )));
@@ -1725,7 +1743,7 @@ fn new_sa_persistent(
     ])
 }
 
-/// Gibbs carry-over state: spins plus the RNG stream, allocated per anneal.
+/// Gibbs carry-over state: spins plus the RNG stream, rented from `pool`.
 ///
 /// Sizes follow the two kernels' differing layouts. The chromatic kernel keeps
 /// one *sample* per threadgroup and stores spins **unpacked** (one byte each,
@@ -1737,8 +1755,15 @@ fn new_sa_persistent(
 /// Unlike SA, Gibbs persists no `delta_energy` or running energy: it recomputes
 /// the effective field from the current spins on every node update, and its
 /// energy is a pure function of the spins it already carries.
+///
+/// The first chunk writes every read's spins and every stream before any read
+/// of them, and every chunk writes them at its end, so pooled buffers need no
+/// zeroing. The spill build keeps the spins past its threadgroup prefix in
+/// the first buffer for the whole anneal, one slice per read, and writes each
+/// of them in the first chunk before any thread reads it.
 fn new_gibbs_persistent(
-    device: &crate::metal_device::MetalDevice,
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
     dims: &BatchDims,
     node_parallel: bool,
     threads_per_group: usize,
@@ -1747,17 +1772,16 @@ fn new_gibbs_persistent(
     const RNG_BYTES_PER_STREAM: usize = 16;
     Ok(if node_parallel {
         [
-            checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.n.max(1)) as u64))?,
-            checked_buffer(device.new_zeroed_buffer(
+            pool.take(device, (dims.num_threads * dims.n.max(1)) as u64)?,
+            pool.take(
+                device,
                 (dims.num_threads * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
-            ))?,
+            )?,
         ]
     } else {
         [
-            checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64))?,
-            checked_buffer(
-                device.new_zeroed_buffer((dims.num_threads * RNG_BYTES_PER_STREAM) as u64),
-            )?,
+            pool.take(device, (dims.num_threads * dims.packed_size) as u64)?,
+            pool.take(device, (dims.num_threads * RNG_BYTES_PER_STREAM) as u64)?,
         ]
     })
 }
@@ -1793,6 +1817,9 @@ enum KernelEncode {
     },
     Gibbs {
         persist: [metal::Buffer; 2],
+        /// `K` of the spill build, bound at slot 29 of the chromatic kernel;
+        /// `None` on the threadgroup build, which takes no such argument.
+        shared_spins: Option<i32>,
     },
     Msa {
         persist: [metal::Buffer; 2],
@@ -1926,6 +1953,13 @@ fn encode_batch_storage(
     // A model past the SA thread-private frame runs the global build, which
     // keeps each read's spins and `delta_energy` in the persistent buffers.
     let sa_global = kernel == Kernel::Sa && (tuning.sa_global || n > SA_MAX_NODES);
+    // `K`, the spins the chromatic Gibbs kernel keeps in threadgroup memory.
+    // A model past it runs the spill build, which keeps the rest in each
+    // read's slice of the persistent buffer.
+    let gibbs_prefix = tuning
+        .gibbs_prefix_cap
+        .map_or(GIBBS_MAX_NODES, |cap| cap.min(GIBBS_MAX_NODES));
+    let gibbs_spill = kernel == Kernel::Gibbs && n > gibbs_prefix;
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -1979,7 +2013,9 @@ fn encode_batch_storage(
 
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
-    let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
+    // Only the chromatic kernel has a spill build, so a model past its
+    // threadgroup array runs it whatever `QUIP_METAL_GIBBS_SEQUENTIAL` says.
+    let node_parallel = kernel == Kernel::Gibbs && (gibbs_node_parallel() || gibbs_spill);
     // A milli model with a row past one chunk takes the weighted lane's dense
     // build, on `int` storage; the default build keeps the one-chunk code
     // alone. A weighted model past `K` takes the spill build, whose milli
@@ -1993,6 +2029,10 @@ fn encode_batch_storage(
         Kernel::Sa if sa_global => &device.sa_global,
         Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
         Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
+        Kernel::Gibbs if gibbs_spill && i8_scale.is_some() => &device.gibbs_parallel_wide_i8_spill,
+        Kernel::Gibbs if gibbs_spill && wide => &device.gibbs_parallel_wide_spill,
+        Kernel::Gibbs if gibbs_spill && float => &device.gibbs_parallel_float_spill,
+        Kernel::Gibbs if gibbs_spill => &device.gibbs_parallel_spill,
         Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
         Kernel::Gibbs if i8_scale.is_some() => &device.gibbs_wide_i8,
         Kernel::Sa if wide => &device.sa_wide,
@@ -2140,6 +2180,8 @@ fn encode_batch_storage(
         (Representation::Binary | Representation::Int8, _) => 1.0,
     } * if sa_global {
         SA_GLOBAL_COST_FACTOR
+    } else if gibbs_spill {
+        GIBBS_SPILL_COST_FACTOR
     } else {
         1.0
     };
@@ -2154,7 +2196,7 @@ fn encode_batch_storage(
             groups,
             in_flight,
             cost,
-            weighted_msa || kernel == Kernel::Sa,
+            weighted_msa || kernel == Kernel::Sa || (kernel == Kernel::Gibbs && node_parallel),
             tuning.planning_rate,
         ),
     };
@@ -2190,7 +2232,18 @@ fn encode_batch_storage(
                 energies: checked_buffer(device.new_zeroed_buffer((num_samples * 4) as u64))?, // i32
             },
             KernelEncode::Gibbs {
-                persist: new_gibbs_persistent(device, &dims, node_parallel, threads_per_group)?,
+                persist: {
+                    let persist = new_gibbs_persistent(
+                        &device.buffer_pool,
+                        &device.device,
+                        &dims,
+                        node_parallel,
+                        threads_per_group,
+                    )?;
+                    pooled.extend(persist.iter().cloned());
+                    persist
+                },
+                shared_spins: gibbs_spill.then(|| i32::try_from(gibbs_prefix).unwrap_or(i32::MAX)),
             },
         ),
         Kernel::Msa => {
@@ -2393,11 +2446,9 @@ pub(crate) fn audit_device_energies(
 /// # Errors
 ///
 /// Returns [`SampleError::TooLarge`] (harness `SampleError::Capacity`) when:
-/// - `graph.num_nodes()` exceeds the Gibbs kernel node cap
-///   (`GIBBS_MAX_NODES`);
 /// - the model does not fit the device's memory
 ///   (`capacity::runnable_footprint`),
-///   which bounds SA and MSA models;
+///   which bounds every kernel's model;
 /// - `params.num_sweeps` exceeds `MAX_SWEEPS`, the sampler's guard against an
 ///   unbounded coordinator-supplied beta schedule.
 ///
@@ -3241,12 +3292,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_batch_rejects_n_over_the_kernel_cap() {
+    fn validate_batch_rejects_n_over_an_explicit_cap() {
         let big = IsingGraph::new(vec![0.0; GIBBS_MAX_NODES + 1], vec![], vec![]);
-        let err = validate_batch(&[&big], &params(64), Kernel::Gibbs).unwrap_err();
+        let err = validate_batch_within(
+            &[&big],
+            &params(64),
+            Kernel::Gibbs,
+            host_device_limits(),
+            false,
+            Some(GIBBS_MAX_NODES),
+        )
+        .map(drop)
+        .unwrap_err();
         let msg = too_large_msg(err);
         assert!(msg.contains("exceeds"), "{msg}");
         assert!(msg.contains(&GIBBS_MAX_NODES.to_string()), "{msg}");
+    }
+
+    /// The Gibbs spill build takes a model past the threadgroup array, so the
+    /// memory footprint bounds it instead of the array.
+    #[test]
+    fn validate_batch_admits_gibbs_past_the_threadgroup_array() {
+        let big = IsingGraph::new(vec![0.0; GIBBS_MAX_NODES + 1], vec![], vec![]);
+        let (_, n, _) = validate_batch(&[&big], &params(64), Kernel::Gibbs).unwrap();
+        assert_eq!(n, GIBBS_MAX_NODES + 1);
     }
 
     /// The SA global build takes a model past the thread-private frame, so
@@ -3312,8 +3381,8 @@ mod tests {
 
     #[test]
     fn kernel_max_nodes_matches_the_kernel_arrays() {
-        // `delta_energy[4593]` in sa.metal, `packed_state[600]` (600*8) in
-        // gibbs.metal.
+        // `delta_energy[4593]` in sa.metal, `shared_state[4800]` and
+        // `packed_state[600]` (600*8) in gibbs.metal.
         assert_eq!(kernel_max_nodes(Kernel::Sa), 4593);
         assert_eq!(kernel_max_nodes(Kernel::Gibbs), 4800);
         assert_eq!(kernel_max_nodes(Kernel::Sa), SA_MAX_NODES);
@@ -3381,8 +3450,10 @@ mod tests {
         assert_eq!(rep, Representation::Wide);
         let weighted = IsingGraph::new(vec![0.0; n], vec![1.5; n], edges);
         validate_batch(&[&weighted], &params(64), Kernel::Msa).unwrap();
-        // The unit kernels' node cap still gates SA and Gibbs.
-        validate_batch(&[&unit], &params(64), Kernel::Gibbs).unwrap_err();
+        // SA and Gibbs run past their frames too, on their global and spill
+        // builds.
+        validate_batch(&[&unit], &params(64), Kernel::Gibbs).unwrap();
+        validate_batch(&[&unit], &params(64), Kernel::Sa).unwrap();
     }
 
     #[test]

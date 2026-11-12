@@ -18,9 +18,9 @@
 //!   memory. The weighted multi-spin kernel keeps it in the carry-over
 //!   buffer the threadgroup tier already counts, so the tier allocates the
 //!   same buffers. The SA global build keeps each read's packed spins and
-//!   `delta_energy` in its carry-over buffers in the same way. Gibbs has no
-//!   spill kernel yet; its formula follows the intended layout and a later
-//!   task corrects it.
+//!   `delta_energy` in its carry-over buffers in the same way. The Gibbs
+//!   spill build keeps the spins past its threadgroup prefix in each read's
+//!   slice of its carry-over spin buffer, which holds one byte per spin.
 //! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. Not yet
 //!   implemented, and no multi-spin model is admitted to it until a dense
 //!   multi-spin kernel exists.
@@ -434,7 +434,9 @@ fn threadgroup_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
 /// the same buffers and adds none (`sampler::encode_batch_storage`). The SA
 /// global build likewise works in place in its carry-over buffers
 /// ([`sa_persistent`]): packed spins and `delta_energy` for every node of
-/// every read. Gibbs has no spill kernel yet and is sized the same way.
+/// every read. The Gibbs spill build keeps the spins past its prefix in the
+/// carry-over spin buffer ([`gibbs_persistent`]), one byte per spin per
+/// read, so it too adds no buffer.
 fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     threadgroup_sizes(kernel, shape)
 }
@@ -815,6 +817,32 @@ mod tests {
             let fp = footprint(kernel, &sparse_shape(), &ROOMY).unwrap();
             assert_eq!(fp.storage, Storage::Spill, "{kernel:?}");
         }
+    }
+
+    /// The spill build keeps one byte per spin of every read in its
+    /// carry-over buffer, so the footprint past the threadgroup array
+    /// counts it.
+    #[test]
+    fn gibbs_past_the_threadgroup_array_counts_the_per_read_spill() {
+        let shape = ModelShape {
+            nodes: 20_000,
+            edges: 200_000,
+            max_degree: 20,
+            precision: Precision::Int8,
+            betas: 64,
+            reads: 100,
+        };
+        let fp = footprint(Kernel::Gibbs, &shape, &ROOMY).unwrap();
+        assert_eq!(fp.storage, Storage::Spill);
+        assert_eq!(fp.storage.name(Kernel::Gibbs), "spill");
+        let spill = simd_rounded_reads(100) * 20_000;
+        assert!(fp.per_instance_bytes > spill);
+        let smaller = ModelShape {
+            nodes: GIBBS_MAX_NODES,
+            ..shape
+        };
+        let local = footprint(Kernel::Gibbs, &smaller, &ROOMY).unwrap();
+        assert_eq!(local.storage, Storage::Threadgroup);
     }
 
     /// The global build keeps packed spins and `delta_energy` for every
