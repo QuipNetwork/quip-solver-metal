@@ -6,6 +6,7 @@
 //! one fixed order and accepts every flat move only shifts the ring's domain
 //! walls in step, so its reads keep the energy of their random start.
 
+use quip_solver_metal::capacity::Storage;
 use quip_solver_metal::metal_device::MetalDevice;
 use quip_solver_metal::sampler::{sample_ising, sample_ising_tuned, Kernel, Tuning};
 use quip_solver_metal::{IsingGraph, SampleParams};
@@ -402,5 +403,55 @@ fn assert_sa_global_build_anneals_the_zero_field_ring(j: f64) {
 fn sa_global_build_anneals_the_zero_field_ring() {
     for j in [1.0, 1000.0, FLOAT_J] {
         assert_sa_global_build_anneals_the_zero_field_ring(j);
+    }
+}
+
+/// Assert `kernel`'s dense-matrix build reaches the ground state of the
+/// zero-field ring with coupling `j`. A zero-field complete bipartite model
+/// anneals without the node left out, so it cannot show the rule; the ring,
+/// forced onto the matrix, does.
+fn assert_dense_build_anneals_the_zero_field_ring(kernel: Kernel, j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 1000,
+        sweeps_per_beta: 1,
+        seed: 7,
+        ..Default::default()
+    };
+    let tuning = Tuning {
+        force_dense: true,
+        ..Tuning::default()
+    };
+    let out = sample_ising_tuned(&dev, &graph, &params, kernel, tuning).unwrap();
+    assert_eq!(out.storage, Storage::Dense, "{kernel:?} j {j}");
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = out
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "dense {kernel:?} j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn sa_dense_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_dense_build_anneals_the_zero_field_ring(Kernel::Sa, j);
+    }
+}
+
+#[test]
+fn msa_dense_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_dense_build_anneals_the_zero_field_ring(Kernel::Msa, j);
     }
 }
