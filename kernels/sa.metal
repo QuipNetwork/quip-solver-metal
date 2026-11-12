@@ -35,6 +35,18 @@ typedef int field_t;
 #define QUIP_DEVICE_ENERGY 1
 #endif
 
+// Storage type of the `h` and `J` buffers. The QUIP_WIDE_I8 build (always with
+// QUIP_WIDE) holds each as `int8_t` and multiplies by the model's integer
+// scale, passed in buffer 23, as it reads, so every field and delta stays
+// milli `int` and the reads equal the plain wide build's.
+#if defined(QUIP_WIDE_I8)
+typedef int8_t stored_t;
+#define COEF(v, s) (int(v) * (s))
+#else
+typedef coef_t stored_t;
+#define COEF(v, s) (v)
+#endif
+
 inline uint xorshift32(thread uint &state) {
     uint x = state;
     x ^= x << 13;
@@ -79,8 +91,9 @@ inline delta_t get_flip_energy(
     thread const int8_t* packed_state,
     device const int* csr_row_ptr,
     device const int* csr_col_ind,
-    device const coef_t* csr_J_vals,
-    device const coef_t* h_vals
+    device const stored_t* csr_J_vals,
+    device const stored_t* h_vals,
+    int coef_scale
 ) {
     int start = csr_row_ptr[var];
     int end = csr_row_ptr[var + 1];
@@ -88,13 +101,13 @@ inline delta_t get_flip_energy(
     // The field starts at h, then adds the row's couplings in CSR order. The
     // host bounds the float build's rounded field for any summation order
     // (sampler::check_float_schedule in src/), so 2 * field stays finite.
-    field_t energy = h_vals[var];
+    field_t energy = COEF(h_vals[var], coef_scale);
 
     // Aggressive unrolling for typical Zephyr degrees (18-20)
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = csr_col_ind[p];
-        coef_t Jij = csr_J_vals[p];
+        coef_t Jij = COEF(csr_J_vals[p], coef_scale);
         int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
         energy += field_t(neighbor_spin) * field_t(Jij);
     }
@@ -120,7 +133,7 @@ inline delta_t get_flip_energy(
 kernel void pure_simulated_annealing(
     device const int* csr_row_ptr [[buffer(0)]],          // Concatenated [N+1] for all problems
     device const int* csr_col_ind [[buffer(1)]],          // Concatenated [nnz] for all problems
-    device const coef_t* csr_J_vals [[buffer(2)]],        // Concatenated [nnz] for all problems
+    device const stored_t* csr_J_vals [[buffer(2)]],        // Concatenated [nnz] for all problems
     device const int* row_ptr_offsets [[buffer(3)]],      // [num_problems+1] offset into csr_row_ptr
     device const int* col_ind_offsets [[buffer(4)]],      // [num_problems+1] offset into csr_col_ind
 
@@ -134,7 +147,7 @@ kernel void pure_simulated_annealing(
     constant int& num_reads [[buffer(14)]],                // reads per individual problem
 
     device const float* beta_schedule [[buffer(9)]],       // [num_betas]
-    device const coef_t* csr_h_vals [[buffer(15)]],        // Concatenated [N] for all problems - h field values
+    device const stored_t* csr_h_vals [[buffer(15)]],        // Concatenated [N] for all problems - h field values
 
     // Outputs only (no working memory needed - using thread-local)
     device int8_t* final_samples [[buffer(10)]],           // [num_threads * (N+7)/8] - bit-packed
@@ -151,12 +164,18 @@ kernel void pure_simulated_annealing(
 #ifdef QUIP_WIDE
     device const int* wide_rows [[buffer(22)]],            // [num_betas * WIDE_ROW] Metropolis thresholds
 #endif
+#ifdef QUIP_WIDE_I8
+    constant int& coef_scale [[buffer(23)]],               // milli value of one stored unit
+#endif
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
     uint3 threads_per_group [[threads_per_threadgroup]]
 ) {
+#ifndef QUIP_WIDE_I8
+    const int coef_scale = 1;
+#endif
     // Compute global thread ID
     uint thread_id = threadgroup_pos.x * threads_per_group.x + thread_pos_in_group.x;
 
@@ -175,8 +194,8 @@ kernel void pure_simulated_annealing(
     // Point to this problem's CSR data
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
-    device const coef_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const coef_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
+    device const stored_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
+    device const stored_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
 
     int n = N;
     int sweeps_per_beta_val = sweeps_per_beta;
@@ -218,7 +237,7 @@ kernel void pure_simulated_annealing(
 
         // Build initial delta_energy array
         for (int var = 0; var < n; var++) {
-            delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals);
+            delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals, coef_scale);
         }
 
         // Compute initial energy
@@ -324,7 +343,7 @@ kernel void pure_simulated_annealing(
                     #pragma unroll 20
                     for (int p = start; p < end; ++p) {
                         int neighbor = my_csr_col_ind[p];
-                        coef_t Jij = my_csr_J_vals[p];
+                        coef_t Jij = COEF(my_csr_J_vals[p], coef_scale);
                         int8_t neighbor_spin = get_spin_packed(neighbor, packed_state);
 #ifdef QUIP_FLOAT
                         // 4*J may overflow even when the updated delta fits,

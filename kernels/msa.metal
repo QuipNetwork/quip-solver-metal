@@ -216,12 +216,29 @@ typedef float weighted_coef_t;
 // One model per word with milli `int` couplings and fields, plus the
 // batch's Metropolis threshold rows: one row of WIDE_ROW milli thresholds
 // per rung, accepting an uphill change `de` when `de <= entry`.
+#ifdef QUIP_WIDE_I8
+// The QUIP_WIDE_I8 build holds `h` and `J` as `int8_t` and multiplies by the
+// model's integer `scale` (buffer 26) on every read, so the fields and the
+// threshold test stay in milli `int` and the reads equal the plain build's.
+struct WeightedCouplings {
+    device const int8_t* j;
+    device const int8_t* h;
+    device const int* rows;
+    int scale;
+    inline int field(int var) const { return int(h[var]) * scale; }
+    inline int coupling(int p) const { return int(j[p]) * scale; }
+};
+typedef int8_t weighted_coef_t;
+#else
 struct WeightedCouplings {
     device const int* j;
     device const int* h;
     device const int* rows;
+    inline int field(int var) const { return h[var]; }
+    inline int coupling(int p) const { return j[p]; }
 };
 typedef int weighted_coef_t;
+#endif
 #endif
 
 // Per-lane energy in milli of the spin words in `state` for the nodes this
@@ -472,7 +489,7 @@ inline uint flip_mask(
 ) {
     int pstart = my_csr_row_ptr[var];
     int pend = my_csr_row_ptr[var + 1];
-    int h = couplings.h[var];
+    int h = couplings.field(var);
 
     int jj[MSA_MAX_DEG];
     uint sw[MSA_MAX_DEG];
@@ -480,7 +497,7 @@ inline uint flip_mask(
     for (int q = 0; q < MSA_MAX_DEG; ++q) {
         int p = pstart + q;
         bool ok = p < pend;
-        jj[q] = ok ? couplings.j[p] : 0;
+        jj[q] = ok ? couplings.coupling(p) : 0;
         sw[q] = state[ok ? my_csr_col_ind[p] : 0];
     }
     uint bi = state[var];
@@ -793,6 +810,9 @@ kernel void msa_anneal_weighted(
 #ifndef QUIP_FLOAT
     device const int* wide_rows [[buffer(25)]],
 #endif
+#ifdef QUIP_WIDE_I8
+    constant int& coef_scale [[buffer(26)]],
+#endif
     threadgroup uint* state [[threadgroup(0)]],
 
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -813,6 +833,9 @@ kernel void msa_anneal_weighted(
 #ifdef QUIP_FLOAT
     WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                                 &csr_h_vals[problem_id * uint(N)]};
+#elif defined(QUIP_WIDE_I8)
+    WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
+                                &csr_h_vals[problem_id * uint(N)], wide_rows, coef_scale};
 #else
     WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                                 &csr_h_vals[problem_id * uint(N)], wide_rows};

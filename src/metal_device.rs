@@ -29,6 +29,13 @@ const WIDE_DEFINE: &str = "#define QUIP_WIDE 1\n";
 /// Prepended to a kernel source to build its Float32 variant.
 const FLOAT_DEFINE: &str = "#define QUIP_FLOAT 1\n";
 
+/// Prepended to a wide variant for `int8_t` coefficient storage.
+const WIDE_I8_DEFINE: &str = "#define QUIP_WIDE_I8 1\n";
+
+fn wide_i8(source: &str) -> String {
+    format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}{source}")
+}
+
 fn wide(source: &str) -> String {
     format!("{WIDE_DEFINE}{source}")
 }
@@ -77,10 +84,14 @@ pub struct MetalDevice {
     pub(crate) sa_wide: ComputePipelineState,
     /// `sa` for Float32 models: `float` coefficients and delta.
     pub(crate) sa_float: ComputePipelineState,
+    /// `sa_wide` with `int8_t` coefficients times one integer scale.
+    pub(crate) sa_wide_i8: ComputePipelineState,
     pub(crate) gibbs: ComputePipelineState,
     pub(crate) gibbs_wide: ComputePipelineState,
     /// `gibbs` for Float32 models: `float` coefficients and heat-bath.
     pub(crate) gibbs_float: ComputePipelineState,
+    /// `gibbs_wide` with `int8_t` coefficients times one integer scale.
+    pub(crate) gibbs_wide_i8: ComputePipelineState,
     /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
     /// split the nodes of each color, `threadgroup`-shared state. Same buffer
     /// layout as `gibbs`, different dispatch geometry.
@@ -88,6 +99,8 @@ pub struct MetalDevice {
     pub(crate) gibbs_parallel_wide: ComputePipelineState,
     /// `gibbs_parallel` for Float32 models.
     pub(crate) gibbs_parallel_float: ComputePipelineState,
+    /// `gibbs_parallel_wide` with `int8_t` coefficients times one integer scale.
+    pub(crate) gibbs_parallel_wide_i8: ComputePipelineState,
     /// Multi-spin coded SA: one threadgroup per (problem, 32-replica word),
     /// threads split each colour class, spin words in `threadgroup` memory.
     /// Same buffer layout as `gibbs_parallel` with `words` at slot 19.
@@ -98,6 +111,8 @@ pub struct MetalDevice {
     /// `msa_weighted` for Float32 models: `float` coefficients and a
     /// per-lane `float` Metropolis test, no threshold rows.
     pub(crate) msa_float: ComputePipelineState,
+    /// `msa_weighted` with `int8_t` coefficients times one integer scale.
+    pub(crate) msa_weighted_i8: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -152,17 +167,22 @@ impl MetalDevice {
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
         let sa_wide = compile_pipeline(&device, &wide(SA_SRC), "pure_simulated_annealing")?;
         let sa_float = compile_pipeline(&device, &float(SA_SRC), "pure_simulated_annealing")?;
+        let sa_wide_i8 = compile_pipeline(&device, &wide_i8(SA_SRC), "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let gibbs_wide = compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_float = compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_sampler")?;
+        let gibbs_wide_i8 = compile_pipeline(&device, &wide_i8(GIBBS_SRC), "block_gibbs_sampler")?;
         let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
         let gibbs_parallel_wide =
             compile_pipeline(&device, &wide(GIBBS_SRC), "block_gibbs_parallel")?;
         let gibbs_parallel_float =
             compile_pipeline(&device, &float(GIBBS_SRC), "block_gibbs_parallel")?;
+        let gibbs_parallel_wide_i8 =
+            compile_pipeline(&device, &wide_i8(GIBBS_SRC), "block_gibbs_parallel")?;
         let msa = compile_pipeline(&device, MSA_SRC, "msa_anneal")?;
         let msa_weighted = compile_pipeline(&device, MSA_SRC, "msa_anneal_weighted")?;
         let msa_float = compile_pipeline(&device, &float(MSA_SRC), "msa_anneal_weighted")?;
+        let msa_weighted_i8 = compile_pipeline(&device, &wide_i8(MSA_SRC), "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -176,15 +196,19 @@ impl MetalDevice {
             sa,
             sa_wide,
             sa_float,
+            sa_wide_i8,
             gibbs,
             gibbs_wide,
             gibbs_float,
+            gibbs_wide_i8,
             gibbs_parallel,
             gibbs_parallel_wide,
             gibbs_parallel_float,
+            gibbs_parallel_wide_i8,
             msa,
             msa_weighted,
             msa_float,
+            msa_weighted_i8,
             msa_slots,
             msa_screen,
             msa_frustration_draw,

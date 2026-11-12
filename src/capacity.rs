@@ -141,18 +141,29 @@ pub enum Precision {
     Int8,
     /// Signed 32-bit integer coefficients (the wide milli representation).
     Int32,
+    /// The wide milli representation stored as `int8_t` coefficients times one
+    /// integer scale: one byte per coefficient, while deltas and fields stay
+    /// 32-bit.
+    Int8Scaled,
     /// 32-bit float coefficients.
     Float32,
 }
 
 impl Precision {
-    /// Bytes per coefficient in the CSR value and field buffers, and per
-    /// `delta_energy` entry (one for the narrow representation, four for the
-    /// wide one; `new_sa_persistent`).
-    const fn sparse_bytes(self) -> usize {
+    /// Bytes per coefficient in the CSR value and field buffers.
+    const fn coef_bytes(self) -> usize {
+        match self {
+            Self::Binary | Self::Int8 | Self::Int8Scaled => 1,
+            Self::Int32 | Self::Float32 => 4,
+        }
+    }
+
+    /// Bytes per `delta_energy` entry (`new_sa_persistent`): one for the
+    /// narrow representation, four for every other.
+    const fn delta_bytes(self) -> usize {
         match self {
             Self::Binary | Self::Int8 => 1,
-            Self::Int32 | Self::Float32 => 4,
+            Self::Int8Scaled | Self::Int32 | Self::Float32 => 4,
         }
     }
 
@@ -160,7 +171,7 @@ impl Precision {
     const fn dense_bytes(self, cells: usize) -> usize {
         match self {
             Self::Binary => cells.div_ceil(8),
-            Self::Int8 => cells,
+            Self::Int8 | Self::Int8Scaled => cells,
             Self::Int32 | Self::Float32 => cells.saturating_mul(4),
         }
     }
@@ -328,7 +339,7 @@ fn output_buffers(shape: &ModelShape) -> [usize; 2] {
 /// then couplings and fields at the precision's width (`upload_inputs`).
 fn csr_buffers(shape: &ModelShape) -> [usize; 4] {
     let nnz = shape.edges.saturating_mul(2).max(1);
-    let width = shape.precision.sparse_bytes();
+    let width = shape.precision.coef_bytes();
     [
         shape.nodes.saturating_add(1).saturating_mul(4),
         nnz.saturating_mul(4),
@@ -362,7 +373,7 @@ fn sa_persistent(shape: &ModelShape) -> [usize; 4] {
         reads.saturating_mul(shape.nodes.div_ceil(8).max(1)),
         reads
             .saturating_mul(shape.nodes.max(1))
-            .saturating_mul(shape.precision.sparse_bytes()),
+            .saturating_mul(shape.precision.delta_bytes()),
         reads.saturating_mul(4),
         reads.saturating_mul(4),
     ]
@@ -431,7 +442,7 @@ fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
         shape
             .precision
             .dense_bytes(shape.nodes.saturating_mul(shape.nodes)),
-        shape.nodes.saturating_mul(shape.precision.sparse_bytes()),
+        shape.nodes.saturating_mul(shape.precision.coef_bytes()),
     ];
     per_instance.extend(output_buffers(shape));
     per_instance.extend(persistent_buffers(kernel, shape));

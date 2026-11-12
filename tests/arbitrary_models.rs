@@ -8,7 +8,7 @@
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::SampleParams;
 use quip_solver_metal::metal_device::MetalDevice;
-use quip_solver_metal::sampler::{sample_ising, Kernel, SampleError};
+use quip_solver_metal::sampler::{model_footprint, sample_ising, Kernel, SampleError};
 use quip_solver_metal::IsingGraph;
 
 fn device() -> Option<MetalDevice> {
@@ -199,4 +199,44 @@ fn msa_anneals_weights_not_signs() {
     let want = brute_force_min(&triangle);
     let reads = sample_ising(&dev, &triangle, &params(500), Kernel::Msa).unwrap();
     assert!(reads.iter().all(|r| r.energy_milli == want), "{reads:?}");
+}
+
+/// A ring whose coefficients are multiples of 250 milli with one quotient
+/// above 63, so the model is wide and takes `int8_t` storage at scale 250.
+/// With `fine` set, one coefficient is 1 milli, so the gcd is 1 and a quotient
+/// of 100 000 does not fit: the same shape on plain `int` storage.
+fn scaled_ring(fine: bool) -> IsingGraph {
+    let n = 100;
+    let edges: Vec<(usize, usize)> = (0..n).map(|v| (v, (v + 1) % n)).collect();
+    let mut j: Vec<f64> = (0..n)
+        .map(|k| f64::from((k % 7) as i32 - 3) * 0.25)
+        .collect();
+    j[0] = 25.0;
+    let mut h = vec![0.25; n];
+    if fine {
+        h[1] = 0.001;
+    }
+    IsingGraph::new(h, j, edges)
+}
+
+#[test]
+fn a_scaled_i8_model_uses_one_byte_per_coupler() {
+    let scaled = scaled_ring(false);
+    let plain = scaled_ring(true);
+    let edges = scaled.edges.len();
+    let nodes = scaled.h.len();
+    for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+        let narrow = model_footprint(&scaled, &params(64), kernel).unwrap();
+        let wide = model_footprint(&plain, &params(64), kernel).unwrap();
+        assert_eq!(narrow.storage, wide.storage, "{kernel:?}");
+        // The J values (two per edge) and the h values drop from four bytes
+        // to one. Deltas and fields stay `int`.
+        let saved = 3 * (2 * edges + nodes);
+        assert_eq!(
+            wide.per_instance_bytes - narrow.per_instance_bytes,
+            saved,
+            "{kernel:?}"
+        );
+        assert_eq!(wide.shared_bytes, narrow.shared_bytes, "{kernel:?}");
+    }
 }

@@ -45,6 +45,7 @@ const fn precision_name(precision: Precision) -> &'static str {
         Precision::Binary => "binary",
         Precision::Int8 => "int8",
         Precision::Int32 => "int32",
+        Precision::Int8Scaled => "int8_scaled",
         Precision::Float32 => "float32",
     }
 }

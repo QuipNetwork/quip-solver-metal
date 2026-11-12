@@ -68,6 +68,43 @@ pub(crate) fn to_milli(v: f64) -> Option<i32> {
     Some(m as i32)
 }
 
+/// The milli value one `int8_t` unit stands for when `graph` is a wide model
+/// whose coefficients all fit `i8` after division by their greatest common
+/// divisor, or `None`. The scale is the gcd of the absolute nonzero milli
+/// values of `h` and `J`. A coefficient off the milli grid, a model with no
+/// nonzero coefficient, and a quotient outside `-128..=127` give `None`.
+#[cfg(test)]
+pub(crate) fn wide_i8_scale(graph: &IsingGraph) -> Option<i32> {
+    batch_wide_i8_scale(&[graph])
+}
+
+/// The scale for the graphs of one batch, which share one scale: the gcd over
+/// every graph, and every quotient must fit `i8`. [`wide_i8_scale`] is the
+/// one-graph case.
+pub(crate) fn batch_wide_i8_scale(graphs: &[&IsingGraph]) -> Option<i32> {
+    let mut milli = Vec::new();
+    for graph in graphs {
+        for &v in graph.h.iter().chain(&graph.j) {
+            milli.push(to_milli(v)?);
+        }
+    }
+    let scale = milli.iter().fold(0_i32, |g, &m| gcd(g, m.abs()));
+    if scale == 0 {
+        return None;
+    }
+    milli
+        .iter()
+        .all(|&m| i8::try_from(m / scale).is_ok())
+        .then_some(scale)
+}
+
+fn gcd(mut a: i32, mut b: i32) -> i32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// What the shared checks learn about a model.
 struct Survey {
     /// The largest local field in milli, when every value is on the milli
@@ -320,6 +357,63 @@ mod tests {
         assert!(err.contains("self-loop"), "{err}");
         let err = classify_msa(&graph).unwrap_err();
         assert!(err.contains("self-loop"), "{err}");
+    }
+
+    #[test]
+    fn a_wide_model_of_small_multiples_has_a_scale() {
+        // 250 milli times {-2, 3}, and a zero.
+        let graph = IsingGraph::new(
+            vec![0.5, 0.0, -0.75],
+            vec![0.25, -0.5],
+            vec![(0, 1), (1, 2)],
+        );
+        assert_eq!(wide_i8_scale(&graph), Some(250));
+        // The scale is the gcd, not the smallest value.
+        let graph = pair([0.6, 0.0], 0.4);
+        assert_eq!(wide_i8_scale(&graph), Some(200));
+    }
+
+    #[test]
+    fn a_quotient_outside_i8_has_no_scale() {
+        // 127 and -128 units fit; 128 does not.
+        assert_eq!(wide_i8_scale(&pair([0.127, -0.128], 0.001)), Some(1));
+        assert_eq!(wide_i8_scale(&pair([0.128, 0.0], 0.001)), None);
+        assert_eq!(wide_i8_scale(&pair([-0.129, 0.0], 0.001)), None);
+        assert_eq!(wide_i8_scale(&pair([0.0, 0.0], 300.0)), Some(300_000));
+    }
+
+    #[test]
+    fn mixed_signs_share_one_scale() {
+        let graph = pair([-0.25, 0.5], -0.75);
+        assert_eq!(wide_i8_scale(&graph), Some(250));
+    }
+
+    #[test]
+    fn whole_unit_wide_models_scale_by_1000() {
+        // 64 unit bonds exceed the int8 field bound, so the model is Wide, and
+        // every coefficient is one multiple of 1000 milli.
+        let graph = star(1.0, 64);
+        assert_eq!(classify(&graph), Ok(Representation::Wide));
+        assert_eq!(wide_i8_scale(&graph), Some(1000));
+    }
+
+    #[test]
+    fn a_model_without_nonzero_coefficients_or_off_grid_has_no_scale() {
+        assert_eq!(wide_i8_scale(&pair([0.0, 0.0], 0.0)), None);
+        assert_eq!(wide_i8_scale(&pair([0.1 + 0.2, 0.0], 1.0)), None);
+        assert_eq!(wide_i8_scale(&pair([f64::NAN, 0.0], 1.0)), None);
+    }
+
+    #[test]
+    fn a_batch_shares_the_gcd_and_the_i8_bound() {
+        let a = pair([0.5, 0.0], 0.5);
+        let b = pair([0.75, 0.0], 0.25);
+        assert_eq!(batch_wide_i8_scale(&[&a, &b]), Some(250));
+        // Alone, `c` has scale 10; with `d` the shared scale is 1 and 1270 does not fit.
+        let c = pair([1.27, 0.0], 0.01);
+        let d = pair([0.001, 0.0], 0.0);
+        assert_eq!(wide_i8_scale(&c), Some(10));
+        assert_eq!(batch_wide_i8_scale(&[&c, &d]), None);
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub enum Kernel {
 }
 
 use crate::capacity::{footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape};
-use crate::representation::{classify, classify_msa, Representation};
+use crate::representation::{batch_wide_i8_scale, classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_float, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
 pub(crate) use quip_solver_core::quip_protocol::scoring::energy_milli;
@@ -772,6 +772,15 @@ fn pooled_from_slice<T: Copy>(
     Ok(buf)
 }
 
+/// The buffer slot of the `int8_t` storage scale: the next free slot after
+/// each kernel's threshold rows (`kernels/sa.metal`, `gibbs.metal`, `msa.metal`).
+fn coef_scale_slot(kernel: Kernel) -> u64 {
+    match kernel {
+        Kernel::Sa => 23,
+        Kernel::Gibbs | Kernel::Msa => 26,
+    }
+}
+
 /// A prepared batch retaining its inputs and carry-over state between chunks.
 /// Only `commit_next` submits work, with at most one unfinished chunk per batch.
 pub(crate) struct EncodedBatch {
@@ -793,6 +802,8 @@ pub(crate) struct EncodedBatch {
     dims: BatchDims,
     kstate: KernelEncode,
     wide_rows: Option<(u64, metal::Buffer)>,
+    /// Buffer slot and milli value of one stored unit, for `int8_t` storage.
+    coef_scale: Option<(u64, i32)>,
     colors: Vec<metal::Buffer>,
     num_colors: i32,
     groups: usize,
@@ -865,6 +876,9 @@ impl EncodedBatch {
         }
         if let Some((index, rows)) = &self.wide_rows {
             encoder.set_buffer(*index, Some(rows), 0);
+        }
+        if let Some((index, scale)) = self.coef_scale {
+            set_bytes_i32(encoder, index, scale);
         }
         encoder.dispatch_thread_groups(
             mtl_size_1d(self.groups),
@@ -1198,7 +1212,7 @@ pub(crate) fn validate_batch<'a>(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
-    validate_batch_within(graphs, params, kernel, host_device_limits())
+    validate_batch_within(graphs, params, kernel, host_device_limits(), false)
 }
 
 /// Memory limits of this host, computed once.
@@ -1207,7 +1221,9 @@ fn host_device_limits() -> &'static DeviceLimits {
     LIMITS.get_or_init(host_limits)
 }
 
-/// [`validate_batch`] against explicit memory `limits`.
+/// [`validate_batch`] against explicit memory `limits`. `allow_i8` sizes a wide
+/// batch that [`batch_i8_scale`] accepts at one byte per coefficient, for the
+/// batch path that uploads it so.
 ///
 /// The footprint check comes last and runs before any buffer exists, so a
 /// model that does not fit is refused without allocating.
@@ -1216,6 +1232,7 @@ fn validate_batch_within<'a>(
     params: &SampleParams,
     kernel: Kernel,
     limits: &DeviceLimits,
+    allow_i8: bool,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
@@ -1259,18 +1276,35 @@ fn validate_batch_within<'a>(
             )));
         }
     }
-    admit_footprint(first, params, kernel, rep, limits)?;
+    let i8_scale = batch_i8_scale(graphs, rep, allow_i8);
+    shape_footprint(first, params, kernel, rep, i8_scale.is_some(), limits)
+        .map(drop)
+        .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}")))?;
     Ok((first, n, rep))
 }
 
-/// Refuse a batch whose models in flight need more than the usable memory.
-fn admit_footprint(
+/// The scale of a wide batch stored as `int8_t` coefficients, or `None` when
+/// the batch runs on plain `int` storage: `allow` is false, the batch is not
+/// wide, or its coefficients do not all fit `i8` after division by their gcd.
+fn batch_i8_scale(graphs: &[&IsingGraph], rep: Representation, allow: bool) -> Option<i32> {
+    if allow && rep == Representation::Wide {
+        batch_wide_i8_scale(graphs)
+    } else {
+        None
+    }
+}
+
+/// The footprint of one model of a batch, or the capacity reason it does not
+/// fit. `i8_storage` is a wide model held as `int8_t` coefficients with `int`
+/// deltas and fields.
+fn shape_footprint(
     graph: &IsingGraph,
     params: &SampleParams,
     kernel: Kernel,
     rep: Representation,
+    i8_storage: bool,
     limits: &DeviceLimits,
-) -> Result<(), SampleError> {
+) -> Result<crate::capacity::Footprint, crate::capacity::CapacityError> {
     let shape = ModelShape {
         nodes: graph.num_nodes(),
         edges: graph.edges.len(),
@@ -1278,6 +1312,8 @@ fn admit_footprint(
         // No bit-packed kernel exists, so a Binary model costs what Int8 does.
         precision: if rep == Representation::Binary {
             Representation::Int8.precision()
+        } else if i8_storage {
+            crate::capacity::Precision::Int8Scaled
         } else {
             rep.precision()
         },
@@ -1287,10 +1323,32 @@ fn admit_footprint(
     };
     // `footprint` compares the total for `instances` with `usable_bytes`.
     capacity_footprint(kernel, &shape, limits)
-        .map(drop)
-        .map_err(|e| {
-            SampleError::TooLarge(format!("{kernel:?} model of {} nodes: {e}", shape.nodes))
-        })
+}
+
+/// The footprint `encode_batch` admits `graph` at, for tests of the storage
+/// choice: a wide model whose coefficients fit `i8` after division by their
+/// gcd counts one byte per coefficient.
+///
+/// # Errors
+///
+/// A capacity refusal, as [`sample_ising`] reports it.
+#[doc(hidden)]
+pub fn model_footprint(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+) -> Result<crate::capacity::Footprint, SampleError> {
+    let rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
+    let i8_scale = batch_i8_scale(&[graph], rep, true);
+    shape_footprint(
+        graph,
+        params,
+        kernel,
+        rep,
+        i8_scale.is_some(),
+        host_device_limits(),
+    )
+    .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model: {e}")))
 }
 
 /// A buffer, or a capacity refusal when the allocation returned a null
@@ -1319,6 +1377,7 @@ fn upload_inputs(
     graphs: &[&IsingGraph],
     kernel: Kernel,
     rep: Representation,
+    i8_scale: Option<i32>,
 ) -> Result<InputBuffers, SampleError> {
     let topo = &cached.topo;
     let num_problems = graphs.len();
@@ -1353,7 +1412,24 @@ fn upload_inputs(
                 all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
                 all_h[p * n..p * n + h_milli.len()].copy_from_slice(&h_milli);
             }
-            if kernel == Kernel::Msa {
+            if let Some(scale) = i8_scale {
+                // `batch_wide_i8_scale` checked every quotient against `i8`.
+                let to_i8 = |milli: &[i32]| -> Vec<i8> {
+                    milli.iter().map(|&m| (m / scale) as i8).collect()
+                };
+                let (all_j, all_h) = (to_i8(&all_j), to_i8(&all_h));
+                if kernel == Kernel::Msa {
+                    (
+                        pooled_from_slice(&device.buffer_pool, &device.device, &all_j)?,
+                        pooled_from_slice(&device.buffer_pool, &device.device, &all_h)?,
+                    )
+                } else {
+                    (
+                        checked_buffer(device.new_buffer_from_slice(&all_j))?,
+                        checked_buffer(device.new_buffer_from_slice(&all_h))?,
+                    )
+                }
+            } else if kernel == Kernel::Msa {
                 (
                     pooled_from_slice(&device.buffer_pool, &device.device, &all_j)?,
                     pooled_from_slice(&device.buffer_pool, &device.device, &all_h)?,
@@ -1603,7 +1679,37 @@ fn encode_batch_inner(
     plan_override: Option<&[(i32, i32)]>,
     beta_override: Option<Vec<f32>>,
 ) -> Result<EncodedBatch, SampleError> {
-    let (first, n, rep) = validate_batch(graphs, params, kernel)?;
+    encode_batch_storage(
+        device,
+        graphs,
+        params,
+        kernel,
+        in_flight,
+        plan_override,
+        beta_override,
+        true,
+    )
+}
+
+/// [`encode_batch_inner`] with `wide_i8` false forcing every wide batch onto
+/// plain `int` coefficients, so tests compare the two storages.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "encode_batch_inner's arguments plus the storage switch"
+)]
+fn encode_batch_storage(
+    device: &crate::metal_device::MetalDevice,
+    graphs: &[&IsingGraph],
+    params: &SampleParams,
+    kernel: Kernel,
+    in_flight: usize,
+    plan_override: Option<&[(i32, i32)]>,
+    beta_override: Option<Vec<f32>>,
+    wide_i8: bool,
+) -> Result<EncodedBatch, SampleError> {
+    let (first, n, rep) =
+        validate_batch_within(graphs, params, kernel, host_device_limits(), wide_i8)?;
+    let i8_scale = batch_i8_scale(graphs, rep, wide_i8);
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -1659,6 +1765,10 @@ fn encode_batch_inner(
     // only the dispatch geometry below differs.
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
     let pipeline = match kernel {
+        Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
+        Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
+        Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
+        Kernel::Gibbs if i8_scale.is_some() => &device.gibbs_wide_i8,
         Kernel::Sa if wide => &device.sa_wide,
         Kernel::Sa if float => &device.sa_float,
         Kernel::Sa => &device.sa,
@@ -1751,7 +1861,7 @@ fn encode_batch_inner(
         first,
         kernel == Kernel::Msa && msa_four_color(),
     );
-    let inputs = upload_inputs(device, &cached, graphs, kernel, rep)?;
+    let inputs = upload_inputs(device, &cached, graphs, kernel, rep, i8_scale)?;
 
     let cost = match (rep, kernel) {
         (Representation::Wide, Kernel::Sa) => WIDE_SA_COST_FACTOR,
@@ -1863,6 +1973,7 @@ fn encode_batch_inner(
         dims,
         kstate,
         wide_rows,
+        coef_scale: i8_scale.map(|scale| (coef_scale_slot(kernel), scale)),
         colors,
         num_colors,
         groups,
@@ -2040,7 +2151,7 @@ pub fn sample_ising(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-    sample_planned(device, graph, params, kernel, None)
+    sample_planned(device, graph, params, kernel, None, true)
 }
 
 /// [`sample_ising`] with the beta schedule split into chunks of
@@ -2064,7 +2175,7 @@ pub fn sample_ising_chunked(
         .step_by(step)
         .map(|start| (start as i32, step.min(num_betas - start) as i32))
         .collect();
-    sample_planned(device, graph, params, kernel, Some(&plan))
+    sample_planned(device, graph, params, kernel, Some(&plan), true)
 }
 
 /// One problem through [`encode_batch_inner`], committed chunk by chunk and
@@ -2075,6 +2186,7 @@ fn sample_planned(
     params: &SampleParams,
     kernel: Kernel,
     plan: Option<&[(i32, i32)]>,
+    wide_i8: bool,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     if graph.num_nodes() == 0 {
         let reads = params.num_reads.max(1);
@@ -2086,7 +2198,7 @@ fn sample_planned(
             .collect());
     }
 
-    let mut batch = encode_batch_inner(device, &[graph], params, kernel, 1, plan, None)?;
+    let mut batch = encode_batch_storage(device, &[graph], params, kernel, 1, plan, None, wide_i8)?;
     while batch.commit_next(|| false) {
         batch.wait_until_completed();
     }
@@ -2547,7 +2659,8 @@ mod tests {
             .then(|| crate::metal_device::MetalDevice::open(0).unwrap());
         let before = device.as_ref().map(|d| d.device.current_allocated_size());
         let g = ring();
-        let err = validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits).unwrap_err();
+        let err =
+            validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits, false).unwrap_err();
         let SampleError::TooLarge(message) = &err else {
             panic!("expected TooLarge, got {err:?}");
         };
@@ -2887,6 +3000,53 @@ mod tests {
         let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
         let j = vec![-1.0; edges.len()];
         IsingGraph::new(h, j, edges)
+    }
+
+    /// 48 nodes on a ring with chords. Every coefficient is a multiple of 250
+    /// milli with quotients up to 100, so the model is wide (not the int8
+    /// tier) and `int8_t` storage takes it at scale 250.
+    fn scaled_i8_model() -> IsingGraph {
+        let n = 48;
+        let mut edges: Vec<(usize, usize)> = (0..n).map(|v| (v, (v + 1) % n)).collect();
+        edges.extend((0..n).map(|v| (v, (v + 7) % n)).filter(|&(u, v)| u < v));
+        let j = (0..edges.len())
+            .map(|k| f64::from(((k * 37) % 201) as i32 - 100) * 0.25)
+            .collect();
+        let h = (0..n)
+            .map(|i| f64::from(((i * 11) % 9) as i32 - 4) * 0.25)
+            .collect();
+        let mut graph = IsingGraph::new(h, j, edges);
+        graph.j[0] = 25.0; // 100 units of 250 milli
+        graph.j[1] = -0.25;
+        graph
+    }
+
+    #[test]
+    fn a_scaled_i8_model_matches_the_wide_path() {
+        let graph = scaled_i8_model();
+        assert_eq!(classify(&graph), Ok(Representation::Wide));
+        assert_eq!(
+            batch_i8_scale(&[&graph], Representation::Wide, true),
+            Some(250)
+        );
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let p = SampleParams {
+            num_reads: 64,
+            num_sweeps: 256,
+            seed: 7,
+            ..Default::default()
+        };
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let plan = [(0, 100), (100, 156)];
+            for plan in [None, Some(&plan[..])] {
+                let i8_reads = sample_planned(&dev, &graph, &p, kernel, plan, true).unwrap();
+                let wide_reads = sample_planned(&dev, &graph, &p, kernel, plan, false).unwrap();
+                assert_eq!(i8_reads, wide_reads, "{kernel:?} plan {plan:?}");
+            }
+        }
     }
 
     #[test]
