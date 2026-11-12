@@ -1495,6 +1495,28 @@ mod tests {
     }
 
     #[test]
+    fn the_metal_engine_refuses_float32_coefficients_outside_the_device_range() {
+        let graph = IsingGraph::new(
+            vec![f64::from(f32::MAX) * 2.0, 0.0],
+            vec![1.0],
+            vec![(0, 1)],
+        );
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert_eq!(
+                eligibility(kernel, &graph, &params, config(true, false), &mut facts),
+                [false, false],
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
     fn edge_facts_reject_duplicates_and_self_loops_and_follow_edge_changes() {
         let mut j = job(0);
         let cfg = config(true, true);

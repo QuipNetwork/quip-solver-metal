@@ -6,18 +6,19 @@
 use quip_solver_core::ising_generators::family::BaseTopology;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
 use quip_solver_metal::capacity::{cluster_footprint, ClusterShape, DeviceLimits};
+#[path = "support/cluster_fixture.rs"]
+mod cluster_fixture;
+
+use cluster_fixture::{corner_sharing, Fixture};
 use quip_solver_metal::cluster::{
     GraphError, Model, Motifs, PrepareError, PreparedGraph, SpinError, Weights,
 };
 
-#[derive(Clone)]
-struct Fixture {
-    h: Vec<i32>,
-    edges: Vec<(u32, u32)>,
-    j: Vec<i32>,
-    tiles: Vec<[u32; 4]>,
-    gauges: Vec<[i8; 4]>,
-    pairs: Vec<(u32, u32)>,
+fn limits() -> DeviceLimits {
+    DeviceLimits {
+        memory_bytes: 1 << 30,
+        max_buffer_bytes: 1 << 30,
+    }
 }
 
 impl Fixture {
@@ -26,21 +27,7 @@ impl Fixture {
         weights: Weights,
         limits: &DeviceLimits,
     ) -> Result<PreparedGraph, PrepareError> {
-        PreparedGraph::new(
-            &Model {
-                h_milli: &self.h,
-                edges: &self.edges,
-                j_milli: &self.j,
-            },
-            &Motifs {
-                tiles: &self.tiles,
-                gauges: &self.gauges,
-                pairs: &self.pairs,
-            },
-            weights,
-            limits,
-            3,
-        )
+        self.prepare_with_anneals(weights, limits, 3)
     }
 
     fn direct(&self, spins: &[i8]) -> i64 {
@@ -54,34 +41,6 @@ impl Fixture {
             })
             .sum()
     }
-}
-
-fn limits() -> DeviceLimits {
-    DeviceLimits {
-        memory_bytes: 1 << 30,
-        max_buffer_bytes: 1 << 30,
-    }
-}
-
-// Source: the reviewed CPU tests/otsuka_kernel.rs corner_sharing fixture.
-fn corner_sharing() -> Fixture {
-    let mut f = Fixture {
-        h: vec![0; 8],
-        edges: vec![(0, 4), (5, 7), (1, 5), (2, 6), (1, 4), (6, 7)],
-        j: vec![-1000, -1000, 300, -200, 700, 500],
-        tiles: vec![[0, 1, 2, 3], [3, 4, 5, 6]],
-        gauges: vec![[1, -1, 1, 1], [-1, 1, 1, -1]],
-        pairs: vec![(0, 4), (5, 7)],
-    };
-    for (tile, gauge) in f.tiles.iter().zip(&f.gauges) {
-        for a in 0..4 {
-            for b in a + 1..4 {
-                f.edges.push((tile[a], tile[b]));
-                f.j.push(1000 * i32::from(gauge[a] * gauge[b]));
-            }
-        }
-    }
-    f
 }
 
 fn states(n: usize) -> impl Iterator<Item = Vec<i8>> {

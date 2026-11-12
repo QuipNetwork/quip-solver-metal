@@ -1214,6 +1214,33 @@ mod tests {
     }
 
     #[test]
+    fn batch_key_refuses_float32_coefficients_outside_the_device_range() {
+        let valid = job(
+            b"valid",
+            IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]),
+            16,
+            64,
+            1,
+        );
+        let invalid = job(
+            b"invalid",
+            IsingGraph::new(
+                vec![f64::from(f32::MAX) * 2.0, 0.0],
+                vec![1.0],
+                vec![(0, 1)],
+            ),
+            16,
+            64,
+            1,
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert!(representation(&valid, kernel).is_some(), "{kernel:?}");
+            assert!(representation(&invalid, kernel).is_none(), "{kernel:?}");
+            assert!(!BatchKey::from_job(&valid, kernel).matches(&invalid, kernel));
+        }
+    }
+
+    #[test]
     fn batch_key_groups_msa_jobs_by_path_not_by_coefficients() {
         let ring = |j: f64| {
             IsingGraph::new(

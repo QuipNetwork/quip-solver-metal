@@ -827,6 +827,13 @@ mod tests {
     use super::*;
     use crate::cluster::{Model, Motifs, Weights};
 
+    mod corner_sharing_data {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/corner_sharing.rs"
+        ));
+    }
+
     fn limits() -> DeviceLimits {
         DeviceLimits {
             memory_bytes: 1 << 30,
@@ -945,31 +952,19 @@ mod tests {
         assert!(needed <= limits.usable_bytes(), "{needed} bytes");
     }
 
-    /// The corner-sharing fixture at 250 milli weights, so the residual
-    /// layer holds the soft tile and pair remainders.
+    /// The shared corner-sharing fixture at 250 milli weights.
     fn corner_sharing() -> PreparedGraph {
-        let tiles = [[0, 1, 2, 3], [3, 4, 5, 6]];
-        let gauges = [[1, -1, 1, 1], [-1, 1, 1, -1]];
-        let mut edges = vec![(0, 4), (5, 7), (1, 5), (2, 6), (1, 4), (6, 7)];
-        let mut j = vec![-1000, -1000, 300, -200, 700, 500];
-        for (tile, gauge) in tiles.iter().zip(gauges) {
-            for a in 0..4 {
-                for b in a + 1..4 {
-                    edges.push((tile[a], tile[b]));
-                    j.push(1000 * i32::from(gauge[a] * gauge[b]));
-                }
-            }
-        }
+        let fixture = corner_sharing_data::corner_sharing();
         PreparedGraph::new(
             &Model {
-                h_milli: &[0; 8],
-                edges: &edges,
-                j_milli: &j,
+                h_milli: &fixture.h,
+                edges: &fixture.edges,
+                j_milli: &fixture.j,
             },
             &Motifs {
-                tiles: &tiles,
-                gauges: &gauges,
-                pairs: &[(0, 4), (5, 7)],
+                tiles: &fixture.tiles,
+                gauges: &fixture.gauges,
+                pairs: &fixture.pairs,
             },
             Weights {
                 tile_milli: 250,

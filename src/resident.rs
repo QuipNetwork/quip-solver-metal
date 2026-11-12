@@ -4553,6 +4553,42 @@ mod tests {
     }
 
     #[test]
+    fn fallback_passes_reserved_slot_memory_to_admission() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let (out, mut replies) = tokio::sync::mpsc::channel(1);
+        let input = job(0, 1);
+        run_fallback(
+            &device,
+            input,
+            Origin::Stream,
+            usize::MAX,
+            &out,
+            &Governor,
+            &CancelToken::default(),
+        )
+        .unwrap();
+        let reply = replies.try_recv().unwrap();
+        assert!(matches!(
+            reply.outcome,
+            StreamOutcome::Completed(Err(quip_solver_core::SampleError::Capacity))
+        ));
+        assert_eq!(reply.device_access_time_us, 0);
+    }
+
+    #[test]
     fn cancelling_a_kept_slot_returns_once_and_releases_it() {
         if MetalDevice::device_count() == 0 {
             #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
