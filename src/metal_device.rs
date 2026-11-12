@@ -35,8 +35,21 @@ const WIDE_I8_DEFINE: &str = "#define QUIP_WIDE_I8 1\n";
 /// Prepended to a weighted multi-spin variant whose rows may pass one chunk.
 const MSA_DENSE_DEFINE: &str = "#define QUIP_MSA_DENSE 1\n";
 
+/// Prepended to a weighted multi-spin variant whose spin words spill past
+/// threadgroup memory.
+const MSA_SPILL_DEFINE: &str = "#define QUIP_MSA_SPILL 1\n";
+
 fn msa_dense(source: &str) -> String {
     format!("{MSA_DENSE_DEFINE}{source}")
+}
+
+/// The milli spill build walks rows of any length, as the dense build does.
+fn msa_spill(source: &str) -> String {
+    format!("{MSA_SPILL_DEFINE}{MSA_DENSE_DEFINE}{source}")
+}
+
+fn float_spill(source: &str) -> String {
+    format!("{MSA_SPILL_DEFINE}{FLOAT_DEFINE}{source}")
 }
 
 fn wide_i8(source: &str) -> String {
@@ -125,6 +138,12 @@ pub struct MetalDevice {
     /// It holds `int` coefficients only: the host never stores a dense
     /// batch as `int8_t`, which was the slower storage there.
     pub(crate) msa_weighted_dense: ComputePipelineState,
+    /// `msa_weighted_dense` for a model of more nodes than threadgroup memory
+    /// holds (the `QUIP_MSA_SPILL` build): words past `shared_spins` live in
+    /// device memory. It holds `int` coefficients only.
+    pub(crate) msa_weighted_spill: ComputePipelineState,
+    /// `msa_float` with spin words past `shared_spins` in device memory.
+    pub(crate) msa_float_spill: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -197,6 +216,10 @@ impl MetalDevice {
         let msa_weighted_i8 = compile_pipeline(&device, &wide_i8(MSA_SRC), "msa_anneal_weighted")?;
         let msa_weighted_dense =
             compile_pipeline(&device, &msa_dense(MSA_SRC), "msa_anneal_weighted")?;
+        let msa_weighted_spill =
+            compile_pipeline(&device, &msa_spill(MSA_SRC), "msa_anneal_weighted")?;
+        let msa_float_spill =
+            compile_pipeline(&device, &float_spill(MSA_SRC), "msa_anneal_weighted")?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -224,6 +247,8 @@ impl MetalDevice {
             msa_float,
             msa_weighted_i8,
             msa_weighted_dense,
+            msa_weighted_spill,
+            msa_float_spill,
             msa_slots,
             msa_screen,
             msa_frustration_draw,
@@ -349,6 +374,8 @@ mod tests {
             ("gibbs_parallel_wide_i8", &dev.gibbs_parallel_wide_i8),
             ("msa_weighted_i8", &dev.msa_weighted_i8),
             ("msa_weighted_dense", &dev.msa_weighted_dense),
+            ("msa_weighted_spill", &dev.msa_weighted_spill),
+            ("msa_float_spill", &dev.msa_float_spill),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");
@@ -407,6 +434,8 @@ mod tests {
             &dev.msa_weighted,
             &dev.msa_weighted_i8,
             &dev.msa_weighted_dense,
+            &dev.msa_weighted_spill,
+            &dev.msa_float_spill,
             &dev.msa_float,
             &dev.msa_slots,
             &dev.msa_screen,
@@ -429,6 +458,8 @@ mod tests {
             &dev.msa_weighted,
             &dev.msa_weighted_i8,
             &dev.msa_weighted_dense,
+            &dev.msa_weighted_spill,
+            &dev.msa_float_spill,
             &dev.msa_float,
             &dev.msa_slots,
             &dev.msa_screen,

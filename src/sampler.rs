@@ -210,14 +210,24 @@ const _: () = assert!(
     MSA_MAX_NODES * 4 + MSA_STATIC_TG_BYTES <= APPLE_TG_MEMORY_BYTES,
     "MSA_MAX_NODES spin words must fit in Apple threadgroup memory"
 );
+/// Spin words the weighted multi-spin kernel keeps in threadgroup memory,
+/// `K`: at most [`MSA_MAX_NODES`], at most what `tg_bytes` of threadgroup
+/// memory holds beside the lane totals, and at most `cap`. A model of more
+/// than `K` nodes keeps words `K..N` in device memory (`SplitSpins` in
+/// `kernels/msa.metal`).
+pub(crate) fn msa_shared_spins(tg_bytes: usize, cap: Option<usize>) -> usize {
+    let fits = tg_bytes.saturating_sub(MSA_STATIC_TG_BYTES) / 16 * 4;
+    MSA_MAX_NODES.min(fits).min(cap.unwrap_or(usize::MAX))
+}
+
 /// Largest CSR degree the unit kernel's unrolled 20-neighbour prefetch
 /// admits, and the neighbours per row chunk of the weighted lanes' walk.
 /// Zephyr (Advantage2) is degree 20. A nonzero field is a 21st input, which
 /// the kernel's `popcount21` covers.
 pub(crate) const MSA_UNIT_MAX_DEG: usize = 20;
 /// Largest CSR degree the weighted multi-spin lanes (milli and Float32) walk,
-/// in row chunks of [`MSA_UNIT_MAX_DEG`]: CUDA's sparse `MSA_MAX_DEG`. Above
-/// it only `capacity::Storage::Dense` admits.
+/// in row chunks of [`MSA_UNIT_MAX_DEG`]: CUDA's sparse `MSA_MAX_DEG`. No
+/// multi-spin kernel admits a denser model (`capacity::CapacityError::Degree`).
 pub const MSA_SPARSE_MAX_DEG: usize = 62;
 
 /// Nodes one colour class held per threadgroup step when
@@ -260,13 +270,17 @@ pub(crate) const fn msa_max_degree(rep: Representation) -> usize {
     }
 }
 
-/// The MSA lane a model of `rep` runs on when its CSR rows reach `degree`.
-/// A unit model denser than the unit kernel's [`MSA_UNIT_MAX_DEG`] is a
-/// whole-milli model, so it runs on the weighted lane, which walks rows up
-/// to [`MSA_SPARSE_MAX_DEG`].
-const fn msa_lane(rep: Representation, degree: usize) -> Representation {
+/// The MSA lane a model of `rep` runs on when its CSR rows reach `degree`
+/// over `nodes` nodes. A unit model denser than the unit kernel's
+/// [`MSA_UNIT_MAX_DEG`], or with more nodes than threadgroup memory holds
+/// ([`MSA_MAX_NODES`]), is a whole-milli model, so it runs on the weighted
+/// lane, which walks rows up to [`MSA_SPARSE_MAX_DEG`] and spills spin words
+/// past threadgroup memory.
+const fn msa_lane(rep: Representation, degree: usize, nodes: usize) -> Representation {
     match rep {
-        Representation::Binary if degree > MSA_UNIT_MAX_DEG => Representation::Wide,
+        Representation::Binary if degree > MSA_UNIT_MAX_DEG || nodes > MSA_MAX_NODES => {
+            Representation::Wide
+        }
         other => other,
     }
 }
@@ -416,35 +430,132 @@ fn estimated_updates_per_sec(kernel: Kernel, groups: usize) -> f64 {
     rate * unit * safety
 }
 
+/// One command buffer of an anneal: sweeps `sweep_start..sweep_start +
+/// sweep_count` of each rung in `beta_start..beta_start + beta_count`. A
+/// chunk is either whole rungs (`sweep_start == 0`, `sweep_count ==
+/// sweeps_per_beta`) or a window inside one rung (`beta_count == 1`); only
+/// the weighted multi-spin kernel takes windows.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// First rung.
+    pub beta_start: i32,
+    /// Rungs.
+    pub beta_count: i32,
+    /// First sweep of each rung.
+    pub sweep_start: i32,
+    /// Sweeps of each rung.
+    pub sweep_count: i32,
+}
+
+impl Chunk {
+    /// Whole rungs `beta_start..beta_start + beta_count` of `sweeps_per`
+    /// sweeps each.
+    fn rungs(beta_start: i32, beta_count: i32, sweeps_per: usize) -> Self {
+        Self {
+            beta_start,
+            beta_count,
+            sweep_start: 0,
+            sweep_count: i32::try_from(sweeps_per).unwrap_or(i32::MAX),
+        }
+    }
+}
+
+/// Test settings of the weighted multi-spin kernel. The default is
+/// production behaviour.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MsaTuning {
+    /// Caps `K`, the spin words kept in threadgroup memory
+    /// ([`msa_shared_spins`]).
+    pub shared_spins_cap: Option<usize>,
+    /// Plans chunks at this many updates per second instead of the measured
+    /// rate.
+    pub planning_rate: Option<f64>,
+}
+
 /// Split a beta schedule into chunks whose dispatches each land near
 /// [`TARGET_DISPATCH_MS`].
 ///
-/// Returns `(beta_start, beta_count)` pairs covering `0..num_betas`. One sweep
-/// touches every spin of every sample, so a chunk's cost is
-/// `threads * sweeps_per_beta * betas * N` spin updates.
+/// Returns chunks covering every sweep of `0..num_betas` in order. One sweep
+/// touches every spin of every sample, so a rung's cost is
+/// `threads * sweeps_per_beta * N` spin updates. When `windows` is set and
+/// one rung costs more than a dispatch's budget, each rung splits into
+/// windows of whole sweeps instead. `forced_rate` replaces the measured
+/// update rate, for tests.
 ///
-/// All kernels can resume mid-schedule: `beta_start == 0` initializes, any
-/// other value restores the carry-over state the previous chunk wrote.
+/// All kernels can resume mid-schedule: the first chunk initializes, any
+/// other restores the carry-over state the previous chunk wrote.
 fn chunk_plan(
     kernel: Kernel,
     dims: &BatchDims,
     groups: usize,
     in_flight: usize,
     cost: f64,
-) -> Vec<(i32, i32)> {
+    windows: bool,
+    forced_rate: Option<f64>,
+) -> Vec<Chunk> {
     let num_betas = dims.num_betas.max(1);
-    let per_beta =
-        (dims.num_threads as f64) * (dims.sweeps_per.max(1) as f64) * (dims.n.max(1) as f64) * cost;
-    let betas_per_chunk = dispatch_beta_limit(kernel, per_beta, groups, in_flight, num_betas);
+    let sweeps_per = dims.sweeps_per.max(1);
+    let per_sweep = (dims.num_threads as f64) * (dims.n.max(1) as f64) * cost;
+    let per_beta = per_sweep * sweeps_per as f64;
+    let budget = dispatch_budget(kernel, groups, in_flight, forced_rate);
 
     let mut plan = Vec::new();
+    if windows && sweeps_per > 1 && budget < per_beta.max(1.0) {
+        let sweeps = i32::try_from(sweeps_per).unwrap_or(i32::MAX);
+        let window = units_per_dispatch(budget, per_sweep, sweeps);
+        for beta_start in 0..num_betas {
+            let mut start = 0;
+            while start < sweeps {
+                let count = window.min(sweeps - start);
+                plan.push(Chunk {
+                    beta_start,
+                    beta_count: 1,
+                    sweep_start: start,
+                    sweep_count: count,
+                });
+                start += count;
+            }
+        }
+        return plan;
+    }
+    let betas_per_chunk = units_per_dispatch(budget, per_beta, num_betas);
     let mut start = 0;
     while start < num_betas {
         let count = betas_per_chunk.min(num_betas - start);
-        plan.push((start, count));
+        plan.push(Chunk::rungs(start, count, sweeps_per));
         start += count;
     }
     plan
+}
+
+/// Updates one dispatch may run: [`TARGET_DISPATCH_MS`] at the estimated
+/// rate, or at `forced_rate` when set.
+fn dispatch_budget(
+    kernel: Kernel,
+    groups: usize,
+    in_flight: usize,
+    forced_rate: Option<f64>,
+) -> f64 {
+    // Concurrent batches share the aggregate rate at their combined occupancy.
+    // Reserve the full stream window even while priming or draining it.
+    let in_flight = in_flight.max(1);
+    let rate = forced_rate.unwrap_or_else(|| {
+        estimated_updates_per_sec(kernel, groups.saturating_mul(in_flight)) / in_flight as f64
+    });
+    TARGET_DISPATCH_MS / 1000.0 * rate
+}
+
+/// Whole units of `per_unit` updates that fit `budget`, in `1..=max`.
+fn units_per_dispatch(budget: f64, per_unit: f64, max: i32) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to 1..=max immediately below"
+    )]
+    let limit =
+        ((budget / per_unit.max(1.0)).floor() as i64).clamp(1, i64::from(max.max(1))) as i32;
+    limit
 }
 
 fn dispatch_beta_limit(
@@ -454,18 +565,11 @@ fn dispatch_beta_limit(
     in_flight: usize,
     num_betas: i32,
 ) -> i32 {
-    // Concurrent batches share the aggregate rate at their combined occupancy.
-    // Reserve the full stream window even while priming or draining it.
-    let in_flight = in_flight.max(1);
-    let rate =
-        estimated_updates_per_sec(kernel, groups.saturating_mul(in_flight)) / in_flight as f64;
-    let budget = TARGET_DISPATCH_MS / 1000.0 * rate;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "clamped to 1..=num_betas immediately below"
-    )]
-    let limit = ((budget / per_beta.max(1.0)).floor() as i64).clamp(1, i64::from(num_betas)) as i32;
-    limit
+    units_per_dispatch(
+        dispatch_budget(kernel, groups, in_flight, None),
+        per_beta,
+        num_betas,
+    )
 }
 
 /// Bound slot commands with the batch estimate, reserving both resident pools.
@@ -525,7 +629,9 @@ fn msa_four_color() -> bool {
         .get_or_init(|| four_color_from(std::env::var("QUIP_METAL_MSA_FOUR_COLOR").ok().as_deref()))
 }
 
-/// Largest `N` the kernel's fixed-size arrays admit.
+/// Largest `N` the kernel's fixed-size arrays admit. For MSA this is the
+/// threadgroup cap that the resident, streaming, and combined paths route
+/// by; the batch path admits more nodes on the weighted lane, which spills.
 pub(crate) fn kernel_max_nodes(kernel: Kernel) -> usize {
     match kernel {
         Kernel::Sa => SA_MAX_NODES,
@@ -648,7 +754,7 @@ impl TopologyCache {
         device: &crate::metal_device::MetalDevice,
         graph: &IsingGraph,
         four_color: bool,
-    ) -> std::sync::Arc<CachedTopology> {
+    ) -> Result<std::sync::Arc<CachedTopology>, SampleError> {
         let mut slot = self
             .slot
             .lock()
@@ -658,12 +764,12 @@ impl TopologyCache {
                 && entry.four_color == four_color
                 && entry.edges == graph.edges
             {
-                return std::sync::Arc::clone(entry);
+                return Ok(std::sync::Arc::clone(entry));
             }
         }
-        let cached = std::sync::Arc::new(build_cached_topology(device, graph, four_color));
+        let cached = std::sync::Arc::new(build_cached_topology(device, graph, four_color)?);
         *slot = Some(std::sync::Arc::clone(&cached));
-        cached
+        Ok(cached)
     }
 }
 
@@ -671,7 +777,7 @@ fn build_cached_topology(
     device: &crate::metal_device::MetalDevice,
     graph: &IsingGraph,
     four_color: bool,
-) -> CachedTopology {
+) -> Result<CachedTopology, SampleError> {
     let topo = if four_color {
         SelfFeedingTopology::build_with_advantage2_coloring(graph)
     } else {
@@ -679,8 +785,8 @@ fn build_cached_topology(
     };
     let colors = [&topo.colors.starts, &topo.colors.counts, &topo.colors.nodes]
         .into_iter()
-        .map(|values| device.new_buffer_from_slice(&pad_i32(values)))
-        .collect();
+        .map(|values| checked_buffer(device.new_buffer_from_slice(&pad_i32(values))))
+        .collect::<Result<_, _>>()?;
     let zero = [0i32];
     let base_row: &[i32] = if topo.row_ptr.is_empty() {
         &zero
@@ -688,9 +794,9 @@ fn build_cached_topology(
         &topo.row_ptr
     };
     let base_col: &[i32] = if topo.nnz == 0 { &zero } else { &topo.col_ind };
-    let row = device.new_buffer_from_slice(base_row);
-    let col = device.new_buffer_from_slice(base_col);
-    CachedTopology {
+    let row = checked_buffer(device.new_buffer_from_slice(base_row))?;
+    let col = checked_buffer(device.new_buffer_from_slice(base_col))?;
+    Ok(CachedTopology {
         n: graph.num_nodes(),
         edges: std::sync::Arc::clone(&graph.edges),
         four_color,
@@ -698,7 +804,7 @@ fn build_cached_topology(
         colors,
         row,
         col,
-    }
+    })
 }
 
 /// Free shared-storage buffers for later multi-spin batches. At most 64.
@@ -708,15 +814,10 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
-    /// Smallest free buffer with `len <= length <= 2 * len`, else a new shared buffer.
-    pub(crate) fn take(&self, device: &metal::DeviceRef, len: u64) -> metal::Buffer {
-        self.take_free(len)
-            .unwrap_or_else(|| device.new_buffer(len, metal::MTLResourceOptions::StorageModeShared))
-    }
-
-    /// [`Self::take`], refusing as a capacity error when the device cannot
-    /// allocate a new buffer.
-    pub(crate) fn try_take(
+    /// Smallest free buffer with `len <= length <= 2 * len`, else a new
+    /// shared buffer, refusing as a capacity error when the device cannot
+    /// allocate one.
+    pub(crate) fn take(
         &self,
         device: &metal::DeviceRef,
         len: u64,
@@ -770,7 +871,7 @@ fn pooled_from_slice<T: Copy>(
 ) -> Result<metal::Buffer, SampleError> {
     let bytes = std::mem::size_of_val(data);
     if bytes == 0 {
-        let buf = pool.try_take(device, 4)?;
+        let buf = pool.take(device, 4)?;
         // SAFETY: `take(4)` returns StorageModeShared storage of at least 4
         // bytes, so `contents()` maps those bytes on the host. The write stays
         // inside that mapping.
@@ -779,7 +880,7 @@ fn pooled_from_slice<T: Copy>(
         }
         return Ok(buf);
     }
-    let buf = pool.try_take(device, bytes as u64)?;
+    let buf = pool.take(device, bytes as u64)?;
     // SAFETY: `take` returns StorageModeShared storage of at least `bytes`
     // bytes, so `contents()` is a non-null host mapping of that many bytes.
     // `data` is a separate allocation and cannot overlap the mapping.
@@ -829,7 +930,7 @@ pub(crate) struct EncodedBatch {
     num_colors: i32,
     groups: usize,
     threads_per_group: usize,
-    plan: Vec<(i32, i32)>,
+    plan: Vec<Chunk>,
     /// Retains the topology buffers after a later miss replaces the device slot.
     #[expect(
         dead_code,
@@ -854,12 +955,12 @@ impl EncodedBatch {
         {
             return false;
         }
-        let Some(&(beta_start, beta_count)) = self.plan.get(self.cmds.len()) else {
+        let Some(&chunk) = self.plan.get(self.cmds.len()) else {
             return false;
         };
         let cmd = self.queue.new_command_buffer().to_owned();
         let encoder = cmd.new_compute_command_encoder();
-        self.encode_chunk(encoder, beta_start, beta_count);
+        self.encode_chunk(encoder, chunk);
         encoder.end_encoding();
         if cancelled() {
             return false;
@@ -869,12 +970,13 @@ impl EncodedBatch {
         true
     }
 
-    fn encode_chunk(
-        &self,
-        encoder: &metal::ComputeCommandEncoderRef,
-        beta_start: i32,
-        beta_count: i32,
-    ) {
+    fn encode_chunk(&self, encoder: &metal::ComputeCommandEncoderRef, chunk: Chunk) {
+        let Chunk {
+            beta_start,
+            beta_count,
+            sweep_start,
+            sweep_count,
+        } = chunk;
         encoder.set_compute_pipeline_state(&self.pipeline);
         bind_shared_args(encoder, &self.inputs, &self.out, &self.dims);
         match &self.kstate {
@@ -889,10 +991,16 @@ impl EncodedBatch {
                 persist,
                 words,
                 state_bytes,
+                shared_spins,
             } => {
                 self.bind_colors(encoder, *words);
                 bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
                 encoder.set_threadgroup_memory_length(0, *state_bytes);
+                if let Some(shared) = shared_spins {
+                    set_bytes_i32(encoder, 27, *shared);
+                    set_bytes_i32(encoder, 28, sweep_start);
+                    set_bytes_i32(encoder, 29, sweep_count);
+                }
             }
         }
         if let Some((index, rows)) = &self.wide_rows {
@@ -1279,7 +1387,12 @@ fn validate_batch_within<'a>(
         ));
     };
     let n = first.num_nodes();
-    let cap = kernel_max_nodes(kernel);
+    // The weighted multi-spin lane spills spin words past threadgroup
+    // memory, so the capacity footprint below bounds an MSA model instead.
+    let cap = match kernel {
+        Kernel::Msa => crate::capacity::MAX_NODES,
+        Kernel::Sa | Kernel::Gibbs => kernel_max_nodes(kernel),
+    };
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
         // before the sampler; this catches drift before it overruns the
@@ -1306,7 +1419,7 @@ fn validate_batch_within<'a>(
         // not a driver fault: the coordinator routes the job to a backend
         // that walks CSR rows of any length.
         let max_deg = max_csr_degree(first);
-        rep = msa_lane(rep, max_deg);
+        rep = msa_lane(rep, max_deg, n);
         let budget = msa_max_degree(rep);
         if max_deg > budget {
             return Err(SampleError::TooLarge(format!(
@@ -1388,10 +1501,12 @@ pub fn model_footprint(
     let mut dense_rows = false;
     if kernel == Kernel::Msa {
         let degree = max_csr_degree(graph);
-        rep = msa_lane(rep, degree);
+        rep = msa_lane(rep, degree, graph.num_nodes());
         dense_rows = degree > MSA_UNIT_MAX_DEG;
     }
-    let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows);
+    // A model past the default `K` runs the spill build on `int` storage.
+    let past_k = kernel == Kernel::Msa && graph.num_nodes() > MSA_MAX_NODES;
+    let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows && !past_k);
     shape_footprint(
         graph,
         params,
@@ -1640,8 +1755,8 @@ fn new_msa_persistent(
 ) -> Result<[metal::Buffer; 2], SampleError> {
     const RNG_BYTES_PER_STREAM: usize = 16;
     Ok([
-        pool.try_take(device, (num_streams * n.max(1) * 4) as u64)?,
-        pool.try_take(
+        pool.take(device, (num_streams * n.max(1) * 4) as u64)?,
+        pool.take(
             device,
             (num_streams * threads_per_group.max(1) * RNG_BYTES_PER_STREAM) as u64,
         )?,
@@ -1662,9 +1777,13 @@ enum KernelEncode {
         persist: [metal::Buffer; 2],
         /// Words per problem, bound at slot 19.
         words: i32,
-        /// Bytes of `threadgroup uint state[N]` at threadgroup index 0,
-        /// rounded up to Metal's 16-byte granularity.
+        /// Bytes of `threadgroup uint state[min(N, K)]` at threadgroup
+        /// index 0, rounded up to Metal's 16-byte granularity.
         state_bytes: u64,
+        /// `K` of the weighted entry (`msa_anneal_weighted`), bound at slot
+        /// 27 with the sweep window at 28 and 29; `None` for the unit entry,
+        /// which takes neither.
+        shared_spins: Option<i32>,
     },
 }
 
@@ -1740,14 +1859,16 @@ fn encode_batch_inner(
         plan_override,
         beta_override,
         true,
+        MsaTuning::default(),
     )
 }
 
 /// [`encode_batch_inner`] with `wide_i8` false forcing every wide batch onto
-/// plain `int` coefficients, so tests compare the two storages.
+/// plain `int` coefficients, so tests compare the two storages, and with the
+/// weighted multi-spin kernel's test `tuning`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "encode_batch_inner's arguments plus the storage switch"
+    reason = "encode_batch_inner's arguments plus the storage switch and tuning"
 )]
 fn encode_batch_storage(
     device: &crate::metal_device::MetalDevice,
@@ -1758,14 +1879,27 @@ fn encode_batch_storage(
     plan_override: Option<&[(i32, i32)]>,
     beta_override: Option<Vec<f32>>,
     wide_i8: bool,
+    tuning: MsaTuning,
 ) -> Result<EncodedBatch, SampleError> {
+    // `K`, the spin words the weighted multi-spin kernel keeps in threadgroup
+    // memory. A model past it runs the spill build, which holds `int`
+    // coefficients only, as the dense build does.
+    let tg_limit = device.device.max_threadgroup_memory_length() as usize;
+    let k = msa_shared_spins(tg_limit, tuning.shared_spins_cap);
+    let past_k = kernel == Kernel::Msa && graphs.first().is_some_and(|g| g.num_nodes() > k);
     let ValidBatch {
         first,
         n,
         rep,
         i8_scale,
         dense_rows,
-    } = validate_batch_within(graphs, params, kernel, host_device_limits(), wide_i8)?;
+    } = validate_batch_within(
+        graphs,
+        params,
+        kernel,
+        host_device_limits(),
+        wide_i8 && !past_k,
+    )?;
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -1822,8 +1956,11 @@ fn encode_batch_storage(
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
     // A milli model with a row past one chunk takes the weighted lane's dense
     // build, on `int` storage; the default build keeps the one-chunk code
-    // alone.
+    // alone. A weighted model past `K` takes the spill build, whose milli
+    // variant also walks dense rows.
     let pipeline = match kernel {
+        Kernel::Msa if wide && past_k => &device.msa_weighted_spill,
+        Kernel::Msa if float && past_k => &device.msa_float_spill,
         Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
         Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
         Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
@@ -1902,13 +2039,26 @@ fn encode_batch_storage(
     };
 
     // The multi-spin kernel's spin words live in threadgroup memory sized per
-    // dispatch. Refuse a job the opened device cannot hold rather than let
-    // Metal fail the command buffer, which would end the session as a
-    // DeviceFault for a per-job size problem.
-    let state_bytes = (n.max(1) * 4).div_ceil(16) * 16;
+    // dispatch; the weighted entry keeps the first `K` there and the rest in
+    // its persistent state. Refuse a job the opened device cannot hold rather
+    // than let Metal fail the command buffer, which would end the session as
+    // a DeviceFault for a per-job size problem.
+    let weighted_msa = kernel == Kernel::Msa && (wide || float);
+    let shared_spins = weighted_msa.then_some(k);
+    let state_bytes = (shared_spins.map_or(n, |k| k.min(n)).max(1) * 4).div_ceil(16) * 16;
     if kernel == Kernel::Msa {
+        // The kernel indexes each threadgroup's persistent words as
+        // `threadgroup * N` in 32 bits.
+        if groups
+            .checked_mul(n.max(1))
+            .is_none_or(|words| words > u32::MAX as usize)
+        {
+            return Err(SampleError::TooLarge(format!(
+                "{groups} multi-spin threadgroups of {n} spin words exceed 32-bit indexing"
+            )));
+        }
         let need = state_bytes + MSA_STATIC_TG_BYTES;
-        let have = device.device.max_threadgroup_memory_length() as usize;
+        let have = tg_limit;
         if need > have {
             return Err(SampleError::TooLarge(format!(
                 "graph N={n} needs {need} B of threadgroup memory; device offers {have} B"
@@ -1920,7 +2070,7 @@ fn encode_batch_storage(
         device,
         first,
         kernel == Kernel::Msa && msa_four_color(),
-    );
+    )?;
     let inputs = upload_inputs(device, &cached, graphs, kernel, rep, i8_scale)?;
 
     let cost = match (rep, kernel) {
@@ -1949,8 +2099,19 @@ fn encode_batch_storage(
         (Representation::Binary | Representation::Int8, _) => 1.0,
     };
     let plan = match plan_override {
-        Some(p) => p.to_vec(),
-        None => chunk_plan(kernel, &dims, groups, in_flight, cost),
+        Some(p) => p
+            .iter()
+            .map(|&(start, count)| Chunk::rungs(start, count, sweeps_per))
+            .collect(),
+        None => chunk_plan(
+            kernel,
+            &dims,
+            groups,
+            in_flight,
+            cost,
+            weighted_msa,
+            tuning.planning_rate,
+        ),
     };
     let mut pooled = Vec::new();
     let (out, kstate) = match kernel {
@@ -1985,10 +2146,10 @@ fn encode_batch_storage(
             // every read's bytes are packed), so pooled buffers need no zeroing.
             let samples = device
                 .buffer_pool
-                .try_take(&device.device, (num_samples * packed_size) as u64)?;
+                .take(&device.device, (num_samples * packed_size) as u64)?;
             let energies = device
                 .buffer_pool
-                .try_take(&device.device, (num_samples * 4) as u64)?;
+                .take(&device.device, (num_samples * 4) as u64)?;
             let persist = new_msa_persistent(
                 &device.buffer_pool,
                 &device.device,
@@ -2015,6 +2176,7 @@ fn encode_batch_storage(
                     persist,
                     words: words as i32,
                     state_bytes: state_bytes as u64,
+                    shared_spins: shared_spins.map(|k| i32::try_from(k).unwrap_or(i32::MAX)),
                 },
             )
         }
@@ -2246,6 +2408,38 @@ pub fn sample_ising_chunked(
     sample_planned(device, graph, params, kernel, Some(&plan), true)
 }
 
+/// The reads of [`sample_ising_tuned`] and how its anneal was split.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TunedRun {
+    /// The reads, as [`sample_ising`] returns them.
+    pub reads: Vec<SamplerResult>,
+    /// The command buffers, in order.
+    pub plan: Vec<Chunk>,
+    /// GPU time of the longest command buffer, microseconds.
+    pub max_chunk_us: u64,
+    /// GPU time of every command buffer together, microseconds.
+    pub gpu_time_us: u64,
+}
+
+/// [`sample_ising`] with the weighted multi-spin kernel's test `tuning`, so
+/// tests can compare a spilled or windowed anneal with a plain one of the
+/// same seed.
+///
+/// # Errors
+///
+/// The same as [`sample_ising`].
+#[doc(hidden)]
+pub fn sample_ising_tuned(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    tuning: MsaTuning,
+) -> Result<TunedRun, SampleError> {
+    run_planned(device, graph, params, kernel, None, true, tuning)
+}
+
 /// One problem through [`encode_batch_inner`], committed chunk by chunk and
 /// harvested. A zero-node graph returns empty reads without the GPU.
 fn sample_planned(
@@ -2256,17 +2450,54 @@ fn sample_planned(
     plan: Option<&[(i32, i32)]>,
     wide_i8: bool,
 ) -> Result<Vec<SamplerResult>, SampleError> {
+    run_planned(
+        device,
+        graph,
+        params,
+        kernel,
+        plan,
+        wide_i8,
+        MsaTuning::default(),
+    )
+    .map(|run| run.reads)
+}
+
+/// [`sample_planned`] with `tuning`, returning the chunk plan and timings.
+fn run_planned(
+    device: &crate::metal_device::MetalDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: Kernel,
+    plan: Option<&[(i32, i32)]>,
+    wide_i8: bool,
+    tuning: MsaTuning,
+) -> Result<TunedRun, SampleError> {
     if graph.num_nodes() == 0 {
         let reads = params.num_reads.max(1);
-        return Ok((0..reads)
-            .map(|_| SamplerResult {
-                spins: vec![],
-                energy_milli: 0,
-            })
-            .collect());
+        return Ok(TunedRun {
+            reads: (0..reads)
+                .map(|_| SamplerResult {
+                    spins: vec![],
+                    energy_milli: 0,
+                })
+                .collect(),
+            plan: Vec::new(),
+            max_chunk_us: 0,
+            gpu_time_us: 0,
+        });
     }
 
-    let mut batch = encode_batch_storage(device, &[graph], params, kernel, 1, plan, None, wide_i8)?;
+    let mut batch = encode_batch_storage(
+        device,
+        &[graph],
+        params,
+        kernel,
+        1,
+        plan,
+        None,
+        wide_i8,
+        tuning,
+    )?;
     while batch.commit_next(|| false) {
         batch.wait_until_completed();
     }
@@ -2287,7 +2518,12 @@ fn sample_planned(
     // `streaming::finish_batch` does on the batched path, so neither path can
     // return more solutions than the job requested.
     samples.truncate(params.num_reads.max(1));
-    Ok(samples)
+    Ok(TunedRun {
+        reads: samples,
+        plan: batch.plan.clone(),
+        max_chunk_us: batch.max_chunk_us(),
+        gpu_time_us: batch.gpu_time_us(),
+    })
 }
 
 fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleError> {
@@ -3048,6 +3284,42 @@ mod tests {
     }
 
     #[test]
+    fn msa_shared_spins_is_at_most_the_threadgroup_cap() {
+        assert_eq!(msa_shared_spins(32 * 1024, None), MSA_MAX_NODES);
+        assert_eq!(msa_shared_spins(64 * 1024, None), 6016);
+        assert_eq!(msa_shared_spins(32 * 1024, Some(1_000)), 1_000);
+        assert_eq!(msa_shared_spins(32 * 1024, Some(0)), 0);
+        // 16 KB holds (16,384 - 128) / 4 = 4,064 words, a multiple of four.
+        assert_eq!(msa_shared_spins(16 * 1024, None), 4_064);
+        assert_eq!(msa_shared_spins(0, None), 0);
+    }
+
+    #[test]
+    fn a_unit_model_past_threadgroup_memory_takes_the_weighted_lane() {
+        let unit = Representation::Binary;
+        assert_eq!(msa_lane(unit, 20, MSA_MAX_NODES), unit);
+        assert_eq!(msa_lane(unit, 20, MSA_MAX_NODES + 1), Representation::Wide);
+        assert_eq!(msa_lane(unit, 21, 100), Representation::Wide);
+        assert_eq!(
+            msa_lane(Representation::Float32, 20, 200_000),
+            Representation::Float32
+        );
+    }
+
+    #[test]
+    fn validate_batch_admits_a_weighted_msa_model_past_threadgroup_memory() {
+        let n = MSA_MAX_NODES + 1;
+        let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        let unit = IsingGraph::new(vec![0.0; n], vec![1.0; n], edges.clone());
+        let (_, _, rep) = validate_batch(&[&unit], &params(64), Kernel::Msa).unwrap();
+        assert_eq!(rep, Representation::Wide);
+        let weighted = IsingGraph::new(vec![0.0; n], vec![1.5; n], edges);
+        validate_batch(&[&weighted], &params(64), Kernel::Msa).unwrap();
+        // The unit kernels' node cap still gates SA and Gibbs.
+        validate_batch(&[&unit], &params(64), Kernel::Gibbs).unwrap_err();
+    }
+
+    #[test]
     fn float_msa_plans_by_row_chunks_and_colour_steps() {
         assert_eq!(msa_row_chunks(0), 1);
         assert_eq!(msa_row_chunks(MSA_UNIT_MAX_DEG), 1);
@@ -3140,8 +3412,18 @@ mod tests {
             let (_, _, rep) = validate_batch(&[graph], &p, Kernel::Msa).unwrap();
             assert_eq!(rep, Representation::Wide);
             assert!(batch_wide_i8_scale(&[graph]).is_some());
-            let batch =
-                encode_batch_storage(&dev, &[graph], &p, Kernel::Msa, 1, None, None, true).unwrap();
+            let batch = encode_batch_storage(
+                &dev,
+                &[graph],
+                &p,
+                Kernel::Msa,
+                1,
+                None,
+                None,
+                true,
+                MsaTuning::default(),
+            )
+            .unwrap();
             assert!(
                 batch.coef_scale.is_none(),
                 "a dense batch takes int storage"
@@ -3260,10 +3542,30 @@ mod tests {
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
             // The i8 side binds the scale and the i8 pipeline; the forced
             // side binds neither.
-            let narrow =
-                encode_batch_storage(&dev, &[&graph], &p, kernel, 1, None, None, true).unwrap();
-            let plain =
-                encode_batch_storage(&dev, &[&graph], &p, kernel, 1, None, None, false).unwrap();
+            let narrow = encode_batch_storage(
+                &dev,
+                &[&graph],
+                &p,
+                kernel,
+                1,
+                None,
+                None,
+                true,
+                MsaTuning::default(),
+            )
+            .unwrap();
+            let plain = encode_batch_storage(
+                &dev,
+                &[&graph],
+                &p,
+                kernel,
+                1,
+                None,
+                None,
+                false,
+                MsaTuning::default(),
+            )
+            .unwrap();
             assert_eq!(
                 narrow.coef_scale.map(|(_, scale)| scale),
                 Some(250),
@@ -3289,20 +3591,23 @@ mod tests {
         let mut a2 = chain(50);
         a2.j[0] = -a2.j[0]; // same topology, different couplings
         let b = ring();
-        let first = dev.topology_cache.get_or_build(&dev, &a, false);
-        let again = dev.topology_cache.get_or_build(&dev, &a2, false);
+        let first = dev.topology_cache.get_or_build(&dev, &a, false).unwrap();
+        let again = dev.topology_cache.get_or_build(&dev, &a2, false).unwrap();
         assert!(std::sync::Arc::ptr_eq(&first, &again));
         // Same node count, one edge moved: the cache must rebuild.
         let mut moved = chain(50);
         let mut edges = moved.edges.to_vec();
         edges[0] = (0, 2);
         moved.edges = edges.into();
-        let rewired = dev.topology_cache.get_or_build(&dev, &moved, false);
+        let rewired = dev
+            .topology_cache
+            .get_or_build(&dev, &moved, false)
+            .unwrap();
         assert!(!std::sync::Arc::ptr_eq(&first, &rewired));
-        let other = dev.topology_cache.get_or_build(&dev, &b, false);
+        let other = dev.topology_cache.get_or_build(&dev, &b, false).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&first, &other));
         assert_eq!(other.n, b.num_nodes());
-        let colored = dev.topology_cache.get_or_build(&dev, &b, true);
+        let colored = dev.topology_cache.get_or_build(&dev, &b, true).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&other, &colored));
     }
 
@@ -3313,12 +3618,12 @@ mod tests {
         }
         let dev = crate::metal_device::MetalDevice::open(0).unwrap();
         let pool = BufferPool::default();
-        let a = pool.take(&dev.device, 4096);
+        let a = pool.take(&dev.device, 4096).unwrap();
         let ptr = a.contents();
         pool.give(a);
-        let b = pool.take(&dev.device, 3000);
+        let b = pool.take(&dev.device, 3000).unwrap();
         assert_eq!(b.contents(), ptr);
-        let c = pool.take(&dev.device, 100_000);
+        let c = pool.take(&dev.device, 100_000).unwrap();
         assert!(c.length() >= 100_000);
     }
 
@@ -3433,8 +3738,8 @@ mod tests {
                 packed_size: 573,
             };
             let groups = cores * 1024;
-            let solo = chunk_plan(kernel, &dims, groups, 1, 1.0)[0].1;
-            let shared = chunk_plan(kernel, &dims, groups, 2, 1.0)[0].1;
+            let solo = chunk_plan(kernel, &dims, groups, 1, 1.0, false, None)[0].beta_count;
+            let shared = chunk_plan(kernel, &dims, groups, 2, 1.0, false, None)[0].beta_count;
             assert_eq!(shared, (solo / 2).max(1), "{kernel:?}");
         }
     }
@@ -3457,7 +3762,8 @@ mod tests {
                     let limit = msa_step_limit(n, groups, slice);
                     assert_eq!(
                         limit,
-                        chunk_plan(Kernel::Msa, &dims, groups, 2, 1.0)[0].1 as usize
+                        chunk_plan(Kernel::Msa, &dims, groups, 2, 1.0, false, None)[0].beta_count
+                            as usize
                     );
                     assert!((1..=slice.min(MAX_SWEEPS)).contains(&limit));
                     let work = limit as f64 * groups as f64 * n as f64;
@@ -3795,8 +4101,9 @@ mod tests {
             prop_assert_eq!(got.spins, spins);
         }
 
-        /// `chunk_plan` covers `0..num_betas.max(1)` with positive counts and
-        /// no gaps; chunk sizes never under/overflow the schedule.
+        /// `chunk_plan` covers every sweep of `0..num_betas.max(1)` in order
+        /// with positive counts and no gaps; chunk sizes never under/overflow
+        /// the schedule, and a window stays inside one rung.
         ///
         /// Inputs are plain Debug scalars (BatchDims has no Debug derive; we
         /// must not change non-test code).
@@ -3809,6 +4116,8 @@ mod tests {
             num_threads in 0usize..=1024,
             groups in 1usize..=512,
             in_flight in 0usize..=4,
+            windows in proptest::bool::ANY,
+            forced_rate in prop_oneof![Just(None), (1.0f64..1e9).prop_map(Some)],
         ) {
             let dims = BatchDims {
                 n,
@@ -3820,22 +4129,36 @@ mod tests {
                 num_reads: 1,
                 packed_size: 0,
             };
-            let plan = chunk_plan(kernel, &dims, groups, in_flight, 1.0);
+            let plan = chunk_plan(kernel, &dims, groups, in_flight, 1.0, windows, forced_rate);
             let cover = dims.num_betas.max(1);
+            let sweeps = sweeps_per.max(1) as i32;
             prop_assert!(!plan.is_empty());
-            let mut cursor = 0i32;
-            for &(start, count) in &plan {
-                prop_assert_eq!(start, cursor, "gap or overlap at start={}", start);
+            // (rung, sweep) of the next sweep the plan must start at.
+            let mut cursor = (0i32, 0i32);
+            for chunk in &plan {
+                let (start, count) = (chunk.beta_start, chunk.beta_count);
+                prop_assert_eq!((start, chunk.sweep_start), cursor, "gap or overlap at {:?}", chunk);
                 prop_assert!(count > 0, "zero-length chunk at start={}", start);
+                prop_assert!(chunk.sweep_count > 0, "zero-sweep chunk {:?}", chunk);
                 prop_assert!(
                     start.checked_add(count).is_some(),
                     "start+count overflows i32: start={} count={}",
                     start,
                     count
                 );
-                cursor = start + count;
+                let end = chunk.sweep_start + chunk.sweep_count;
+                prop_assert!(end <= sweeps, "window past its rung: {:?}", chunk);
+                if end < sweeps || chunk.sweep_start > 0 {
+                    prop_assert!(windows, "a window without windows: {:?}", chunk);
+                    prop_assert_eq!(count, 1, "a window spans rungs: {:?}", chunk);
+                }
+                cursor = if end == sweeps {
+                    (start + count, 0)
+                } else {
+                    (start, end)
+                };
             }
-            prop_assert_eq!(cursor, cover, "plan does not cover full schedule");
+            prop_assert_eq!(cursor, (cover, 0), "plan does not cover full schedule");
         }
     }
 }

@@ -300,7 +300,7 @@ impl SlotPool {
                 "slot pool needs {need} B of threadgroup memory"
             )));
         }
-        let cached = device.topology_cache.get_or_build(device, graph, true);
+        let cached = device.topology_cache.get_or_build(device, graph, true)?;
         let words = num_reads.div_ceil(sampler::MSA_LANES);
         let threads = MSA_THREADS
             .min(device.msa_slots.max_total_threads_per_threadgroup() as usize)
@@ -328,8 +328,8 @@ impl SlotPool {
         ];
         let buffers = sizes
             .into_iter()
-            .map(|(index, bytes)| (index, device.buffer_pool.take(&device.device, bytes)))
-            .collect();
+            .map(|(index, bytes)| Ok((index, device.buffer_pool.take(&device.device, bytes)?)))
+            .collect::<Result<_, SampleError>>()?;
         Ok(Self {
             decode,
             cached,

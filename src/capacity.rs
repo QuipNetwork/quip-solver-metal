@@ -14,12 +14,14 @@
 //!   at most [`MSA_UNIT_MAX_DEG`] on the unit lane, or [`MSA_SPARSE_MAX_DEG`]
 //!   on the weighted lanes. The sizes come from the buffers that
 //!   `sampler::encode_batch` allocates.
-//! - [`Storage::Spill`]: the threadgroup-tier buffers, plus a device buffer
-//!   for the spin state of the nodes past the threadgroup cap. This kernel
-//!   does not exist yet; the formulas follow the intended layout and later
-//!   tasks correct them.
-//! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. Also not
-//!   yet implemented.
+//! - [`Storage::Spill`]: spin state past the threadgroup cap lives in device
+//!   memory. The weighted multi-spin kernel keeps it in the carry-over
+//!   buffer the threadgroup tier already counts, so the tier allocates the
+//!   same buffers. SA and Gibbs have no spill kernel yet; their formulas
+//!   follow the intended layout and later tasks correct them.
+//! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. Not yet
+//!   implemented, and no multi-spin model is admitted to it until a dense
+//!   multi-spin kernel exists.
 //!
 //! Every formula sits in one small function per kernel, so a later task can
 //! correct one without touching the routing.
@@ -318,7 +320,9 @@ fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
                 && (kernel != Kernel::Msa || shape.max_degree <= msa_degree)
         }
         Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEG,
-        Storage::Dense => true,
+        // No dense multi-spin kernel exists, so MSA refuses this tier and a
+        // model past the sparse degree is a `CapacityError::Degree`.
+        Storage::Dense => kernel != Kernel::Msa,
     }
 }
 
@@ -421,12 +425,12 @@ fn threadgroup_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     }
 }
 
-/// Spill-tier sizes. The spill kernel keeps the spin state of the
-/// `nodes - K` nodes past the threadgroup cap `K` in device memory. That
-/// state is the carry-over buffers the threadgroup tier already counts (they
-/// hold every node's state), so the spill tier allocates the same buffers
-/// and adds none. This kernel does not exist yet; a later task corrects this
-/// when its layout is known.
+/// Spill-tier sizes. The weighted multi-spin kernel keeps the words of the
+/// `nodes - K` nodes past its threadgroup cap `K` in their slots of the
+/// carry-over buffer (`persistent_state`, one `uint` per word and spin),
+/// which the threadgroup tier already counts, so the spill tier allocates
+/// the same buffers and adds none (`sampler::encode_batch_storage`). SA and
+/// Gibbs have no spill kernel yet and are sized the same way.
 fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     threadgroup_sizes(kernel, shape)
 }
@@ -772,7 +776,7 @@ mod tests {
 
     #[test]
     fn a_complete_model_routes_to_dense() {
-        for kernel in KERNELS {
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
             let fp = footprint(kernel, &complete_shape(), &ROOMY).unwrap();
             assert_eq!(fp.storage, Storage::Dense, "{kernel:?}");
         }
@@ -807,16 +811,34 @@ mod tests {
     }
 
     #[test]
-    fn msa_above_sparse_degree_admits_only_dense() {
+    fn msa_above_sparse_degree_is_refused() {
         let mut shape = sparse_shape();
         shape.max_degree = MSA_SPARSE_MAX_DEG + 1;
         shape.nodes = 1_000;
         shape.edges = 40_000;
-        let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
-        assert_eq!(fp.storage, Storage::Dense);
+        assert_eq!(
+            footprint(Kernel::Msa, &shape, &ROOMY),
+            Err(CapacityError::Degree {
+                max: MSA_SPARSE_MAX_DEG
+            })
+        );
+        assert_eq!(
+            footprint(Kernel::Msa, &complete_shape(), &ROOMY),
+            Err(CapacityError::Degree {
+                max: MSA_SPARSE_MAX_DEG
+            })
+        );
         shape.max_degree = MSA_SPARSE_MAX_DEG;
         let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
         assert_ne!(fp.storage, Storage::Dense);
+    }
+
+    #[test]
+    fn msa_never_admits_dense_storage() {
+        for shape in [unit_shape(), sparse_shape(), complete_shape()] {
+            assert!(!admits(Kernel::Msa, Storage::Dense, &shape), "{shape:?}");
+        }
+        assert!(admits(Kernel::Sa, Storage::Dense, &complete_shape()));
     }
 
     #[test]
