@@ -264,6 +264,14 @@ pub enum CapacityError {
         /// The device limit.
         max: usize,
     },
+    /// An index the kernel computes in 32 bits would pass its range.
+    #[error("{entries} entries exceed the {max} a 32-bit kernel index addresses")]
+    Index {
+        /// Entries the largest index addresses.
+        entries: usize,
+        /// The most the index addresses.
+        max: usize,
+    },
     /// The degree exceeds what every admitting tier supports.
     #[error("degree above {max} is not supported")]
     Degree {
@@ -321,6 +329,84 @@ fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
         Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEG,
         // A dense matrix has no row-length limit, so it admits any degree.
         Storage::Dense => true,
+    }
+}
+
+/// Largest entry index a kernel computes in `uint`.
+const MAX_UINT_INDEX: usize = u32::MAX as usize;
+/// Largest value of an `int` CSR offset or `row_ptr` entry.
+const MAX_INT_OFFSET: usize = i32::MAX as usize;
+/// `uint` words of one RNG stream.
+const RNG_WORDS_PER_STREAM: usize = RNG_BYTES_PER_STREAM / 4;
+
+/// Refuse `problems` problems of `shape` on `storage` when an index that
+/// `kernel` computes in 32 bits would pass its range.
+///
+/// The indices, from the kernels and from `sampler::upload_inputs`:
+///
+/// - SA: entry `i` of thread `t` is `i * num_threads + t` in the global and
+///   dense builds, and `thread * N` in the local build, so every tier bounds
+///   `samples * N`.
+/// - Gibbs: the chromatic builds index the RNG streams as
+///   `(sample * 256 + thread) * 4`. The shared and dense builds also index
+///   the spins as `sample * N`; the spill build addresses them in 64 bits.
+/// - Multi-spin: each threadgroup's words are `threadgroup * N`, with one
+///   threadgroup per problem and 32-read word.
+/// - Dense: a row of one problem's matrix is `row * row_elems`.
+/// - CSR: `row_ptr` and the per-problem offsets are `int`. SA and Gibbs tile
+///   one copy per problem; the multi-spin kernel reads one copy.
+///
+/// # Errors
+///
+/// [`CapacityError::Index`] naming the largest index that does not fit.
+pub(crate) fn check_indices(
+    kernel: Kernel,
+    storage: Storage,
+    shape: &ModelShape,
+    problems: usize,
+) -> Result<(), CapacityError> {
+    let n = shape.nodes.max(1);
+    let reads = simd_rounded_reads(shape.reads);
+    let samples = problems.saturating_mul(reads);
+    let mut uint = vec![match kernel {
+        Kernel::Sa => samples.saturating_mul(n),
+        Kernel::Gibbs => samples
+            .saturating_mul(GIBBS_GROUP_THREADS)
+            .saturating_mul(RNG_WORDS_PER_STREAM),
+        Kernel::Msa => problems.saturating_mul(reads / MSA_LANES).saturating_mul(n),
+    }];
+    if kernel == Kernel::Gibbs && storage != Storage::Spill {
+        uint.push(samples.saturating_mul(n));
+    }
+    let mut int = Vec::new();
+    if storage == Storage::Dense {
+        uint.push(n.saturating_mul(dense_row_elems(shape.precision, n)));
+    } else {
+        let copies = if kernel == Kernel::Msa { 1 } else { problems };
+        int.push(copies.saturating_mul(shape.edges.saturating_mul(2).max(1)));
+        int.push(copies.saturating_mul(n.saturating_add(1)));
+    }
+    let over = |entries: &[usize], max: usize| {
+        entries
+            .iter()
+            .copied()
+            .filter(|&e| e > max)
+            .max()
+            .map(|entries| CapacityError::Index { entries, max })
+    };
+    match over(&uint, MAX_UINT_INDEX).or_else(|| over(&int, MAX_INT_OFFSET)) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Elements of one row of an `n`-node dense matrix: the two `uint` bit
+/// planes per 32 columns of a unit model, else one coefficient per column
+/// (`sampler::dense_row_elems`).
+const fn dense_row_elems(precision: Precision, n: usize) -> usize {
+    match precision {
+        Precision::Binary => 2 * n.div_ceil(32),
+        _ => n,
     }
 }
 
@@ -499,9 +585,11 @@ fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
 ///   most `col_ind` entries 32-bit indexing addresses. It reports the
 ///   `col_ind` bytes needed and the bytes `u32::MAX` entries occupy.
 /// - [`CapacityError::Degree`] when no tier admits the degree.
-/// - [`CapacityError::Memory`] when `total(instances)` exceeds
-///   `limits.usable_bytes()`. Of the per-tier checks this runs first; the
+/// - [`CapacityError::Index`] when one model passes a 32-bit index of the
+///   tier ([`check_indices`]). Of the per-tier checks this runs first; the
 ///   node and `col_ind` bounds above run before any tier.
+/// - [`CapacityError::Memory`] when `total(instances)` exceeds
+///   `limits.usable_bytes()`.
 /// - [`CapacityError::Buffer`] when the largest buffer exceeds
 ///   `limits.max_buffer_bytes`. A per-model buffer counts for the
 ///   [`models_per_buffer`] models it holds; a shared buffer counts once.
@@ -657,7 +745,9 @@ pub(crate) fn footprint_in(
     let mut first_error = None;
     for (footprint, largest) in admitted {
         let needed = footprint.total(in_flight);
-        let error = if needed > limits.usable_bytes() {
+        let error = if let Err(error) = check_indices(kernel, footprint.storage, shape, 1) {
+            error
+        } else if needed > limits.usable_bytes() {
             CapacityError::Memory {
                 needed,
                 usable: limits.usable_bytes(),
@@ -1391,7 +1481,10 @@ mod tests {
             };
             let err = footprint(kernel, &shape, &BIG).unwrap_err();
             assert!(
-                matches!(err, CapacityError::Memory { .. }),
+                matches!(
+                    err,
+                    CapacityError::Memory { .. } | CapacityError::Index { .. }
+                ),
                 "{kernel:?}: {err:?}"
             );
         }
@@ -1423,6 +1516,113 @@ mod tests {
                 "{kernel:?}: {err:?}"
             );
         }
+    }
+
+    /// Planning memory far past any model here, so only an index bound can
+    /// refuse one.
+    const HUGE: DeviceLimits = DeviceLimits {
+        memory_bytes: 1 << 60,
+        max_buffer_bytes: 1 << 60,
+    };
+
+    fn edgeless(nodes: usize, precision: Precision) -> ModelShape {
+        ModelShape {
+            nodes,
+            edges: 0,
+            max_degree: 0,
+            precision,
+            betas: 64,
+            reads: 256,
+        }
+    }
+
+    /// The SA global build indexes entry `i` of thread `t` as
+    /// `i * num_threads + t` in 32 bits (`sampler::encode_batch_storage`),
+    /// so one problem of 256 reads holds at most `u32::MAX / 256` nodes.
+    #[test]
+    fn the_capacity_model_mirrors_the_sa_global_index_guard() {
+        let last = u32::MAX as usize / 256;
+        let fits = footprint(Kernel::Sa, &edgeless(last, Precision::Int32), &HUGE).unwrap();
+        assert_eq!(fits.storage, Storage::Spill);
+        assert_eq!(
+            footprint(Kernel::Sa, &edgeless(last + 1, Precision::Int32), &HUGE),
+            Err(CapacityError::Index {
+                entries: (last + 1) * 256,
+                max: u32::MAX as usize
+            })
+        );
+    }
+
+    /// The multi-spin kernel indexes each threadgroup's words as
+    /// `threadgroup * N` in 32 bits: 8 words of 256 reads.
+    #[test]
+    fn the_capacity_model_mirrors_the_multi_spin_index_guard() {
+        let last = u32::MAX as usize / 8;
+        footprint(Kernel::Msa, &edgeless(last, Precision::Int32), &HUGE).unwrap();
+        assert!(matches!(
+            footprint(Kernel::Msa, &edgeless(last + 1, Precision::Int32), &HUGE),
+            Err(CapacityError::Index { .. })
+        ));
+    }
+
+    /// The chromatic Gibbs builds index the RNG streams as
+    /// `(sample * 256 + thread) * 4` in 32 bits; the shared and dense builds
+    /// also index the spins as `sample * N`. The spill build addresses its
+    /// spins in 64 bits.
+    #[test]
+    fn the_gibbs_index_guard_bounds_the_rng_streams_and_the_shared_spins() {
+        let shape = edgeless(4_000, Precision::Int8);
+        let samples = u32::MAX as usize / (256 * 4);
+        let problems = samples / 256;
+        assert_eq!(
+            check_indices(Kernel::Gibbs, Storage::Spill, &shape, problems),
+            Ok(())
+        );
+        assert!(check_indices(Kernel::Gibbs, Storage::Spill, &shape, problems + 1).is_err());
+        // `sample * N` binds first on the shared build.
+        let shared = u32::MAX as usize / (256 * 4_000);
+        assert_eq!(
+            check_indices(Kernel::Gibbs, Storage::Threadgroup, &shape, shared),
+            Ok(())
+        );
+        assert!(check_indices(Kernel::Gibbs, Storage::Threadgroup, &shape, shared + 1).is_err());
+    }
+
+    /// The SA and Gibbs kernels read their tiled CSR copies through `int`
+    /// offsets (`sampler::upload_inputs`); the multi-spin kernel reads one
+    /// untiled copy.
+    #[test]
+    fn the_tiled_csr_offsets_stay_in_int_range() {
+        let shape = ModelShape {
+            edges: 1_000_000,
+            max_degree: 1_000,
+            reads: 32,
+            ..edgeless(2_000, Precision::Int8)
+        };
+        let copies = i32::MAX as usize / 2_000_000;
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            assert_eq!(
+                check_indices(kernel, Storage::Spill, &shape, copies),
+                Ok(()),
+                "{kernel:?}"
+            );
+            assert!(
+                check_indices(kernel, Storage::Spill, &shape, copies + 1).is_err(),
+                "{kernel:?}"
+            );
+        }
+    }
+
+    /// A dense row of an `n`-node model is indexed in 32 bits: `n` cells,
+    /// or the `2 * ceil(n / 32)` words of a bit matrix.
+    #[test]
+    fn the_dense_row_index_is_32_bit() {
+        let at = |nodes, precision| {
+            check_indices(Kernel::Msa, Storage::Dense, &edgeless(nodes, precision), 1)
+        };
+        assert_eq!(at(65_535, Precision::Int32), Ok(()));
+        assert!(at(65_536, Precision::Int32).is_err());
+        assert_eq!(at(65_536, Precision::Binary), Ok(()));
     }
 
     #[test]

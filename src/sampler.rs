@@ -531,9 +531,10 @@ fn check_one_sweep(shape: &SweepShape) -> Result<(), SampleError> {
 
 /// The most problems of `graph` that one stream batch may hold, at most
 /// `max` and at least 1, so that [`one_sweep_ms`] of the whole batch with
-/// `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`]. The stream caps
-/// its batches with it, so a batch is never refused when its jobs pass
-/// alone. `None` when one problem of `graph` fails with `in_flight` batches,
+/// `in_flight` batches on the GPU fits [`ONE_SWEEP_MAX_MS`], and every
+/// 32-bit kernel index of the batch stays in range
+/// (`capacity::check_indices`). The stream caps its batches with it, so a
+/// batch is never refused when its jobs pass alone. `None` when one problem of `graph` fails with `in_flight` batches,
 /// or when the capacity model routes `graph` to dense-matrix storage: the
 /// stream then runs it as the only batch on the GPU, where the admission
 /// applies the rule of [`sample_ising`]. The dense-matrix estimate covers
@@ -563,18 +564,20 @@ pub(crate) fn one_sweep_problem_cap(
         return None;
     }
     let fits = |problems: usize| {
-        one_sweep_ms(&SweepShape {
-            kernel,
-            storage: batch.storage,
-            nodes: batch.n,
-            degree: mean_degree(graph),
-            problems,
-            reads: simd_rounded_reads(params.num_reads),
-            in_flight,
-            cores: host_gpu_cores(),
-        }) <= ONE_SWEEP_MAX_MS
+        crate::capacity::check_indices(kernel, batch.storage, &batch.shape, problems).is_ok()
+            && one_sweep_ms(&SweepShape {
+                kernel,
+                storage: batch.storage,
+                nodes: batch.n,
+                degree: mean_degree(graph),
+                problems,
+                reads: simd_rounded_reads(params.num_reads),
+                in_flight,
+                cores: host_gpu_cores(),
+            }) <= ONE_SWEEP_MAX_MS
     };
-    // The estimate never falls as the problems grow, and one problem fits.
+    // Neither the estimate nor an index falls as the problems grow, and one
+    // problem fits.
     let (mut lo, mut hi) = (1, max);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
@@ -1935,6 +1938,8 @@ struct ValidBatch<'a> {
     dense_rows: bool,
     /// The storage tier the admission priced the batch on.
     storage: Storage,
+    /// The size of one model, as the admission priced it.
+    shape: ModelShape,
     /// Every coupling and field is in {-1, 0, 1}. Only the multi-spin kernel
     /// holds a dense-matrix batch of such a model as a bit matrix; SA and
     /// Gibbs map it to the Int8 tier.
@@ -2080,6 +2085,10 @@ fn validate_batch_within<'a>(
             return Err(SampleError::TooLarge(message));
         }
     }
+    // The capacity model checks the indices of one problem; a batch holds
+    // `graphs.len()`.
+    crate::capacity::check_indices(kernel, footprint.storage, &shape, graphs.len())
+        .map_err(too_large)?;
     // A chunk is at least one sweep, so a batch whose one sweep would pass
     // the limit is refused before any buffer exists, on every tier and under
     // every dense mode. The tier is the one the footprint chose: a model
@@ -2101,6 +2110,7 @@ fn validate_batch_within<'a>(
         i8_scale,
         dense_rows,
         storage: footprint.storage,
+        shape,
         unit,
     })
 }
@@ -2737,6 +2747,7 @@ fn encode_batch_storage(
         i8_scale,
         dense_rows,
         storage,
+        shape: _,
         unit,
     } = validate_batch_within(
         graphs,
@@ -2981,28 +2992,9 @@ fn encode_batch_storage(
     // The dense-matrix kernel keeps the spill layout at every precision.
     let shared_spins = (weighted_msa || matrix).then_some(k);
     let state_bytes = (shared_spins.map_or(n, |k| k.min(n)).max(1) * 4).div_ceil(16) * 16;
-    if sa_global
-        && num_threads
-            .checked_mul(n.max(1))
-            .is_none_or(|entries| entries > u32::MAX as usize)
-    {
-        // The global build indexes entry `i` of thread `t` as
-        // `i * num_threads + t` in 32 bits.
-        return Err(SampleError::TooLarge(format!(
-            "{num_threads} SA reads of {n} spins exceed 32-bit indexing"
-        )));
-    }
+    // `validate_batch_within` refused every batch whose 32-bit kernel
+    // indices would pass their range (`capacity::check_indices`).
     if kernel == Kernel::Msa {
-        // The kernel indexes each threadgroup's persistent words as
-        // `threadgroup * N` in 32 bits.
-        if groups
-            .checked_mul(n.max(1))
-            .is_none_or(|words| words > u32::MAX as usize)
-        {
-            return Err(SampleError::TooLarge(format!(
-                "{groups} multi-spin threadgroups of {n} spin words exceed 32-bit indexing"
-            )));
-        }
         let need = state_bytes + MSA_STATIC_TG_BYTES;
         let have = tg_limit;
         if need > have {
@@ -3011,16 +3003,6 @@ fn encode_batch_storage(
             )));
         }
     }
-    // The kernel indexes a row of one problem's matrix in 32 bits.
-    if matrix
-        && n.checked_mul(dense_row_elems(n, unit))
-            .is_none_or(|cells| cells > u32::MAX as usize)
-    {
-        return Err(SampleError::TooLarge(format!(
-            "a dense matrix of {n} nodes exceeds 32-bit row indexing"
-        )));
-    }
-
     let four_color = kernel == Kernel::Msa && msa_four_color();
     let (cached, inputs) = if matrix {
         let cached = if kernel == Kernel::Sa {
@@ -5035,6 +5017,38 @@ mod tests {
             vec![(0, 1), (0, 2), (0, 3)],
         );
         too_large(check_float_schedule(&star, &[0.0]));
+    }
+
+    /// The chromatic Gibbs builds index the RNG streams as
+    /// `(sample * 256 + thread) * 4` in 32 bits, so a batch of 16,384
+    /// problems of 256 reads is refused before any buffer exists, as the SA
+    /// global and multi-spin batches are.
+    #[test]
+    fn a_gibbs_batch_past_32_bit_rng_indexing_is_refused() {
+        let g = ring();
+        let p = SampleParams {
+            num_reads: 256,
+            ..params(64)
+        };
+        let graphs = vec![&g; 16_384];
+        let err = validate_batch_within(
+            &graphs,
+            &p,
+            Kernel::Gibbs,
+            host_device_limits(),
+            false,
+            None,
+            DenseMode::Auto,
+            1,
+        )
+        .map(drop)
+        .unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        let msg = too_large_msg(err);
+        assert!(msg.contains("32-bit kernel index"), "{msg}");
     }
 
     #[test]
