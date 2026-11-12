@@ -378,16 +378,18 @@ const GIBBS_SHARED_SWEEP_NS: [(f64, f64); 11] = [
 /// worst chunk at 8,335,556 nodes, 509.6 ms in the second of two runs), 20 (1.388 ns, the worst chunk
 /// at 1,170,280 nodes, 415.8 ms), and 62 (3.79 ns, the worst chunk of
 /// `the_largest_admitted_high_degree_sweeps_stay_under_400_ms`
-/// at 553,665 nodes, which took 537.3 ms). Degree 200 is the grid's worst
-/// (400,000 nodes `int32`, the largest of three repeats), above the 10.6 ns of
-/// 16 sweeps at 107,927 nodes. The grid has no spill row past degree 200, so
+/// at 553,665 nodes, which took 537.3 ms). Degree 200 (14.775 ns) is the
+/// slower of the two worst chunks of 16-sweep runs at 107,927 nodes `int32`
+/// at a load average under 8: 405.4 ms at 5.79 and 408.2 ms at 7.51
+/// (`docs/perf/2026-11-metal-capacity.md`). It is above the grid's worst of
+/// 12.589 ns (400,000 nodes `int32`). The grid has no spill row past degree 200, so
 /// the points past it are the shared build's: a spill update is never
 /// cheaper than a shared one at the measured degrees.
 const GIBBS_SPILL_SWEEP_NS: [(f64, f64); 11] = [
     (4.0, 0.239),
     (20.0, 1.388),
     (62.0, 3.79),
-    (200.0, 12.589),
+    (200.0, 14.775),
     (999.0, 103.8),
     (1413.0, 165.8),
     (1999.0, 290.0),
@@ -4487,7 +4489,7 @@ mod tests {
             (Kernel::Sa, Storage::Spill, 200.0, 145.75),
             (Kernel::Gibbs, Storage::Threadgroup, 2499.0, 392.0),
             (Kernel::Gibbs, Storage::Spill, 62.0, 3.79),
-            (Kernel::Gibbs, Storage::Spill, 200.0, 12.589),
+            (Kernel::Gibbs, Storage::Spill, 200.0, 14.775),
             (Kernel::Msa, Storage::Spill, 62.0, 0.948),
         ];
         for (kernel, storage, degree, ns) in points {
@@ -4597,7 +4599,7 @@ mod tests {
             (Kernel::Gibbs, Storage::Spill, Some(4.0), 5_684_919),
             (Kernel::Gibbs, Storage::Spill, Some(20.0), 978_887),
             (Kernel::Gibbs, Storage::Spill, Some(62.0), 358_494),
-            (Kernel::Gibbs, Storage::Spill, Some(200.0), 107_927),
+            (Kernel::Gibbs, Storage::Spill, Some(200.0), 91_959),
             (Kernel::Msa, Storage::Spill, Some(4.0), 13_724_198),
             (Kernel::Msa, Storage::Spill, Some(20.0), 6_932_120),
             (Kernel::Msa, Storage::Spill, Some(62.0), 1_433_223),

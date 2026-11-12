@@ -275,7 +275,7 @@ fn complete(n: usize, path: Path) -> IsingGraph {
 }
 
 /// The worst admitted high-degree CSR shapes of Gibbs, one problem of 256
-/// reads: the spill build at its one-sweep limits of 107,927 nodes at degree
+/// reads: the spill build at its one-sweep limits of 91,959 nodes at degree
 /// 200 and 358,494 nodes at degree 62 (extrapolated past the grid), and a
 /// complete model on CSR storage at the shared build's limit of 2,915 nodes.
 /// Each anneal's longest chunk stays below 400 ms, and one node more is
@@ -294,13 +294,13 @@ fn the_largest_admitted_high_degree_sweeps_stay_under_400_ms() {
         (
             "spill degree 200",
             |n, path| circulant(n, 200, path),
-            107_927,
+            91_959,
             Path::Unit,
         ),
         (
             "spill degree 200",
             |n, path| circulant(n, 200, path),
-            107_927,
+            91_959,
             Path::Int,
         ),
         (
