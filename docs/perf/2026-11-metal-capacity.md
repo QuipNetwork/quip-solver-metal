@@ -736,7 +736,7 @@ The table gives the largest node count that the admission accepts for one proble
 | Gibbs spill | 4 | 5,684,919 | extrapolated | 365.4, 248.9 |
 | Gibbs spill | 20 | 978,887 | extrapolated | 288.7, 301.3 |
 | Gibbs spill | 62 | 358,494 | measured (400,000 nodes) | 288.3, 249.3, 346.0, 317.9, 305.1 (`int32`) |
-| Gibbs spill | 200 | 107,927 | measured (100,000 and 200,000 nodes) | 286.3, 258.9 and 386.3 (`binary`), 293.9, 306.6, 277.4 and 331.0 (`int32`) |
+| Gibbs spill | 200 | 91,959 | measured (100,000 and 200,000 nodes) | 290.0, 274.1 and 313.1 (`int32`, Task 5.4b) |
 | MSA spill | 4 | 13,724,198 | extrapolated | 357.0, 340.5 |
 | MSA spill | 20 | 6,932,120 | extrapolated | 343.7 |
 | MSA spill | 62 | 1,433,223 | extrapolated | 277.9 (`int32`) |
@@ -775,6 +775,21 @@ During Task 5.3b fix round 2, other sessions loaded the host. Six runs of the Gi
 | Gibbs spill, degree 62, 358,494 nodes, `int32` | 707.5 | 19.66, 12.10, 11.12 |
 
 The same test at the earlier commit `84d6715` failed in the same way under that load, with 454.7 and 406.4 ms. The constants stay as they are.
+
+### Task 5.4b re-measurement at degree 200
+
+Task 5.4b ran the Gibbs spill build again at degree 200, 16 sweeps of one sweep each, `int32`, one problem of 256 reads. Other sessions kept the load average of the host between 5.5 and 9.1. The records are in `docs/perf/2026-11-metal-capacity-5.4b.jsonl`.
+
+| Nodes | Crate commit | Longest chunk (ms) | Load average before the run (1, 5 and 15 minutes) |
+|---|---|---|---|
+| 107,927 | `66eac87` | 345.9 | 5.73, 6.09, 6.90 |
+| 107,927 | `66eac87` | 351.4 | 5.55, 6.04, 6.87 |
+| 107,927 | `66eac87` | 352.0 | 5.54, 6.02, 6.85 |
+| 91,959 | `936c262` | 290.0 | 9.11, 6.57, 6.60 |
+| 91,959 | `936c262` | 274.1 | 8.70, 6.53, 6.58 |
+| 91,959 | `936c262` | 313.1 | 8.05, 6.46, 6.56 |
+
+No quiet run was possible, so the degree-200 point takes the conservative value of 14.775 ns. That value comes from the slower of the two Task 5.3b chunks at a load average under 8 (408.2 ms at 7.51). The limit at degree 200 falls from 107,927 to 91,959 nodes. At that limit, the longest chunk was 313.1 ms at a load average of 8.05.
 
 The 500 ms ceiling does not cover these chunks. The margin to the macOS GPU watchdog prevents a fault at these times. The `TARGET_DISPATCH_MS` doc comment in `src/sampler.rs` says that the watchdog aborts a command buffer that runs more than a few seconds, and that MLX measured watchdog kills at about 1.2 s per operation with a display attached. The longest chunk here, 707.5 ms, is below 1.2 s.
 
