@@ -1212,7 +1212,20 @@ mod tests {
     }
 
     #[test]
-    fn resident_beta_range_matches_library_bits_on_draws() {
+    fn resident_beta_range_matches_library_bits_on_64_draws() {
+        resident_beta_range_matches_library_bits_on_draws(64);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "512 draws take about 10 s in a debug build: run with --features long-tests"
+    )]
+    fn resident_beta_range_matches_library_bits_on_512_draws() {
+        resident_beta_range_matches_library_bits_on_draws(512);
+    }
+
+    fn resident_beta_range_matches_library_bits_on_draws(draws: usize) {
         let edges: Vec<(usize, usize)> = include_str!("../tests/fixtures/advantage2-system1.edges")
             .lines()
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
@@ -1231,7 +1244,7 @@ mod tests {
             rng ^= rng << 17;
             rng
         };
-        for seed in 0..512 {
+        for seed in 0..draws {
             let mut graph = IsingGraph::new(
                 (0..4577)
                     .map(|_| [-1.0, 0.0, 1.0][(draw() % 3) as usize])

@@ -290,6 +290,15 @@ mod msa {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "adds the third fixture to the two of the default run: run with --features long-tests"
+    )]
+    fn three_portfolio_models_reach_their_ground_states() {
+        super::portfolio_models_reach_their_ground_states(Kernel::Msa, 3);
+    }
+
+    #[test]
     fn a_model_whose_schedule_overflows_f32_is_refused() {
         super::a_model_whose_schedule_overflows_f32_is_refused(Kernel::Msa);
     }

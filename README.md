@@ -278,15 +278,17 @@ See `tests/msa_bench.rs` for the commands to repeat each run.
 ## Tests
 
 ```sh
-cargo test --release
-cargo test --release --features long-tests   # adds the tests that take more than ten seconds
+cargo test -- --test-threads=1                       # the default run, as CI runs it (dev profile)
+cargo test --features long-tests -- --test-threads=1 # adds the tests that take more than ten seconds
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-solver-conformance`'s scripted driver and check energies against
-`conformance/golden_vectors.json`. The whole suite runs on a Mac with a Metal
-device. CI runs it on a macOS runner, which is the only configuration this
-crate builds in.
+`conformance/golden_vectors.json`. The tests run on a Mac with a Metal device.
+CI runs the default run on a macOS runner, which is the only configuration this
+crate builds in. CI fails any test that takes more than 30 seconds. The default
+run skips the tests that take more than ten seconds in a dev build, and CI does
+not run them. Run them with `--features long-tests` before a release.
 
 Two harnesses carry `#[ignore]` because they take minutes to hours of device
 time. `tests/msa_bench.rs` times one problem through both kernels at a job

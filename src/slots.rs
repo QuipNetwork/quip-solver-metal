@@ -2048,11 +2048,22 @@ mod tests {
     }
 
     #[test]
+    fn one_observe_point_does_not_change_the_final_energies_or_spins() {
+        observe_points_do_not_change_the_final_energies_or_spins(1);
+    }
+
+    #[test]
     #[cfg_attr(
         not(feature = "long-tests"),
         ignore = "over 10 s in a debug build: run with --features long-tests"
     )]
-    fn observe_points_do_not_change_the_final_energies_or_spins() {
+    fn two_observe_points_do_not_change_the_final_energies_or_spins() {
+        observe_points_do_not_change_the_final_energies_or_spins(2);
+    }
+
+    /// `boundaries` is the number of `OBSERVE_INTERVAL` boundaries the anneal
+    /// crosses before its checkpoint.
+    fn observe_points_do_not_change_the_final_energies_or_spins(boundaries: usize) {
         let Some(device) = device() else {
             return;
         };
@@ -2060,7 +2071,7 @@ mod tests {
         // they only add output write-backs at extra step boundaries, which
         // the kernel already tolerates (every step resumes spins and RNG
         // from device memory regardless of where the previous one stopped).
-        let checkpoint = 2 * OBSERVE_INTERVAL + 17;
+        let checkpoint = boundaries * OBSERVE_INTERVAL + 17;
         let graph = advantage2_system1(11);
         let schedule: Arc<[f32]> = build_beta_schedule(
             &graph,

@@ -291,17 +291,12 @@ fn complete_int32(n: usize) -> IsingGraph {
     IsingGraph::new(h, j, edges)
 }
 
-/// A complete Int32 model of 1,000 nodes is inside the capacity limits on
-/// dense-matrix storage. The stream runs it as `sample_ising` does: two
+/// A complete Int32 model of `nodes` nodes (200 by default, 1,000 under
+/// `long-tests`) runs on dense-matrix storage. The stream runs it as `sample_ising` does: two
 /// jobs of the same topology each return the reads of `sample_ising` with
 /// their seed, every one scored exactly.
-#[test]
-#[cfg_attr(
-    not(feature = "long-tests"),
-    ignore = "over 30 s in a debug build: run with --features long-tests"
-)]
-fn a_complete_model_runs_dense_in_the_stream() {
-    let graph = complete_int32(1_000);
+fn complete_model_runs_dense_in_the_stream(nodes: usize) {
+    let graph = complete_int32(nodes);
     each_kernel(|kernel| {
         let Some(sampler) = open(kernel) else { return };
         let jobs = (0..2)
@@ -339,6 +334,20 @@ fn a_complete_model_runs_dense_in_the_stream() {
             assert_eq!(reads, direct, "{kernel:?}: {id}");
         }
     });
+}
+
+#[test]
+fn a_small_complete_model_runs_dense_in_the_stream() {
+    complete_model_runs_dense_in_the_stream(200);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "long-tests"),
+    ignore = "over 30 s in a debug build: run with --features long-tests"
+)]
+fn a_complete_model_runs_dense_in_the_stream() {
+    complete_model_runs_dense_in_the_stream(1_000);
 }
 
 /// A ring one node past the SA thread-private frame (4,593) and one past

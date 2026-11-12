@@ -1515,23 +1515,29 @@ mod tests {
     /// degree passes the advertised bound, so it runs only through the
     /// library API. Both are admitted on unit and on wide
     /// coefficients, at the smallest and the largest read count, and one
-    /// node more is refused as a capacity error.
-    #[test]
-    #[cfg_attr(
-        not(feature = "long-tests"),
-        ignore = "over 30 s in a debug build: run with --features long-tests"
-    )]
-    fn the_advertised_corners_pass_the_session_admission() {
+    /// node more is refused as a capacity error. The default run checks unit
+    /// coefficients at the smallest read count; `long-tests` adds the wide
+    /// coefficients and the largest read count.
+    fn advertised_corners_pass_the_session_admission(
+        wide_coefficients: bool,
+        reads_list: &[usize],
+    ) {
         use quip_solver_core::SampleParams;
         let unit: fn(usize) -> f64 = |k| if k % 2 == 0 { 1.0 } else { -1.0 };
         let wide: fn(usize) -> f64 = |k| if k % 2 == 0 { 1.3 } else { -0.127 };
+        let coefficients: &[fn(usize) -> f64] = if wide_coefficients {
+            &[unit, wide]
+        } else {
+            &[unit]
+        };
         for (kernel, identity) in host_identities() {
             let nodes = identity.max_nodes as usize;
             let edges = identity.max_edges as usize;
             let complete = (2..).find(|n| n * (n - 1) / 2 >= edges).unwrap();
             assert_eq!(complete * (complete - 1) / 2, edges, "{kernel:?}");
-            let graphs: Vec<super::IsingGraph> = [unit, wide]
-                .into_iter()
+            let graphs: Vec<super::IsingGraph> = coefficients
+                .iter()
+                .copied()
                 .flat_map(|coupling| {
                     [
                         corner_graph(nodes, edges, coupling),
@@ -1540,7 +1546,7 @@ mod tests {
                     ]
                 })
                 .collect();
-            for reads in [32, 256] {
+            for &reads in reads_list {
                 let params = SampleParams {
                     num_reads: reads,
                     num_sweeps: 64,
@@ -1565,6 +1571,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_advertised_corners_pass_the_session_admission_on_unit_coefficients() {
+        advertised_corners_pass_the_session_admission(false, &[32]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 30 s in a debug build: run with --features long-tests"
+    )]
+    fn the_advertised_corners_pass_the_session_admission() {
+        advertised_corners_pass_the_session_admission(true, &[32, 256]);
     }
 
     #[test]
