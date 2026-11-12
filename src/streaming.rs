@@ -1037,7 +1037,19 @@ mod tests {
             completed += 1;
         }
         assert_eq!(completed, jobs);
-        assert!(gov.0.get() >= 2, "{} batches", gov.0.get());
+        // One `budget_scale` call per formed batch. The cap depends on the
+        // host's core count, so the count comes from the same function.
+        let params = params(256, 2, 1);
+        let nominal = batch_size_for_reads(Kernel::Sa, 256);
+        let cap =
+            sampler::one_sweep_problem_cap(&graph, &params, Kernel::Sa, STREAM_IN_FLIGHT, nominal)
+                .unwrap();
+        assert!(cap < jobs, "{cap}");
+        assert_eq!(gov.0.get(), jobs.div_ceil(cap), "cap {cap}");
+        // The stream exposes no per-chunk timings, only each job's share of
+        // its batch's GPU time, so this test cannot check the longest chunk.
+        // `the_stream_cap_splits_a_batch_whose_jobs_pass_alone` checks that a
+        // batch at the cap passes the one-sweep admission.
     }
 
     /// A Gibbs job that fails beside a second batch in flight but passes
