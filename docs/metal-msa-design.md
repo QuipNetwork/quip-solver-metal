@@ -117,6 +117,30 @@ initial words and the threshold rows consume the stream. Sweep offsets are
 a hash of `(seed, problem, word, rung, sweep)`, so resume needs no extra
 state.
 
+### Zero-field models
+
+Every annealing kernel accepts a flat move, one with `ΔE = 0`, without a
+draw. On a model with no linear field, a sweep that visits the nodes the same
+way every time then moves the domain walls of a chain in step, and walls that
+move in step never meet. A read keeps the energy of its random start at any
+temperature (QUI-1980). Every sweep but the last of an anneal therefore leaves
+one node out, chosen afresh each sweep. The last sweep visits every node. A
+model of one node leaves none out. `quip-solver-cpu` applies the same rule.
+
+- `kernels/sa.metal` draws the node from the thread's xorshift32 stream, one
+  draw per sweep.
+- `kernels/msa.metal` takes it per replica word from a hash of the word's
+  seed and the sweep's position within the anneal, so every thread of the
+  threadgroup agrees and no RNG stream moves. A slot step carries the bounds
+  and the seed of the anneal it belongs to (`SlotStep::anneal_start`,
+  `anneal_end`, `seed`), so the node does not depend on how the host splits
+  an anneal into steps and legs. The screen entry uses the same body.
+
+`tests/zero_field_annealing.rs` runs a 16-spin zero-field ring and a
+zero-field Max-Cut lattice through `--solve` on `quip-metal-sa` and
+`quip-metal-msa`. `kernels/msa64.metal` is an experiment that no binary
+loads; it does not have the rule.
+
 ### Threshold table
 
 The CPU and CUDA kernels compare a 64-bit uniform against
