@@ -24,7 +24,7 @@
 //! - [`Storage::Dense`]: an `N * N` coupling matrix instead of CSR. It
 //!   admits any degree, so a multi-spin model past the sparse degree routes
 //!   here. [`routed_footprint`] keeps a graph with a repeated coupler or a
-//!   self-loop off this tier. No kernel runs it yet (see
+//!   self-loop off this tier. Only the multi-spin kernel runs it (see
 //!   [`runnable_storages`]).
 //!
 //! Every formula sits in one small function per kernel, so a later task can
@@ -534,25 +534,62 @@ pub fn routed_footprint(
     shape: &ModelShape,
     limits: &DeviceLimits,
 ) -> Result<Footprint, CapacityError> {
-    let chosen = footprint(kernel, shape, limits)?;
+    routed_on(
+        kernel,
+        graph,
+        shape,
+        limits,
+        &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
+    )
+}
+
+/// [`routed_footprint`] over only the tiers in [`runnable_storages`]: the
+/// tier and bytes the sampler's batch path allocates, which its admission
+/// checks before any buffer exists.
+///
+/// # Errors
+///
+/// The errors of [`routed_footprint`].
+pub fn routed_runnable_footprint(
+    kernel: Kernel,
+    graph: &IsingGraph,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+) -> Result<Footprint, CapacityError> {
+    routed_on(kernel, graph, shape, limits, runnable_storages(kernel))
+}
+
+/// The routing of [`routed_footprint`] over `tiers`: the cheapest tier that
+/// fits, except that a graph that is not a dense candidate takes the
+/// cheapest of the other tiers.
+fn routed_on(
+    kernel: Kernel,
+    graph: &IsingGraph,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+    tiers: &[Storage],
+) -> Result<Footprint, CapacityError> {
+    let chosen = footprint_in(kernel, shape, limits, tiers)?;
     if chosen.storage == Storage::Dense && !crate::topology::dense_candidate(graph) {
-        return footprint_in(
-            kernel,
-            shape,
-            limits,
-            &[Storage::Threadgroup, Storage::Spill],
-        );
+        let sparse: Vec<Storage> = tiers
+            .iter()
+            .copied()
+            .filter(|&tier| tier != Storage::Dense)
+            .collect();
+        return footprint_in(kernel, shape, limits, &sparse);
     }
     Ok(chosen)
 }
 
 /// The tiers a kernel of this crate runs. No SA or Gibbs dense kernel
 /// exists, so those kernels upload CSR whatever tier [`footprint`] prices.
-/// A dense kernel adds its tier here.
+/// A dense kernel adds its tier here: the multi-spin kernel runs dense
+/// storage on the batch path (`kernels/msa_dense.metal`).
 #[must_use]
 pub const fn runnable_storages(kernel: Kernel) -> &'static [Storage] {
     match kernel {
-        Kernel::Sa | Kernel::Gibbs | Kernel::Msa => &[Storage::Threadgroup, Storage::Spill],
+        Kernel::Sa | Kernel::Gibbs => &[Storage::Threadgroup, Storage::Spill],
+        Kernel::Msa => &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
     }
 }
 
@@ -570,8 +607,14 @@ pub fn runnable_footprint(
     footprint_in(kernel, shape, limits, runnable_storages(kernel))
 }
 
-/// [`footprint`] over the tiers in `tiers`, in their cost order.
-fn footprint_in(
+/// [`footprint`] over the tiers in `tiers`, in their cost order: the
+/// sampler's admission when a path allocates only some tiers, such as the
+/// multi-spin gates that run CSR storage alone.
+///
+/// # Errors
+///
+/// The errors of [`footprint`].
+pub(crate) fn footprint_in(
     kernel: Kernel,
     shape: &ModelShape,
     limits: &DeviceLimits,
@@ -1063,17 +1106,34 @@ mod tests {
     }
 
     #[test]
-    fn the_sampler_still_refuses_a_job_that_only_fits_dense() {
-        let shape = shape_of(&complete_graph(80));
+    fn the_sampler_prices_msa_dense_and_routes_non_candidates_off_it() {
+        let graph = complete_graph(80);
+        let shape = shape_of(&graph);
         assert_eq!(
-            footprint(Kernel::Msa, &shape, &ROOMY).unwrap().storage,
+            runnable_footprint(Kernel::Msa, &shape, &ROOMY)
+                .unwrap()
+                .storage,
             Storage::Dense
         );
         assert_eq!(
-            runnable_footprint(Kernel::Msa, &shape, &ROOMY),
+            routed_runnable_footprint(Kernel::Msa, &graph, &shape, &ROOMY)
+                .unwrap()
+                .storage,
+            Storage::Dense
+        );
+        let repeated = with_edge(&graph, (1, 0));
+        assert_eq!(
+            routed_runnable_footprint(Kernel::Msa, &repeated, &shape_of(&repeated), &ROOMY),
             Err(CapacityError::Degree {
                 max: MSA_SPARSE_MAX_DEG
             })
+        );
+        // SA has no dense kernel, so its batch path prices CSR.
+        assert_ne!(
+            routed_runnable_footprint(Kernel::Sa, &graph, &shape, &ROOMY)
+                .unwrap()
+                .storage,
+            Storage::Dense
         );
     }
 

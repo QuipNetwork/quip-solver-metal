@@ -1,0 +1,378 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2025 QUIP Protocol Contributors
+
+//! The dense-matrix multi-spin kernel (`kernels/msa_dense.metal`): each
+//! update reads one row of an `N * N` coupling matrix instead of a CSR row.
+//! It keeps the update order and the RNG streams of the sparse kernels, so a
+//! model that both paths hold returns the same reads on each.
+//!
+//! ```sh
+//! cargo test --release --test msa_dense
+//! cargo test --release --test msa_dense -- --ignored --nocapture
+//! ```
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use quip_solver_core::quip_protocol::scoring::energy_milli;
+use quip_solver_core::SampleParams;
+use quip_solver_metal::capacity::Storage;
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::model_file::read_model;
+use quip_solver_metal::sampler::{sample_ising_tuned, Kernel, SampleError, TunedRun, Tuning};
+use quip_solver_metal::{IsingGraph, SamplerResult};
+
+/// Coefficient precisions of the dense matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Precision {
+    /// Couplings and fields in {-1, 0, 1}: a bit matrix.
+    Binary,
+    /// Milli coefficients that fit `int8_t` after division by their gcd.
+    Int8,
+    /// Milli coefficients with gcd 1: an `int` matrix.
+    Int32,
+    /// Coefficients off the milli grid: a `float` matrix.
+    Float32,
+}
+
+const PRECISIONS: [Precision; 4] = [
+    Precision::Binary,
+    Precision::Int8,
+    Precision::Int32,
+    Precision::Float32,
+];
+
+/// Coupling magnitudes and field magnitudes of `precision`, picked by `k`.
+fn magnitude(precision: Precision, k: usize, field: bool) -> f64 {
+    let (couplings, fields): (&[f64], &[f64]) = match precision {
+        Precision::Binary => (&[1.0], &[1.0, 0.0]),
+        Precision::Int8 => (&[0.5, 1.0, 1.5], &[0.5, 0.0, 1.0]),
+        Precision::Int32 => (&[1.3, 0.127, 2.0], &[0.5, 0.0, 0.75]),
+        Precision::Float32 => (&[1.300_65, 0.127_063_5, 2.001], &[0.500_25, 0.0, 0.750_375]),
+    };
+    let values = if field { fields } else { couplings };
+    values[k % values.len()]
+}
+
+/// Signed coefficients of `precision`, picked by `k`.
+fn signed(precision: Precision, k: usize, field: bool) -> f64 {
+    let value = magnitude(precision, k / 2, field);
+    if k.is_multiple_of(2) {
+        value
+    } else {
+        -value
+    }
+}
+
+/// A complete model on `n` nodes whose ground state is `planted`: every
+/// coupling is `-|w| s_u s_v` and every field `-|a| s_i`, so `planted`
+/// satisfies every term, and a nonzero field breaks the global flip.
+fn planted_complete(n: usize, precision: Precision) -> (IsingGraph, Vec<i8>) {
+    let planted: Vec<i8> = (0..n)
+        .map(|i| if (i * 7 + i / 3) % 5 < 2 { -1 } else { 1 })
+        .collect();
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for u in 0..n {
+        for v in u + 1..n {
+            edges.push((u, v));
+            let w = magnitude(precision, u * 13 + v * 5, false);
+            j.push(-w * f64::from(planted[u]) * f64::from(planted[v]));
+        }
+    }
+    let h = (0..n)
+        .map(|i| -magnitude(precision, i, true) * f64::from(planted[i]))
+        .collect();
+    (IsingGraph::new(h, j, edges), planted)
+}
+
+/// Circulant graph: node i links to i+1 ..= i+degree/2 (mod n), so every
+/// node has `degree` neighbours when n > degree.
+fn circulant(n: usize, degree: usize, precision: Precision) -> IsingGraph {
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for i in 0..n {
+        for d in 1..=degree / 2 {
+            edges.push((i, (i + d) % n));
+            j.push(signed(precision, i * 7 + d, false));
+        }
+    }
+    let h = (0..n).map(|i| signed(precision, i, true)).collect();
+    IsingGraph::new(h, j, edges)
+}
+
+/// A complete graph on `n` nodes with every coupling `j`.
+fn complete(n: usize, j: f64) -> IsingGraph {
+    let edges: Vec<(usize, usize)> = (0..n)
+        .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+        .collect();
+    IsingGraph::new(vec![0.0; n], vec![j; edges.len()], edges)
+}
+
+/// `graph` plus one more coupler.
+fn with_edge(graph: &IsingGraph, edge: (usize, usize)) -> IsingGraph {
+    let mut edges = graph.edges.to_vec();
+    edges.push(edge);
+    let mut j = graph.j.to_vec();
+    j.push(1.0);
+    IsingGraph::new(graph.h.to_vec(), j, edges)
+}
+
+fn params(reads: usize, sweeps: usize, sweeps_per_beta: usize, seed: u64) -> SampleParams {
+    SampleParams {
+        num_reads: reads,
+        num_sweeps: sweeps,
+        sweeps_per_beta,
+        seed,
+        ..SampleParams::default()
+    }
+}
+
+fn run(dev: &MetalDevice, graph: &IsingGraph, p: &SampleParams, tuning: Tuning) -> TunedRun {
+    sample_ising_tuned(dev, graph, p, Kernel::Msa, tuning).expect("msa samples")
+}
+
+fn dense(tuning: Tuning) -> Tuning {
+    Tuning {
+        force_dense: true,
+        ..tuning
+    }
+}
+
+fn spins(reads: &[SamplerResult]) -> Vec<Vec<i8>> {
+    reads.iter().map(|r| r.spins.clone()).collect()
+}
+
+/// A planning rate so high that the anneal is one command buffer.
+const ONE_CHUNK: f64 = 1e18;
+
+#[test]
+fn a_complete_model_reaches_its_ground_state_at_each_precision() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(64, 1_024, 16, 21);
+    for precision in PRECISIONS {
+        let (graph, planted) = planted_complete(64, precision);
+        let ground = energy_milli(&planted, &graph.h, &graph.j, &graph.edges);
+        // Degree 63 is past every sparse lane, so the model routes dense.
+        let out = run(&dev, &graph, &p, Tuning::default());
+        assert_eq!(out.storage, Storage::Dense, "{precision:?}");
+        assert_eq!(out.reads.len(), 64, "{precision:?}");
+        for read in &out.reads {
+            assert_eq!(
+                read.energy_milli,
+                energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges),
+                "{precision:?}"
+            );
+        }
+        let best = out.reads.iter().min_by_key(|r| r.energy_milli).unwrap();
+        assert_eq!(best.energy_milli, ground, "{precision:?}");
+        assert_eq!(best.spins, planted, "{precision:?}");
+    }
+}
+
+/// The dense kernel keeps the sparse kernels' update order, RNG streams, and
+/// acceptance arithmetic, so a model both paths hold returns the same reads,
+/// bit for bit, at every precision. Spilled spin words and sweep windows
+/// change nothing either.
+#[test]
+fn the_dense_path_matches_the_sparse_path() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(64, 64, 4, 7);
+    for precision in PRECISIONS {
+        let graph = circulant(200, 20, precision);
+        let whole = Tuning {
+            planning_rate: Some(ONE_CHUNK),
+            ..Tuning::default()
+        };
+        let sparse = run(&dev, &graph, &p, whole);
+        assert_eq!(sparse.storage, Storage::Threadgroup, "{precision:?}");
+        let dense_run = run(&dev, &graph, &p, dense(whole));
+        assert_eq!(dense_run.storage, Storage::Dense, "{precision:?}");
+        assert_eq!(dense_run.plan.len(), 1, "{precision:?}");
+        assert_eq!(
+            spins(&dense_run.reads),
+            spins(&sparse.reads),
+            "{precision:?}"
+        );
+        assert_eq!(dense_run.reads, sparse.reads, "{precision:?} energies");
+        // The anneal moved: the reads are not all one state.
+        assert!(
+            sparse
+                .reads
+                .iter()
+                .any(|r| r.spins != sparse.reads[0].spins),
+            "{precision:?}"
+        );
+        for (cap, rate) in [
+            (Some(0), Some(ONE_CHUNK)),
+            (Some(37), Some(ONE_CHUNK)),
+            // One-sweep windows: every chunk resumes from the carry-over.
+            (None, Some(1.0)),
+            (Some(37), Some(1.0)),
+        ] {
+            let tuning = dense(Tuning {
+                shared_spins_cap: cap,
+                planning_rate: rate,
+                ..Tuning::default()
+            });
+            let other = run(&dev, &graph, &p, tuning);
+            assert_eq!(
+                other.reads,
+                sparse.reads,
+                "{precision:?}: K cap {cap:?}, {} chunks",
+                other.plan.len()
+            );
+        }
+    }
+}
+
+/// A repeated coupler or a self-loop has no single matrix cell, so such a
+/// model keeps sparse storage: the automatic route refuses it past the
+/// sparse degree, and a forced dense run refuses it before any buffer.
+#[test]
+fn a_repeated_coupler_or_a_self_loop_stays_sparse() {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(32, 16, 4, 3);
+    let clean = complete(80, -1.0);
+    assert_eq!(
+        run(&dev, &clean, &p, Tuning::default()).storage,
+        Storage::Dense
+    );
+    for graph in [with_edge(&clean, (1, 0)), with_edge(&clean, (5, 5))] {
+        let err = sample_ising_tuned(&dev, &graph, &p, Kernel::Msa, Tuning::default()).unwrap_err();
+        assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+    }
+    // Below the sparse degree the model runs sparse, and forcing it dense is
+    // refused.
+    let small = with_edge(&complete(40, -1.0), (1, 0));
+    assert_eq!(
+        run(&dev, &small, &p, Tuning::default()).storage,
+        Storage::Threadgroup
+    );
+    let err =
+        sample_ising_tuned(&dev, &small, &p, Kernel::Msa, dense(Tuning::default())).unwrap_err();
+    assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+}
+
+fn portfolio_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/portfolio")
+}
+
+/// The proven ground energies, offset included, of every fixture in
+/// file-name order.
+fn proven_ground_states() -> Vec<(String, f64)> {
+    let manifest = std::fs::read_to_string(portfolio_dir().join("ground_states.json")).unwrap();
+    let records: Vec<serde_json::Value> = serde_json::from_str(&manifest).unwrap();
+    let mut proven: Vec<(String, f64)> = records
+        .iter()
+        .filter(|r| r["status"] == "optimal" && r["gap"].as_f64() == Some(0.0))
+        .map(|r| {
+            (
+                r["file"].as_str().unwrap().to_owned(),
+                r["energy"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    proven.sort_by(|a, b| a.0.cmp(&b.0));
+    proven
+}
+
+/// `E(s) = sum_i h_i s_i + sum_k J_k s_u s_v` in `f64`, without an offset.
+fn real_energy(spins: &[i8], graph: &IsingGraph) -> f64 {
+    let fields: f64 = graph
+        .h
+        .iter()
+        .zip(spins)
+        .map(|(&h, &s)| h * f64::from(s))
+        .sum();
+    let couplings: f64 = graph
+        .j
+        .iter()
+        .zip(graph.edges.iter())
+        .map(|(&j, &(u, v))| j * f64::from(spins[u]) * f64::from(spins[v]))
+        .sum();
+    fields + couplings
+}
+
+/// Port of CUDA `933088c`: each fixture in `range` of the proven list, forced
+/// dense, reaches its proven ground energy with 128 reads of 8,192 sweeps in
+/// 64 beta steps at seed 42.
+fn portfolio_fixtures_run_dense(range: std::ops::Range<usize>) {
+    let dev = MetalDevice::open(0).unwrap();
+    let p = params(128, 8_192, 128, 42);
+    let proven = proven_ground_states();
+    let end = range.end.min(proven.len());
+    let mut failures = Vec::new();
+    for (file, ground) in &proven[range.start..end] {
+        let model = read_model(&portfolio_dir().join(file)).unwrap();
+        let out = run(&dev, &model.graph, &p, dense(Tuning::default()));
+        assert_eq!(out.storage, Storage::Dense, "{file}");
+        assert_eq!(out.reads.len(), 128, "{file}");
+        let best = out
+            .reads
+            .iter()
+            .map(|r| real_energy(&r.spins, &model.graph) + model.offset)
+            .fold(f64::INFINITY, f64::min);
+        let tolerance = 1e-6 * ground.abs().max(1.0);
+        if (best - ground).abs() > tolerance {
+            failures.push(format!("{file}: best {best} against proven {ground}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn every_portfolio_fixture_runs_dense() {
+    portfolio_fixtures_run_dense(0..6);
+}
+
+#[test]
+#[ignore = "the fixtures after the first six take minutes: run with --release --ignored"]
+fn every_later_portfolio_fixture_runs_dense() {
+    portfolio_fixtures_run_dense(6..usize::MAX);
+}
+
+/// Reads one dispatch runs at most: the batch path's read cap.
+const MAX_READS: usize = 256;
+
+/// GPU time of the dense kernel on complete models, for the planning rate in
+/// `docs/perf/2026-11-12-msa-dense.md`. Each shape runs 256 reads with the
+/// production chunk plan and reports the measured column rate of one
+/// threadgroup and the longest chunk. The large shapes run a few sweeps,
+/// one sweep per chunk, to find where one sweep passes 400 ms.
+#[test]
+#[ignore = "minutes of device time: run with --release --ignored --nocapture"]
+fn dense_rates() {
+    let dev = MetalDevice::open(0).unwrap();
+    let groups = MAX_READS / 32;
+    let shapes = [
+        (64, 1 << 20),
+        (256, 1 << 20),
+        (1_024, 1 << 20),
+        (4_096, 1 << 20),
+        (4_800, 1 << 17),
+        (5_600, 1 << 17),
+        (6_016, 1 << 17),
+    ];
+    for precision in PRECISIONS {
+        for (nodes, budget) in shapes {
+            let (graph, _) = planted_complete(nodes, precision);
+            let sweeps = (budget / nodes).max(4);
+            let p = params(MAX_READS, sweeps, (sweeps / 64).max(1), 9);
+            let out = run(&dev, &graph, &p, Tuning::default());
+            assert_eq!(out.storage, Storage::Dense);
+            assert_eq!(out.reads.len(), MAX_READS, "{precision:?} {nodes}");
+            let columns = (groups * nodes * sweeps) as f64 * nodes as f64;
+            let gpu = out.gpu_time_us.max(1) as f64;
+            writeln!(
+                io::stdout().lock(),
+                "{{\"precision\":\"{precision:?}\",\"nodes\":{nodes},\"sweeps\":{sweeps},\"gpu_ms\":{:.1},\"mcolumns_per_s_per_group\":{:.1},\"max_chunk_ms\":{:.1},\"chunks\":{}}}",
+                gpu / 1e3,
+                columns / gpu / groups as f64,
+                out.max_chunk_us as f64 / 1e3,
+                out.plan.len()
+            )
+            .unwrap();
+        }
+    }
+}

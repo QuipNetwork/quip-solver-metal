@@ -41,7 +41,7 @@ pub enum Kernel {
     Gibbs,
 }
 
-use crate::capacity::{host_limits, runnable_footprint, DeviceLimits, ModelShape};
+use crate::capacity::{host_limits, DeviceLimits, ModelShape, Storage};
 use crate::representation::{batch_wide_i8_scale, classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_float, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
@@ -198,6 +198,25 @@ const FLOAT_MSA_COST_FACTOR: f64 = 5.3;
 /// the Float32 lane on degree-62 circulants: see
 /// `weighted_msa_high_degree_chunks_stay_under_the_ceiling`.
 const WEIGHTED_MSA_DENSE_COST_FACTOR: f64 = 6.8;
+
+/// Matrix columns one threadgroup of the dense-matrix multi-spin kernel
+/// walks per second: a word update of an `n`-node model walks `n` columns.
+/// The slowest shape measured in `docs/perf/2026-11-12-msa-dense.md`
+/// (Int8, 64 nodes, 256 reads on an M4 Max). Each threadgroup is one SIMD
+/// group whose column walk is bound by latency, so the rate scales with the
+/// threadgroups and not with the GPU cores, unlike
+/// [`MSA_OCCUPANCY_CURVE`].
+const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 7.0e7;
+/// Margin on [`MSA_MATRIX_COLUMNS_PER_SEC`], so a chunk planned at the
+/// 500 ms ceiling runs about 200 ms on the slowest measured shape.
+const MSA_MATRIX_THROUGHPUT_SAFETY: f64 = 0.4;
+
+/// Planned column updates per second of `groups` dense-matrix threadgroups
+/// that share the GPU with `in_flight` batches of the same shape.
+fn msa_matrix_rate(groups: usize, in_flight: usize) -> f64 {
+    MSA_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_THROUGHPUT_SAFETY * groups.max(1) as f64
+        / in_flight.max(1) as f64
+}
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
 fn wide_sa_group(num_reads: usize, pipeline_max: usize) -> usize {
@@ -497,6 +516,11 @@ pub struct Tuning {
     /// memory, at most [`GIBBS_MAX_NODES`]. A model of more nodes runs the
     /// spill build.
     pub gibbs_prefix_cap: Option<usize>,
+    /// Runs a multi-spin model on dense-matrix storage
+    /// ([`crate::capacity::Storage::Dense`]) whatever tier the capacity
+    /// model routes it to. A model with a repeated coupler or a self-loop
+    /// is refused.
+    pub force_dense: bool,
 }
 
 /// Split a beta schedule into chunks whose dispatches each land near
@@ -761,6 +785,9 @@ pub(crate) struct CachedTopology {
     pub(crate) n: usize,
     pub(crate) edges: std::sync::Arc<[(usize, usize)]>,
     pub(crate) four_color: bool,
+    /// The colouring alone, for dense-matrix storage: `topo` has no CSR
+    /// arrays, and `row` and `col` are four-byte stubs.
+    pub(crate) colors_only: bool,
     pub(crate) topo: SelfFeedingTopology,
     pub(crate) colors: Vec<metal::Buffer>,
     pub(crate) row: metal::Buffer,
@@ -780,6 +807,27 @@ impl TopologyCache {
         graph: &IsingGraph,
         four_color: bool,
     ) -> Result<std::sync::Arc<CachedTopology>, SampleError> {
+        self.get_or_build_as(device, graph, four_color, false)
+    }
+
+    /// [`Self::get_or_build`] for dense-matrix storage: the colouring alone,
+    /// with no CSR on the host or the device.
+    pub(crate) fn get_or_build_colors(
+        &self,
+        device: &crate::metal_device::MetalDevice,
+        graph: &IsingGraph,
+        four_color: bool,
+    ) -> Result<std::sync::Arc<CachedTopology>, SampleError> {
+        self.get_or_build_as(device, graph, four_color, true)
+    }
+
+    fn get_or_build_as(
+        &self,
+        device: &crate::metal_device::MetalDevice,
+        graph: &IsingGraph,
+        four_color: bool,
+        colors_only: bool,
+    ) -> Result<std::sync::Arc<CachedTopology>, SampleError> {
         let mut slot = self
             .slot
             .lock()
@@ -787,12 +835,18 @@ impl TopologyCache {
         if let Some(entry) = slot.as_ref() {
             if entry.n == graph.num_nodes()
                 && entry.four_color == four_color
+                && entry.colors_only == colors_only
                 && entry.edges == graph.edges
             {
                 return Ok(std::sync::Arc::clone(entry));
             }
         }
-        let cached = std::sync::Arc::new(build_cached_topology(device, graph, four_color)?);
+        let cached = std::sync::Arc::new(build_cached_topology(
+            device,
+            graph,
+            four_color,
+            colors_only,
+        )?);
         *slot = Some(std::sync::Arc::clone(&cached));
         Ok(cached)
     }
@@ -802,8 +856,11 @@ fn build_cached_topology(
     device: &crate::metal_device::MetalDevice,
     graph: &IsingGraph,
     four_color: bool,
+    colors_only: bool,
 ) -> Result<CachedTopology, SampleError> {
-    let topo = if four_color {
+    let topo = if colors_only {
+        SelfFeedingTopology::colors_only(graph, four_color)
+    } else if four_color {
         SelfFeedingTopology::build_with_advantage2_coloring(graph)
     } else {
         SelfFeedingTopology::build(graph)
@@ -825,6 +882,7 @@ fn build_cached_topology(
         n: graph.num_nodes(),
         edges: std::sync::Arc::clone(&graph.edges),
         four_color,
+        colors_only,
         topo,
         colors,
         row,
@@ -965,6 +1023,8 @@ pub(crate) struct EncodedBatch {
     pool: std::sync::Arc<BufferPool>,
     /// Multi-spin and SA carry-over buffers rented from `pool`.
     pooled: Vec<metal::Buffer>,
+    /// The storage tier the batch runs on.
+    pub(crate) storage: crate::capacity::Storage,
 }
 
 impl EncodedBatch {
@@ -1027,6 +1087,7 @@ impl EncodedBatch {
                 words,
                 state_bytes,
                 shared_spins,
+                virtual_threads,
             } => {
                 self.bind_colors(encoder, *words);
                 bind_color_kernel_chunk(encoder, persist, beta_start, beta_count);
@@ -1035,6 +1096,9 @@ impl EncodedBatch {
                     set_bytes_i32(encoder, 27, *shared);
                     set_bytes_i32(encoder, 28, sweep_start);
                     set_bytes_i32(encoder, 29, sweep_count);
+                }
+                if let Some(width) = virtual_threads {
+                    set_bytes_i32(encoder, 30, *width);
                 }
             }
         }
@@ -1376,8 +1440,16 @@ pub(crate) fn validate_batch<'a>(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<(&'a IsingGraph, usize, Representation), SampleError> {
-    validate_batch_within(graphs, params, kernel, host_device_limits(), false, None)
-        .map(|batch| (batch.first, batch.n, batch.rep))
+    validate_batch_within(
+        graphs,
+        params,
+        kernel,
+        host_device_limits(),
+        false,
+        None,
+        DenseMode::Off,
+    )
+    .map(|batch| (batch.first, batch.n, batch.rep))
 }
 
 /// A batch [`validate_batch_within`] admits.
@@ -1390,8 +1462,26 @@ struct ValidBatch<'a> {
     /// The `int8_t` storage scale, when the batch takes that storage.
     i8_scale: Option<i32>,
     /// An MSA batch with a CSR row past one chunk of [`MSA_UNIT_MAX_DEG`]:
-    /// it runs on the dense weighted pipeline.
+    /// on CSR storage it runs on the dense-rows weighted pipeline.
     dense_rows: bool,
+    /// The storage tier the admission priced the batch on.
+    storage: Storage,
+    /// Every coupling and field is in {-1, 0, 1}, so a dense-matrix batch
+    /// holds a bit matrix.
+    unit: bool,
+}
+
+/// Whether a batch may take dense-matrix storage ([`Storage::Dense`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenseMode {
+    /// CSR storage only: the resident, streaming, and slot gates, whose
+    /// paths run no dense kernel.
+    Off,
+    /// The tier the capacity model routes the batch to (the batch path).
+    Auto,
+    /// Dense storage, refusing a model that is not a dense candidate
+    /// ([`Tuning::force_dense`]).
+    Forced,
 }
 
 /// Memory limits of this host, computed once.
@@ -1406,7 +1496,8 @@ pub(crate) fn host_device_limits() -> &'static DeviceLimits {
 /// storage, the faster one on the dense pipeline.
 ///
 /// The footprint check comes last and runs before any buffer exists, so a
-/// model that does not fit is refused without allocating.
+/// model that does not fit is refused without allocating. `dense` says
+/// whether the batch may take dense-matrix storage.
 fn validate_batch_within<'a>(
     graphs: &[&'a IsingGraph],
     params: &SampleParams,
@@ -1414,6 +1505,7 @@ fn validate_batch_within<'a>(
     limits: &DeviceLimits,
     allow_i8: bool,
     node_cap: Option<usize>,
+    dense: DenseMode,
 ) -> Result<ValidBatch<'a>, SampleError> {
     let Some(&first) = graphs.first() else {
         // Was a `debug_assert!`, which is compiled out in release — an empty
@@ -1448,34 +1540,77 @@ fn validate_batch_within<'a>(
         )));
     }
     let mut rep = batch_representation(graphs, kernel)?;
+    let unit = rep == Representation::Binary;
     let mut dense_rows = false;
+    let mut over_budget = None;
     if kernel == Kernel::Msa {
         // The unit kernel unrolls a fixed 20-neighbour prefetch, so a denser
         // unit model moves to the weighted lane, and the weighted lanes walk
         // at most `msa_max_degree` neighbours. A denser node is capacity,
-        // not a driver fault: the coordinator routes the job to a backend
-        // that walks CSR rows of any length.
+        // not a driver fault: the batch path runs it on dense-matrix storage
+        // when the capacity model routes it there, and otherwise the
+        // coordinator routes the job to a backend that walks CSR rows of any
+        // length.
         let max_deg = max_csr_degree(first);
         rep = msa_lane(rep, max_deg, n);
         let budget = msa_max_degree(rep);
         if max_deg > budget {
-            return Err(SampleError::TooLarge(format!(
+            over_budget = Some(format!(
                 "graph max degree {max_deg} exceeds the multi-spin kernel's \
                  {budget}-neighbour budget"
-            )));
+            ));
         }
         dense_rows = max_deg > MSA_UNIT_MAX_DEG;
     }
+    if dense == DenseMode::Off {
+        if let Some(message) = over_budget.take() {
+            return Err(SampleError::TooLarge(message));
+        }
+    }
     let i8_scale = batch_i8_scale(graphs, rep, allow_i8 && !dense_rows);
-    shape_footprint(first, params, kernel, rep, i8_scale.is_some(), limits)
-        .map(drop)
-        .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}")))?;
+    let shape = model_shape(first, params, rep, i8_scale.is_some());
+    let too_large = |e: crate::capacity::CapacityError| {
+        SampleError::TooLarge(format!("{kernel:?} model of {n} nodes: {e}"))
+    };
+    let footprint = match dense {
+        DenseMode::Off => crate::capacity::footprint_in(
+            kernel,
+            &shape,
+            limits,
+            &[Storage::Threadgroup, Storage::Spill],
+        ),
+        DenseMode::Auto => {
+            crate::capacity::routed_runnable_footprint(kernel, first, &shape, limits)
+        }
+        DenseMode::Forced => {
+            if !crate::capacity::runnable_storages(kernel).contains(&Storage::Dense) {
+                return Err(SampleError::TooLarge(format!(
+                    "the {kernel:?} kernel has no dense-matrix build"
+                )));
+            }
+            if !crate::topology::dense_candidate(first) {
+                return Err(SampleError::TooLarge(
+                    "dense-matrix storage needs a model without a repeated coupler or a self-loop"
+                        .into(),
+                ));
+            }
+            crate::capacity::footprint_in(kernel, &shape, limits, &[Storage::Dense])
+        }
+    }
+    .map_err(too_large)?;
+    if footprint.storage != Storage::Dense {
+        if let Some(message) = over_budget {
+            return Err(SampleError::TooLarge(message));
+        }
+    }
     Ok(ValidBatch {
         first,
         n,
         rep,
         i8_scale,
         dense_rows,
+        storage: footprint.storage,
+        unit,
     })
 }
 
@@ -1490,22 +1625,22 @@ fn batch_i8_scale(graphs: &[&IsingGraph], rep: Representation, allow: bool) -> O
     }
 }
 
-/// The footprint of one model of a batch, or the capacity reason it does not
-/// fit. `i8_storage` is a wide model held as `int8_t` coefficients with `int`
-/// deltas and fields.
-fn shape_footprint(
+/// The size of one model of a batch for the capacity model. `i8_storage` is
+/// a wide model held as `int8_t` coefficients with `int` deltas and fields.
+///
+/// A unit model costs what Int8 does on every tier. On CSR storage that is
+/// its exact width. A dense-matrix unit model holds two bit planes, a
+/// quarter of the Int8 bytes, so the dense tier overstates it.
+fn model_shape(
     graph: &IsingGraph,
     params: &SampleParams,
-    kernel: Kernel,
     rep: Representation,
     i8_storage: bool,
-    limits: &DeviceLimits,
-) -> Result<crate::capacity::Footprint, crate::capacity::CapacityError> {
-    let shape = ModelShape {
+) -> ModelShape {
+    ModelShape {
         nodes: graph.num_nodes(),
         edges: graph.edges.len(),
         max_degree: max_csr_degree(graph),
-        // No bit-packed kernel exists, so a Binary model costs what Int8 does.
         precision: if rep == Representation::Binary {
             Representation::Int8.precision()
         } else if i8_storage {
@@ -1516,9 +1651,7 @@ fn shape_footprint(
         // `num_sweeps` bounds the beta schedule length from above.
         betas: params.num_sweeps,
         reads: params.num_reads,
-    };
-    // `footprint` compares the total for `instances` with `usable_bytes`.
-    runnable_footprint(kernel, &shape, limits)
+    }
 }
 
 /// The footprint `encode_batch` admits `graph` at, for tests of the storage
@@ -1544,13 +1677,12 @@ pub fn model_footprint(
     // A model past the default `K` runs the spill build on `int` storage.
     let past_k = kernel == Kernel::Msa && graph.num_nodes() > MSA_MAX_NODES;
     let i8_scale = batch_i8_scale(&[graph], rep, !dense_rows && !past_k);
-    shape_footprint(
-        graph,
-        params,
+    // The resident gate runs CSR storage only.
+    crate::capacity::footprint_in(
         kernel,
-        rep,
-        i8_scale.is_some(),
+        &model_shape(graph, params, rep, i8_scale.is_some()),
         host_device_limits(),
+        &[Storage::Threadgroup, Storage::Spill],
     )
     .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model: {e}")))
 }
@@ -1697,6 +1829,159 @@ fn upload_inputs(
     })
 }
 
+/// The element type of a dense coupling matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixKind {
+    /// Two bit planes per 32 columns: the negative and the nonzero
+    /// couplings of a unit model.
+    Bits,
+    /// `int8_t` milli coefficients divided by this scale.
+    Int8(i32),
+    /// Milli `int` coefficients.
+    Int32,
+    /// `float` coefficients.
+    Float32,
+}
+
+/// Elements of one row of an `n`-node dense matrix: `uint` words of two bit
+/// planes for a unit model, else one coefficient per column.
+fn dense_row_elems(n: usize, unit: bool) -> usize {
+    if unit {
+        2 * n.div_ceil(32)
+    } else {
+        n
+    }
+}
+
+/// One problem's matrix and fields in the layout `kernels/msa_dense.metal`
+/// reads: row `u` holds the coupling of every column `v`, both halves of
+/// each edge, and a zero diagonal. The caller routed only dense candidates
+/// here, so every pair appears once.
+fn fill_dense<T: Copy>(
+    graph: &IsingGraph,
+    n: usize,
+    matrix: &mut [T],
+    h: &mut [T],
+    value: impl Fn(f64) -> T,
+) {
+    for (&(u, v), &j) in graph.edges.iter().zip(graph.j.iter()) {
+        if u >= n || v >= n || u == v {
+            continue;
+        }
+        matrix[u * n + v] = value(j);
+        matrix[v * n + u] = value(j);
+    }
+    for (slot, &field) in h.iter_mut().zip(graph.h.iter()) {
+        *slot = value(field);
+    }
+}
+
+/// Upload a dense-matrix batch: each problem's matrix at buffer 2 and its
+/// fields at buffer 15, in pooled buffers. The CSR and offset slots get
+/// four-byte stubs the kernel never reads.
+fn upload_dense_inputs(
+    device: &crate::metal_device::MetalDevice,
+    graphs: &[&IsingGraph],
+    n: usize,
+    kind: MatrixKind,
+) -> Result<InputBuffers, SampleError> {
+    use crate::representation::to_milli;
+    let pool = &device.buffer_pool;
+    let cells = n * n;
+    let (j, h) = match kind {
+        MatrixKind::Bits => {
+            let row = dense_row_elems(n, true);
+            let mut matrix = vec![0_u32; graphs.len() * n * row];
+            let mut fields = vec![0_i8; graphs.len() * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                let rows = &mut matrix[p * n * row..(p + 1) * n * row];
+                for (&(u, v), &value) in graph.edges.iter().zip(graph.j.iter()) {
+                    if u >= n || v >= n || u == v || value == 0.0 {
+                        continue;
+                    }
+                    for (a, b) in [(u, v), (v, u)] {
+                        let word = a * row + 2 * (b / 32);
+                        let bit = 1_u32 << (b % 32);
+                        if value < 0.0 {
+                            rows[word] |= bit;
+                        }
+                        rows[word + 1] |= bit;
+                    }
+                }
+                for (slot, &field) in fields[p * n..(p + 1) * n].iter_mut().zip(graph.h.iter()) {
+                    // A unit field is -1, 0, or 1.
+                    *slot = field as i8;
+                }
+            }
+            (
+                pooled_from_slice(pool, &device.device, &matrix)?,
+                pooled_from_slice(pool, &device.device, &fields)?,
+            )
+        }
+        MatrixKind::Int8(scale) => {
+            let mut matrix = vec![0_i8; graphs.len() * cells];
+            let mut fields = vec![0_i8; graphs.len() * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                // `batch_wide_i8_scale` checked every quotient against `i8`.
+                fill_dense(
+                    graph,
+                    n,
+                    &mut matrix[p * cells..(p + 1) * cells],
+                    &mut fields[p * n..(p + 1) * n],
+                    |v| (to_milli(v).unwrap_or(0) / scale) as i8,
+                );
+            }
+            (
+                pooled_from_slice(pool, &device.device, &matrix)?,
+                pooled_from_slice(pool, &device.device, &fields)?,
+            )
+        }
+        MatrixKind::Int32 => {
+            let mut matrix = vec![0_i32; graphs.len() * cells];
+            let mut fields = vec![0_i32; graphs.len() * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                fill_dense(
+                    graph,
+                    n,
+                    &mut matrix[p * cells..(p + 1) * cells],
+                    &mut fields[p * n..(p + 1) * n],
+                    |v| to_milli(v).unwrap_or(0),
+                );
+            }
+            (
+                pooled_from_slice(pool, &device.device, &matrix)?,
+                pooled_from_slice(pool, &device.device, &fields)?,
+            )
+        }
+        MatrixKind::Float32 => {
+            let mut matrix = vec![0_f32; graphs.len() * cells];
+            let mut fields = vec![0_f32; graphs.len() * n];
+            for (p, graph) in graphs.iter().enumerate() {
+                fill_dense(
+                    graph,
+                    n,
+                    &mut matrix[p * cells..(p + 1) * cells],
+                    &mut fields[p * n..(p + 1) * n],
+                    |v| v as f32,
+                );
+            }
+            (
+                pooled_from_slice(pool, &device.device, &matrix)?,
+                pooled_from_slice(pool, &device.device, &fields)?,
+            )
+        }
+    };
+    let stub = || checked_buffer(device.new_zeroed_buffer(4));
+    Ok(InputBuffers {
+        row: stub()?,
+        col: stub()?,
+        j,
+        h,
+        row_off: stub()?,
+        col_off: stub()?,
+    })
+}
+
 /// Bind the shared buffer layout (indices 0..15) — identical in both kernels.
 fn bind_shared_args(
     enc: &metal::ComputeCommandEncoderRef,
@@ -1834,6 +2119,9 @@ enum KernelEncode {
         /// 27 with the sweep window at 28 and 29; `None` for the unit entry,
         /// which takes neither.
         shared_spins: Option<i32>,
+        /// `V`, the sparse dispatch width the dense-matrix kernel emulates,
+        /// bound at slot 30; `None` on CSR storage.
+        virtual_threads: Option<i32>,
     },
 }
 
@@ -1911,15 +2199,17 @@ fn encode_batch_inner(
         beta_override,
         true,
         Tuning::default(),
+        DenseMode::Off,
     )
 }
 
 /// [`encode_batch_inner`] with `wide_i8` false forcing every wide batch onto
-/// plain `int` coefficients, so tests compare the two storages, and with the
-/// batch kernels' test `tuning`.
+/// plain `int` coefficients, so tests compare the two storages, with the
+/// batch kernels' test `tuning`, and with `dense` saying whether the batch
+/// may take dense-matrix storage.
 #[expect(
     clippy::too_many_arguments,
-    reason = "encode_batch_inner's arguments plus the storage switch and tuning"
+    reason = "encode_batch_inner's arguments plus the storage switches and tuning"
 )]
 fn encode_batch_storage(
     device: &crate::metal_device::MetalDevice,
@@ -1931,6 +2221,7 @@ fn encode_batch_storage(
     beta_override: Option<Vec<f32>>,
     wide_i8: bool,
     tuning: Tuning,
+    dense: DenseMode,
 ) -> Result<EncodedBatch, SampleError> {
     // `K`, the spin words the weighted multi-spin kernel keeps in threadgroup
     // memory. A model past it runs the spill build, which holds `int`
@@ -1938,12 +2229,18 @@ fn encode_batch_storage(
     let tg_limit = device.device.max_threadgroup_memory_length() as usize;
     let k = msa_shared_spins(tg_limit, tuning.shared_spins_cap);
     let past_k = kernel == Kernel::Msa && graphs.first().is_some_and(|g| g.num_nodes() > k);
+    let dense = match dense {
+        DenseMode::Auto if tuning.force_dense => DenseMode::Forced,
+        other => other,
+    };
     let ValidBatch {
         first,
         n,
         rep,
         i8_scale,
         dense_rows,
+        storage,
+        unit,
     } = validate_batch_within(
         graphs,
         params,
@@ -1951,7 +2248,9 @@ fn encode_batch_storage(
         host_device_limits(),
         wide_i8 && !past_k,
         tuning.node_cap,
+        dense,
     )?;
+    let matrix = storage == Storage::Dense;
     // A model past the SA thread-private frame runs the global build, which
     // keeps each read's spins and `delta_energy` in the persistent buffers.
     let sa_global = kernel == Kernel::Sa && (tuning.sa_global || n > SA_MAX_NODES);
@@ -2022,7 +2321,7 @@ fn encode_batch_storage(
     // build, on `int` storage; the default build keeps the one-chunk code
     // alone. A weighted model past `K` takes the spill build, whose milli
     // variant also walks dense rows.
-    let pipeline = match kernel {
+    let sparse_pipeline = match kernel {
         Kernel::Msa if wide && past_k => &device.msa_weighted_spill,
         Kernel::Msa if float && past_k => &device.msa_float_spill,
         Kernel::Sa if sa_global && i8_scale.is_some() => &device.sa_wide_i8_global,
@@ -2051,6 +2350,31 @@ fn encode_batch_storage(
         Kernel::Gibbs if float => &device.gibbs_float,
         Kernel::Gibbs => &device.gibbs,
     };
+    // A dense-matrix batch keeps the RNG streams of the sparse pipeline the
+    // model would take, so it emulates that pipeline's dispatch width. It
+    // holds a bit matrix for a unit model, and otherwise the narrowest
+    // matrix its coefficients fit: `int8_t` storage needs no CSR rule here.
+    let (pipeline, i8_scale) = if matrix {
+        let dense_i8 = if unit {
+            None
+        } else {
+            batch_i8_scale(graphs, rep, wide_i8)
+        };
+        let pipeline = if unit && rep == Representation::Binary {
+            &device.msa_matrix_bits_unit
+        } else if unit {
+            &device.msa_matrix_bits
+        } else if dense_i8.is_some() {
+            &device.msa_matrix_i8
+        } else if wide {
+            &device.msa_matrix_int
+        } else {
+            &device.msa_matrix_float
+        };
+        (pipeline, dense_i8)
+    } else {
+        (sparse_pipeline, i8_scale)
+    };
 
     // Dispatch geometry is constant across a batch's chunks, and must be: the
     // chromatic and multi-spin kernels' RNG stream identity is
@@ -2070,8 +2394,23 @@ fn encode_batch_storage(
     // threadgroups per problem, 1,024 threads splitting each colour class.
     let words = num_reads.div_ceil(MSA_LANES);
     let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+    // The sparse multi-spin width: the dense-matrix kernel's RNG streams.
+    let msa_width = MSA_THREADS
+        .min(sparse_pipeline.max_total_threads_per_threadgroup() as usize)
+        .max(1);
+    if matrix
+        && (max_threads < MSA_LANES || pipeline.thread_execution_width() as usize != MSA_LANES)
+    {
+        return Err(SampleError::TooLarge(format!(
+            "the dense-matrix multi-spin kernel needs one {MSA_LANES}-lane SIMD group per threadgroup; \
+             this device admits {max_threads} threads of width {}",
+            pipeline.thread_execution_width()
+        )));
+    }
     let (groups, threads_per_group) = match kernel {
-        Kernel::Msa => (num_problems * words, MSA_THREADS.min(max_threads).max(1)),
+        // One SIMD group per (problem, word) on dense-matrix storage.
+        Kernel::Msa if matrix => (num_problems * words, MSA_LANES),
+        Kernel::Msa => (num_problems * words, msa_width),
         Kernel::Gibbs if node_parallel && wide => {
             if max_threads < WIDE_GIBBS_GROUP {
                 return Err(SampleError::TooLarge(format!(
@@ -2116,7 +2455,8 @@ fn encode_batch_storage(
     // than let Metal fail the command buffer, which would end the session as
     // a DeviceFault for a per-job size problem.
     let weighted_msa = kernel == Kernel::Msa && (wide || float);
-    let shared_spins = weighted_msa.then_some(k);
+    // The dense-matrix kernel keeps the spill layout at every precision.
+    let shared_spins = (weighted_msa || matrix).then_some(k);
     let state_bytes = (shared_spins.map_or(n, |k| k.min(n)).max(1) * 4).div_ceil(16) * 16;
     if sa_global
         && num_threads
@@ -2147,16 +2487,45 @@ fn encode_batch_storage(
                 "graph N={n} needs {need} B of threadgroup memory; device offers {have} B"
             )));
         }
+        // The kernel indexes a row of one problem's matrix in 32 bits.
+        if matrix
+            && n.checked_mul(dense_row_elems(n, unit))
+                .is_none_or(|cells| cells > u32::MAX as usize)
+        {
+            return Err(SampleError::TooLarge(format!(
+                "a dense matrix of {n} nodes exceeds 32-bit row indexing"
+            )));
+        }
     }
 
-    let cached = device.topology_cache.get_or_build(
-        device,
-        first,
-        kernel == Kernel::Msa && msa_four_color(),
-    )?;
-    let inputs = upload_inputs(device, &cached, graphs, kernel, rep, i8_scale)?;
+    let four_color = kernel == Kernel::Msa && msa_four_color();
+    let (cached, inputs) = if matrix {
+        let cached = device
+            .topology_cache
+            .get_or_build_colors(device, first, four_color)?;
+        let kind = if unit {
+            MatrixKind::Bits
+        } else if let Some(scale) = i8_scale {
+            MatrixKind::Int8(scale)
+        } else if wide {
+            MatrixKind::Int32
+        } else {
+            MatrixKind::Float32
+        };
+        let inputs = upload_dense_inputs(device, graphs, n, kind)?;
+        (cached, inputs)
+    } else {
+        let cached = device
+            .topology_cache
+            .get_or_build(device, first, four_color)?;
+        let inputs = upload_inputs(device, &cached, graphs, kernel, rep, i8_scale)?;
+        (cached, inputs)
+    };
 
     let cost = match (rep, kernel) {
+        // Every word update of the dense-matrix kernel walks all `n`
+        // columns, planned at `msa_matrix_rate` column updates per second.
+        (_, Kernel::Msa) if matrix => n.max(1) as f64,
         (Representation::Wide, Kernel::Sa) => WIDE_SA_COST_FACTOR,
         (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
@@ -2198,8 +2567,19 @@ fn encode_batch_storage(
             groups,
             in_flight,
             cost,
-            weighted_msa || kernel == Kernel::Sa || (kernel == Kernel::Gibbs && node_parallel),
-            tuning.planning_rate,
+            weighted_msa
+                || matrix
+                || kernel == Kernel::Sa
+                || (kernel == Kernel::Gibbs && node_parallel),
+            if matrix {
+                Some(
+                    tuning
+                        .planning_rate
+                        .unwrap_or_else(|| msa_matrix_rate(groups, in_flight)),
+                )
+            } else {
+                tuning.planning_rate
+            },
         ),
     };
     let mut pooled = Vec::new();
@@ -2259,12 +2639,14 @@ fn encode_batch_storage(
             let energies = device
                 .buffer_pool
                 .take(&device.device, (num_samples * 4) as u64)?;
+            // The dense-matrix kernel holds the sparse width of streams.
+            let streams_per_group = if matrix { msa_width } else { threads_per_group };
             let persist = new_msa_persistent(
                 &device.buffer_pool,
                 &device.device,
                 groups,
                 n,
-                threads_per_group,
+                streams_per_group,
             )?;
             pooled.extend([
                 inputs.j.clone(),
@@ -2286,6 +2668,7 @@ fn encode_batch_storage(
                     words: words as i32,
                     state_bytes: state_bytes as u64,
                     shared_spins: shared_spins.map(|k| i32::try_from(k).unwrap_or(i32::MAX)),
+                    virtual_threads: matrix.then(|| i32::try_from(msa_width).unwrap_or(i32::MAX)),
                 },
             )
         }
@@ -2296,6 +2679,7 @@ fn encode_batch_storage(
     Ok(EncodedBatch {
         // The weighted entry and its float lane leave energies to the host.
         device_energy: kernel == Kernel::Msa
+            && !matrix
             && !wide
             && !float
             && graphs.iter().all(|g| device_energy_exact(g)),
@@ -2321,6 +2705,13 @@ fn encode_batch_storage(
         cached,
         pool: std::sync::Arc::clone(&device.buffer_pool),
         pooled,
+        storage: if matrix {
+            Storage::Dense
+        } else if (weighted_msa && past_k) || sa_global || gibbs_spill {
+            Storage::Spill
+        } else {
+            Storage::Threadgroup
+        },
     })
 }
 
@@ -2449,7 +2840,8 @@ pub(crate) fn audit_device_energies(
 ///
 /// Returns [`SampleError::TooLarge`] (harness `SampleError::Capacity`) when:
 /// - the model does not fit the device's memory
-///   (`capacity::runnable_footprint`),
+///   (`capacity::routed_runnable_footprint`, which runs dense-matrix storage
+///   for a multi-spin model past the sparse degree),
 ///   which bounds every kernel's model;
 /// - `params.num_sweeps` exceeds `MAX_SWEEPS`, the sampler's guard against an
 ///   unbounded coordinator-supplied beta schedule.
@@ -2530,6 +2922,8 @@ pub struct TunedRun {
     pub max_chunk_us: u64,
     /// GPU time of every command buffer together, microseconds.
     pub gpu_time_us: u64,
+    /// The storage tier the anneal ran on.
+    pub storage: crate::capacity::Storage,
 }
 
 /// [`sample_ising`] with the batch kernels' test `tuning`, so tests can
@@ -2594,6 +2988,7 @@ fn run_planned(
             plan: Vec::new(),
             max_chunk_us: 0,
             gpu_time_us: 0,
+            storage: crate::capacity::Storage::Threadgroup,
         });
     }
 
@@ -2607,6 +3002,7 @@ fn run_planned(
         None,
         wide_i8,
         tuning,
+        DenseMode::Auto,
     )?;
     while batch.commit_next(|| false) {
         batch.wait_until_completed();
@@ -2633,6 +3029,7 @@ fn run_planned(
         plan: batch.plan.clone(),
         max_chunk_us: batch.max_chunk_us(),
         gpu_time_us: batch.gpu_time_us(),
+        storage: batch.storage,
     })
 }
 
@@ -3143,8 +3540,16 @@ mod tests {
             .then(|| crate::metal_device::MetalDevice::open(0).unwrap());
         let before = device.as_ref().map(|d| d.device.current_allocated_size());
         let g = ring();
-        let err = validate_batch_within(&[&g], &params(64), Kernel::Sa, &limits, false, None)
-            .unwrap_err();
+        let err = validate_batch_within(
+            &[&g],
+            &params(64),
+            Kernel::Sa,
+            &limits,
+            false,
+            None,
+            DenseMode::Auto,
+        )
+        .unwrap_err();
         let SampleError::TooLarge(message) = &err else {
             panic!("expected TooLarge, got {err:?}");
         };
@@ -3303,6 +3708,7 @@ mod tests {
             host_device_limits(),
             false,
             Some(GIBBS_MAX_NODES),
+            DenseMode::Auto,
         )
         .map(drop)
         .unwrap_err();
@@ -3561,6 +3967,7 @@ mod tests {
                 None,
                 true,
                 Tuning::default(),
+                DenseMode::Auto,
             )
             .unwrap();
             assert!(
@@ -3691,6 +4098,7 @@ mod tests {
                 None,
                 true,
                 Tuning::default(),
+                DenseMode::Auto,
             )
             .unwrap();
             let plain = encode_batch_storage(
@@ -3703,6 +4111,7 @@ mod tests {
                 None,
                 false,
                 Tuning::default(),
+                DenseMode::Auto,
             )
             .unwrap();
             assert_eq!(

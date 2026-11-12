@@ -118,14 +118,9 @@ fn complete_graphs_at_16_64_65_and_200_nodes_report_exact_energies() {
         // best() asserts reported == recomputed for every read.
         best(&dev, &graph, Kernel::Sa, 64);
         best(&dev, &graph, Kernel::Gibbs, 64);
-        // MSA walks at most 62 neighbours: K_16 runs, denser graphs are
-        // capacity.
-        if n - 1 <= 62 {
-            best(&dev, &graph, Kernel::Msa, 64);
-        } else {
-            let err = sample_ising(&dev, &graph, &params(64), Kernel::Msa).unwrap_err();
-            assert!(matches!(err, SampleError::TooLarge(_)), "K_{n}: {err:?}");
-        }
+        // MSA walks CSR rows of at most 62 neighbours: K_16 runs on CSR, and
+        // the denser graphs run on dense-matrix storage.
+        best(&dev, &graph, Kernel::Msa, 64);
     }
 }
 

@@ -277,6 +277,57 @@ impl SelfFeedingTopology {
         topology
     }
 
+    /// The colouring of [`Self::build_with_advantage2_coloring`] (when
+    /// `four_color` is set) or [`Self::build`], without the CSR arrays, for
+    /// the dense-matrix multi-spin kernel. `row_ptr`, `col_ind`, and
+    /// `edge_pos` are empty and `nnz` is 0. The greedy colouring depends on
+    /// each node's neighbour set and degree only, so a transient CSR in any
+    /// column order yields the colouring `build` gives.
+    pub(crate) fn colors_only(graph: &IsingGraph, four_color: bool) -> Self {
+        let n = graph.h.len();
+        if let Some(colors) = four_color.then(|| advantage2_color(graph)).flatten() {
+            return Self::without_csr(n, colors);
+        }
+        let mut row_ptr = vec![0i32; n + 1];
+        for &(u, v) in graph.edges.iter() {
+            if u >= n || v >= n {
+                continue;
+            }
+            row_ptr[u + 1] += 1;
+            if u != v {
+                row_ptr[v + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            row_ptr[i + 1] += row_ptr[i];
+        }
+        let mut next = row_ptr.clone();
+        let mut col_ind = vec![0i32; row_ptr[n] as usize];
+        for &(u, v) in graph.edges.iter() {
+            if u >= n || v >= n {
+                continue;
+            }
+            col_ind[next[u] as usize] = v as i32;
+            next[u] += 1;
+            if u != v {
+                col_ind[next[v] as usize] = u as i32;
+                next[v] += 1;
+            }
+        }
+        Self::without_csr(n, greedy_color(n, &row_ptr, &col_ind))
+    }
+
+    fn without_csr(n: usize, colors: ColorBlocks) -> Self {
+        Self {
+            n,
+            nnz: 0,
+            row_ptr: Vec::new(),
+            col_ind: Vec::new(),
+            edge_pos: Vec::new(),
+            colors,
+        }
+    }
+
     /// Build CSR + coloring from a graph. `graph.edges` fixes the canonical
     /// edge order used by `edge_pos` (and thus by [`fill_h_j`] for this and
     /// every later job sharing this topology).
@@ -520,6 +571,33 @@ fn fill_h_j_inspecting_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dense-matrix kernel keeps the sparse kernels' update order, so its
+    /// colouring must be the one the CSR build gives.
+    #[test]
+    fn colors_only_matches_the_csr_build() {
+        let n = 50;
+        let complete: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let circulant: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (1..=10).map(move |d| (i, (i + d) % n)))
+            .collect();
+        // Edges in a scrambled order, so the transient CSR differs in order.
+        let mut scrambled = circulant.clone();
+        scrambled.reverse();
+        for edges in [complete, circulant, scrambled] {
+            let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+            let only = SelfFeedingTopology::colors_only(&graph, false);
+            assert_eq!(only.colors, SelfFeedingTopology::build(&graph).colors);
+            assert_eq!((only.n, only.nnz), (n, 0));
+            assert!(only.col_ind.is_empty() && only.edge_pos.is_empty());
+            assert_eq!(
+                SelfFeedingTopology::colors_only(&graph, true).colors,
+                SelfFeedingTopology::build_with_advantage2_coloring(&graph).colors
+            );
+        }
+    }
 
     #[test]
     fn matching_coefficients_require_exact_topology() {

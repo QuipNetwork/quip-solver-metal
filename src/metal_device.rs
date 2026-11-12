@@ -83,6 +83,23 @@ fn float(source: &str) -> String {
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
+/// The dense-matrix multi-spin kernel, appended to [`MSA_SRC`] for its RNG,
+/// spin stores, and coefficient types; see `kernels/msa_dense.metal`.
+const MSA_DENSE_SRC: &str = include_str!("../kernels/msa_dense.metal");
+
+/// Prepended to a dense-matrix multi-spin variant whose matrix holds two bit
+/// planes per 32 columns (a unit model).
+const MSA_MATRIX_BITS_DEFINE: &str = "#define QUIP_MSA_MATRIX_BITS 1\n";
+
+/// Prepended to the bit-matrix variant that accepts with the unit kernel's
+/// geometric draw instead of the weighted lane's threshold rows.
+const MSA_MATRIX_UNIT_DEFINE: &str = "#define QUIP_MSA_MATRIX_UNIT 1\n";
+
+/// The dense-matrix kernel source after the `defines` of its variant.
+fn msa_matrix(defines: &str) -> String {
+    format!("{defines}{MSA_SRC}\n{MSA_DENSE_SRC}")
+}
+
 /// Failure opening a Metal device or compiling its SA, Gibbs, or multi-spin pipelines.
 #[derive(Debug, Error)]
 pub enum MetalError {
@@ -179,6 +196,20 @@ pub struct MetalDevice {
     pub(crate) msa_weighted_spill: ComputePipelineState,
     /// `msa_float` with spin words past `shared_spins` in device memory.
     pub(crate) msa_float_spill: ComputePipelineState,
+    /// Dense-matrix multi-spin (`kernels/msa_dense.metal`) for a unit model
+    /// the unit kernel would run: a bit matrix and the unit kernel's
+    /// geometric draw.
+    pub(crate) msa_matrix_bits_unit: ComputePipelineState,
+    /// Dense-matrix multi-spin for a unit model the weighted lane would run:
+    /// a bit matrix and the milli threshold rows.
+    pub(crate) msa_matrix_bits: ComputePipelineState,
+    /// Dense-matrix multi-spin with an `int8_t` matrix times one scale.
+    pub(crate) msa_matrix_i8: ComputePipelineState,
+    /// Dense-matrix multi-spin with a milli `int` matrix.
+    pub(crate) msa_matrix_int: ComputePipelineState,
+    /// Dense-matrix multi-spin with a `float` matrix and the float lane's
+    /// acceptance.
+    pub(crate) msa_matrix_float: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -289,6 +320,14 @@ impl MetalDevice {
             compile_pipeline(&device, &msa_spill(MSA_SRC), "msa_anneal_weighted")?;
         let msa_float_spill =
             compile_pipeline(&device, &float_spill(MSA_SRC), "msa_anneal_weighted")?;
+        let matrix =
+            |defines: &str| compile_pipeline(&device, &msa_matrix(defines), "msa_matrix_anneal");
+        let msa_matrix_bits_unit =
+            matrix(&format!("{MSA_MATRIX_BITS_DEFINE}{MSA_MATRIX_UNIT_DEFINE}"))?;
+        let msa_matrix_bits = matrix(MSA_MATRIX_BITS_DEFINE)?;
+        let msa_matrix_i8 = matrix(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
+        let msa_matrix_int = matrix("")?;
+        let msa_matrix_float = matrix(FLOAT_DEFINE)?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -326,6 +365,11 @@ impl MetalDevice {
             msa_weighted_dense,
             msa_weighted_spill,
             msa_float_spill,
+            msa_matrix_bits_unit,
+            msa_matrix_bits,
+            msa_matrix_i8,
+            msa_matrix_int,
+            msa_matrix_float,
             msa_slots,
             msa_screen,
             msa_frustration_draw,
@@ -462,6 +506,11 @@ mod tests {
             ("msa_weighted_dense", &dev.msa_weighted_dense),
             ("msa_weighted_spill", &dev.msa_weighted_spill),
             ("msa_float_spill", &dev.msa_float_spill),
+            ("msa_matrix_bits_unit", &dev.msa_matrix_bits_unit),
+            ("msa_matrix_bits", &dev.msa_matrix_bits),
+            ("msa_matrix_i8", &dev.msa_matrix_i8),
+            ("msa_matrix_int", &dev.msa_matrix_int),
+            ("msa_matrix_float", &dev.msa_matrix_float),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");
