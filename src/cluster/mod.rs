@@ -5,10 +5,12 @@
 //!
 //! Validation and the strong/weak split follow the CPU Otsuka graph contract.
 //! Family contexts come from the session after canonical metadata validation.
-//! Preparation performs no Metal calls; `device` runs the anneal.
+//! Preparation performs no Metal calls; `device` runs the anneal, and
+//! `sampler` routes session jobs to it.
 
 pub mod device;
 mod prepare;
+pub mod sampler;
 
 use std::collections::HashMap;
 use std::fmt;

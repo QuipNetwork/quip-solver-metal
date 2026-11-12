@@ -1084,7 +1084,42 @@ pub fn advertised_nodes(
     limits: &DeviceLimits,
     cap: Option<usize>,
 ) -> Result<usize, CapacityError> {
-    let couplers = advertised_couplers(kernel, limits);
+    advertised_nodes_for(kernel, limits, advertised_couplers(kernel, limits), cap)
+}
+
+/// The most couplers a miner advertises when its identity bounds the degree
+/// at `degree`: [`advertised_couplers`], lowered so that the session admits a
+/// regular model of degree `degree` with that many couplers. Inside the
+/// advertised box, a model with these couplers and a mean degree up to
+/// `degree` then fits.
+#[must_use]
+pub fn advertised_couplers_within_degree(
+    kernel: Kernel,
+    limits: &DeviceLimits,
+    degree: usize,
+) -> usize {
+    let per_node = degree / 2;
+    // At `degree` nodes or fewer the regular model is complete, and complete
+    // models up to the advertised couplers fit.
+    let regular = largest_fitting(MAX_NODES / per_node.max(1), |n| {
+        n <= degree || session_admits(kernel, n, n * per_node, limits)
+    });
+    advertised_couplers(kernel, limits).min(regular.saturating_mul(per_node))
+}
+
+/// [`advertised_nodes`] for a miner that advertises `couplers` couplers: the
+/// largest node count the session admits with `couplers` couplers, or every
+/// coupler of a complete model when it has fewer.
+///
+/// # Errors
+///
+/// The errors of [`advertised_nodes`].
+pub fn advertised_nodes_for(
+    kernel: Kernel,
+    limits: &DeviceLimits,
+    couplers: usize,
+    cap: Option<usize>,
+) -> Result<usize, CapacityError> {
     let limit = largest_fitting(MAX_NODES, |n| {
         let complete = n * n.saturating_sub(1) / 2;
         session_admits(kernel, n, couplers.min(complete), limits)

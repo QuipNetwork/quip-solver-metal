@@ -1,9 +1,11 @@
 //! Metal Ising samplers.
 //!
-//! Three binaries share this library:
+//! Four binaries share this library:
 //! - `quip-metal-sa` — Metropolis simulated annealing on one Apple GPU
 //! - `quip-metal-msa` — multi-spin annealing on selected Metal and ANE engines
 //! - `quip-metal-gibbs` — single-site heat-bath Gibbs on one Apple GPU
+//! - `quip-metal-otsuka` — the Otsuka cluster anneal on twisted-ice-dimer
+//!   family jobs, and Metal SA on every other job
 //!
 //! Kernels take **explicit per-job** CSR buffers from the host (no kernel-side
 //! nonce economy / rotating slots). Solution energies are always scored with
@@ -208,9 +210,20 @@ fn identity(
     limits: &DeviceLimits,
     cap: Option<usize>,
 ) -> Result<BackendIdentity, CapacityError> {
-    use quip_solver_core::quip_proto::v1::Algorithm as Proto;
     let nodes = capacity::advertised_nodes(kernel, limits, cap)?;
     let edges = capacity::advertised_couplers(kernel, limits);
+    identity_with(kernel, adapt, model_limits, nodes, edges)
+}
+
+/// The identity of `kernel` with `nodes` and `edges` as its limits.
+fn identity_with(
+    kernel: Kernel,
+    adapt: quip_solver_core::adapt::AdaptBounds,
+    model_limits: quip_solver_core::ModelLimits,
+    nodes: usize,
+    edges: usize,
+) -> Result<BackendIdentity, CapacityError> {
+    use quip_solver_core::quip_proto::v1::Algorithm as Proto;
     let to_u32 = |count: usize| {
         u32::try_from(count).map_err(|_| CapacityError::Nodes {
             max: u32::MAX as usize,
@@ -308,6 +321,60 @@ pub fn metal_msa_identity(
     identity(Kernel::Msa, METAL_MSA_ADAPT, METAL_MSA_LIMITS, limits, cap)
 }
 
+/// Model limits of `quip-metal-otsuka`: those of [`METAL_SA_LIMITS`] with
+/// the degree bound [`cluster::sampler::MAX_DEGREE`]. Plain jobs run on the
+/// SA kernel, whose sparse storage has no row-length limit.
+pub const METAL_OTSUKA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
+    max_degree: Some(OTSUKA_MAX_DEGREE),
+    ..METAL_SA_LIMITS
+};
+
+const OTSUKA_MAX_DEGREE: u32 = {
+    assert!(cluster::sampler::MAX_DEGREE <= u32::MAX as usize);
+    cluster::sampler::MAX_DEGREE as u32
+};
+
+/// Backend identity for `quip-metal-otsuka`. Plain jobs run on Metal SA, so
+/// the limits come from the SA capacity model, as for [`metal_sa_identity`],
+/// with the degree bound [`cluster::sampler::MAX_DEGREE`]. The SA one-sweep
+/// limit refuses the SA couplers at that degree, so `max_edges` is
+/// [`capacity::advertised_couplers_within_degree`] and `max_nodes` is
+/// [`capacity::advertised_nodes_for`] those couplers, lowered to `cap`. A
+/// family job that does not fit the cluster layout is refused as `Capacity`
+/// before any allocation.
+///
+/// # Errors
+///
+/// The errors of [`metal_sa_identity`].
+///
+/// # Examples
+///
+/// ```
+/// use quip_solver_metal::{capacity, metal_otsuka_identity, metal_sa_identity};
+/// use quip_solver_core::quip_proto::v1::Algorithm;
+///
+/// let limits = capacity::host_limits();
+/// let otsuka = metal_otsuka_identity(&limits, None).unwrap();
+/// let sa = metal_sa_identity(&limits, None).unwrap();
+/// assert_eq!(otsuka.algorithm, Algorithm::Otsuka);
+/// assert_eq!(otsuka.limits.max_degree, Some(128));
+/// assert!(otsuka.max_edges <= sa.max_edges);
+/// ```
+pub fn metal_otsuka_identity(
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, CapacityError> {
+    let edges = capacity::advertised_couplers_within_degree(
+        Kernel::Sa,
+        limits,
+        cluster::sampler::MAX_DEGREE,
+    );
+    let nodes = capacity::advertised_nodes_for(Kernel::Sa, limits, edges, cap)?;
+    let mut id = identity_with(Kernel::Sa, METAL_ADAPT, METAL_OTSUKA_LIMITS, nodes, edges)?;
+    id.algorithm = quip_solver_core::quip_proto::v1::Algorithm::Otsuka;
+    Ok(id)
+}
+
 /// The identity of `kernel` on this host with `max_nodes` lowered to `cap`,
 /// or, when `cap` is 0 or passes the limit, the exit code of an invalid
 /// configuration after a message on standard error. The binaries call it
@@ -324,6 +391,29 @@ pub fn host_identity(kernel: Kernel, cap: Option<usize>) -> Result<BackendIdenti
         Kernel::Gibbs => metal_gibbs_identity(&limits, cap),
         Kernel::Msa => metal_msa_identity(&limits, cap),
     };
+    config_exit(identity, kernel, cap)
+}
+
+/// [`host_identity`] for `quip-metal-otsuka`: [`metal_otsuka_identity`] on
+/// this host. Its node limit is the SA limit, so the messages name SA.
+///
+/// # Errors
+///
+/// The errors of [`host_identity`].
+pub fn host_otsuka_identity(cap: Option<usize>) -> Result<BackendIdentity, ExitCode> {
+    config_exit(
+        metal_otsuka_identity(&capacity::host_limits(), cap),
+        Kernel::Sa,
+        cap,
+    )
+}
+
+/// The identity, or the configuration exit code after a message.
+fn config_exit(
+    identity: Result<BackendIdentity, CapacityError>,
+    kernel: Kernel,
+    cap: Option<usize>,
+) -> Result<BackendIdentity, ExitCode> {
     identity.map_err(|e| {
         #[expect(
             clippy::print_stderr,
@@ -1247,12 +1337,17 @@ mod tests {
     /// degree the advertised degree bound allows (a graph's mean degree is at
     /// most its largest). A coarse log grid covers the box, including its
     /// edges. With no degree bound the grid reaches the dense and high-degree
-    /// shapes that the session refuses.
+    /// shapes that the session refuses. The Otsuka identity runs plain jobs
+    /// on SA, so its box, with degree bound 128, is checked against SA.
     #[test]
     fn every_shape_in_the_advertised_box_is_admitted() {
         use crate::capacity::session_admits;
         let limits = crate::sampler::host_device_limits();
-        for (kernel, identity) in host_identities() {
+        let otsuka = (
+            super::Kernel::Sa,
+            super::metal_otsuka_identity(limits, None).unwrap(),
+        );
+        for (kernel, identity) in host_identities().into_iter().chain([otsuka]) {
             let bound = identity
                 .limits
                 .max_degree
@@ -1324,6 +1419,42 @@ mod tests {
                 .map_err(|e| e.to_sample_error()),
             Err(quip_solver_core::SampleError::Capacity)
         );
+    }
+
+    /// Plain jobs on `quip-metal-otsuka` run on SA up to degree 128. The
+    /// corners of the Otsuka box pass the SA session admission, and so does
+    /// a ring at the Otsuka node limit with one hub of degree 128.
+    #[test]
+    fn an_sa_hub_at_the_otsuka_degree_bound_is_admitted() {
+        use quip_solver_core::SampleParams;
+        let limits = crate::sampler::host_device_limits();
+        let otsuka = super::metal_otsuka_identity(limits, None).unwrap();
+        let bound = otsuka.limits.max_degree.unwrap() as usize;
+        assert_eq!(bound, 128);
+        // Both corners of the box: every coupler at degree 128, and at the
+        // node limit.
+        let edges = otsuka.max_edges as usize;
+        for nodes in [edges.div_ceil(bound / 2), otsuka.max_nodes as usize] {
+            assert!(
+                crate::capacity::session_admits(super::Kernel::Sa, nodes, edges, limits),
+                "{nodes} nodes, {edges} couplers"
+            );
+        }
+        let n = otsuka.max_nodes as usize;
+        let mut edges: Vec<(usize, usize)> = (0..n).map(|u| (u, (u + 1) % n)).collect();
+        edges.extend((0..bound - 2).map(|k| (0, 2 + 2 * k)));
+        let j = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let graph = super::IsingGraph::new(vec![0.0; n], j, edges);
+        for reads in [32, 256] {
+            let params = SampleParams {
+                num_reads: reads,
+                num_sweeps: 64,
+                ..Default::default()
+            };
+            crate::sampler::admit_one(&graph, &params, super::Kernel::Sa).unwrap();
+        }
     }
 
     /// `nodes` nodes with `edges` couplers: every pair when `edges` is the

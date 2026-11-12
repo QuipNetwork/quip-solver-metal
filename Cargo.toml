@@ -5,7 +5,7 @@ edition = "2021"
 # MSRV contract for consumers. `rust-toolchain.toml` pins the *build* toolchain
 # (1.97.1); this is the oldest compiler the crate is supported on.
 rust-version = "1.97"
-description = "Metal Ising miners: simulated annealing, multi-spin coded SA and heat-bath Gibbs (v0.3, Apple Silicon)"
+description = "Metal Ising miners: simulated annealing, multi-spin coded SA, heat-bath Gibbs and Otsuka cluster annealing (v0.3, Apple Silicon)"
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/quip.network/quip-solver-metal"
 
@@ -24,6 +24,10 @@ path = "src/bin/quip_metal_gibbs.rs"
 [[bin]]
 name = "quip-metal-msa"
 path = "src/bin/quip_metal_msa.rs"
+
+[[bin]]
+name = "quip-metal-otsuka"
+path = "src/bin/quip_metal_otsuka.rs"
 
 # The solver contract (quip-proto, quip-protocol, quip-solver-core) is
 # published to crates.io, from quip.network/quip-solver-core. The other miner

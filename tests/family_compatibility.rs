@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! MT-1: Metal miners at the generic family tier.
+//! MT-1: Metal miners at the generic family tier, and the Otsuka miner.
 //!
-//! No Metal binary expands family leases, so each declares the generic tier
-//! (FAM-56): no `solver_id`, no generated or accepted family, and its own
-//! kernel limits. A family lease is rejected without a fallback, and an
-//! explicit job that carries a `FamilyBinding` is solved as the plain model
-//! (FAM-69).
+//! The SA, Gibbs and MSA binaries expand no family leases, so each declares
+//! the generic tier (FAM-56): no `solver_id`, no generated or accepted
+//! family, and its own kernel limits. A family lease is rejected without a
+//! fallback, and an explicit job that carries a `FamilyBinding` is solved as
+//! the plain model (FAM-69). `quip-metal-otsuka` lists
+//! `quip/twisted-ice-dimer` revision 1 in both family lists and passes the
+//! family gate for it.
 //!
 //! Metal GPU tests: need a real device (Apple Silicon). Run with
 //! `--test-threads=1`.
@@ -134,10 +136,36 @@ fn session_json(c: &Capabilities) -> Value {
         }
     }
     assert!(c.native_topology_hash.is_none(), "{c:?}");
-    assert!(c.solver_id.is_empty(), "{c:?}");
-    assert!(c.generated_families.is_empty(), "{c:?}");
-    assert!(c.accepted_families.is_empty(), "{c:?}");
+    if !c.solver_id.is_empty() {
+        view.insert("solverId".into(), json!(c.solver_id));
+    }
+    for (key, list) in [
+        ("generatedFamilies", &c.generated_families),
+        ("acceptedFamilies", &c.accepted_families),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        let entries: Vec<Value> = list
+            .iter()
+            .map(|entry| {
+                assert!(entry.params_digests.is_empty(), "{c:?}");
+                json!({"familyId": entry.family_id, "revisions": entry.revisions})
+            })
+            .collect();
+        view.insert(key.into(), json!(entries));
+    }
     Value::Object(view)
+}
+
+/// `quip-metal-otsuka`, which lists twisted-ice-dimer revision 1 in both
+/// family lists.
+fn otsuka() -> Bin {
+    Bin {
+        name: "quip-metal-otsuka",
+        path: env!("CARGO_BIN_EXE_quip-metal-otsuka"),
+        identity: quip_solver_metal::host_otsuka_identity(None).unwrap(),
+    }
 }
 
 fn socket(name: &str) -> String {
@@ -212,8 +240,96 @@ async fn the_session_advertises_what_the_command_line_prints() {
                 bin.identity.algorithm,
                 "{name} {source}"
             );
+            assert!(session.solver_id.is_empty(), "{name} {source}");
+            assert!(session.generated_families.is_empty(), "{name} {source}");
+            assert!(session.accepted_families.is_empty(), "{name} {source}");
             assert_eq!(session_json(session), caps, "{name} {source}");
         }
+    }
+}
+
+#[test]
+fn the_otsuka_command_line_declares_twisted_ice_dimer() {
+    let bin = otsuka();
+    let caps = command_line_capabilities(bin.path);
+    assert_eq!(caps["solverId"], "quip-metal-otsuka/1", "{caps}");
+    for list in ["generatedFamilies", "acceptedFamilies"] {
+        assert_eq!(
+            caps[list],
+            json!([{"familyId": "quip/twisted-ice-dimer", "revisions": [1]}]),
+            "{list}: {caps}"
+        );
+    }
+    let family_generator = GeneratorAlgorithm::FamilyChacha8V1.as_str_name();
+    assert!(
+        caps["generators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g == family_generator),
+        "a generated family lists {family_generator} (FAM-58): {caps}"
+    );
+    let identity = bin.identity;
+    assert_eq!(caps["backend"], "metal");
+    assert_eq!(caps["algorithm"], "otsuka");
+    assert_eq!(caps["maxNodes"], identity.max_nodes);
+    assert_eq!(caps["maxEdges"], identity.max_edges);
+    assert_eq!(caps["maxDegree"], 128);
+    let limits = &identity.limits;
+    for (key, value) in [
+        ("maxDegree", limits.max_degree),
+        ("maxLocalFieldMilli", limits.max_local_field_milli),
+        ("exactResolutionMilli", limits.exact_resolution_milli),
+    ] {
+        assert_eq!(caps[key], value.unwrap(), "{key}: {caps}");
+    }
+}
+
+#[tokio::test]
+async fn the_otsuka_session_advertises_what_the_command_line_prints() {
+    let bin = otsuka();
+    let caps = command_line_capabilities(bin.path);
+    let report = drive_miner(bin.path, &socket(bin.name)).await;
+    assert!(report.handshake_ok, "handshake failed");
+    let hello = report
+        .hello
+        .as_ref()
+        .and_then(|hello| hello.capabilities.as_ref())
+        .expect("Hello carries capabilities");
+    let answered = report
+        .capabilities_received
+        .as_ref()
+        .expect("a GetCapabilities answer");
+    for (source, session) in [("Hello", hello), ("GetCapabilities", answered)] {
+        assert_eq!(session.backend(), Backend::Metal, "{source}");
+        assert_eq!(session.algorithm(), bin.identity.algorithm, "{source}");
+        assert_eq!(session_json(session), caps, "{source}");
+    }
+}
+
+/// The SC-7 cases the Otsuka binary must pass for its supported revision.
+const OTSUKA_CASES: [&str; 3] = [
+    "supported-revision",
+    "explicit-supported",
+    "credit-ledger-balanced",
+];
+
+#[tokio::test]
+async fn the_otsuka_binary_passes_the_family_gate_for_twisted_ice_dimer() {
+    let bin = otsuka();
+    let report = drive_miner_family(bin.path, &[], &socket(bin.name)).await;
+    assert!(
+        report.is_conformant(),
+        "{}\n{}",
+        report.summary(),
+        report.stderr
+    );
+    for wanted in OTSUKA_CASES {
+        let passed = report
+            .cases
+            .iter()
+            .any(|case| case.name == wanted && case.outcome == CaseOutcome::Passed);
+        assert!(passed, "{wanted}: {}", report.summary());
     }
 }
 

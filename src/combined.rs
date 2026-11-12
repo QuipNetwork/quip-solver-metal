@@ -117,6 +117,13 @@ impl CombinedSampler {
         }
     }
 
+    /// Whether the IOKit governor asks Metal work to yield. Opens the Metal
+    /// engine when no job has opened it yet, because the governor starts
+    /// with it. False when it cannot open.
+    pub(crate) fn governor_yields(&self) -> bool {
+        self.metal().is_ok_and(|metal| metal.gov.should_throttle())
+    }
+
     pub(crate) fn check(&self) -> Result<(), OpenError> {
         let cfg = settings(&self.settings);
         if cfg.enable_metal {

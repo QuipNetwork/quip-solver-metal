@@ -97,6 +97,22 @@ pub(crate) struct Session {
 impl Session {
     /// Spawn `binary`, finish the handshake, and wait for the first credits.
     pub(crate) async fn start(binary: &str, queue_depth: u32, backend_toml: &str) -> Self {
+        Self::start_with(queue_depth, backend_toml, |socket| {
+            let mut command = Command::new(binary);
+            command.args(["--quip-coordinator", socket]);
+            command.args(["--miner-id", "lease-test"]);
+            command
+        })
+        .await
+    }
+
+    /// [`Self::start`] with the miner process that `command` builds for the
+    /// coordinator socket address.
+    pub(crate) async fn start_with(
+        queue_depth: u32,
+        backend_toml: &str,
+        command: impl FnOnce(&str) -> Command,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("socket directory");
         let path = directory.path().join("coord.sock");
         let listener = UnixListener::bind(&path).expect("bind test coordinator");
@@ -108,9 +124,7 @@ impl Session {
                 .await
                 .expect("serve test coordinator");
         });
-        let child = Command::new(binary)
-            .args(["--quip-coordinator", &format!("unix://{}", path.display())])
-            .args(["--miner-id", "lease-test"])
+        let child = command(&format!("unix://{}", path.display()))
             .env("QUIP_SESSION_TOKEN", "test-token")
             .kill_on_drop(true)
             .spawn()

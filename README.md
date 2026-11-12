@@ -2,8 +2,8 @@
 
 Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`), multi-spin coded SA
-(`quip-metal-msa`) and heat-bath Gibbs (`quip-metal-gibbs`), shipped as
-separate binaries.
+(`quip-metal-msa`), heat-bath Gibbs (`quip-metal-gibbs`) and the Otsuka
+cluster anneal (`quip-metal-otsuka`), shipped as separate binaries.
 
 **macOS arm64 only (Apple Silicon).** Metal and IOKit exist on no other
 platform, so this crate does not build anywhere else and offers no stub or CPU
@@ -13,8 +13,8 @@ Build and run on Apple Silicon.
 Energies match consensus `quip_solver_core::quip_protocol::scoring::energy_milli`.
 The multi-spin kernel computes each read's energy on the device in integer
 milli units when every coefficient is a whole number in `i8` range, and the
-host rescores 1 job in 1,000 to check it. Other kernels, and graphs with
-other coefficients, are scored on the host.
+host rescores 1 job in 1,000 to check it. The host scores the reads of the other kernels,
+and of graphs with other coefficients.
 
 ## Binaries
 
@@ -23,10 +23,12 @@ other coefficients, are scored on the host.
 | `quip-metal-sa` | simulated annealing (Metropolis) |
 | `quip-metal-msa` | multi-spin coded simulated annealing (32 replicas per word) |
 | `quip-metal-gibbs` | heat-bath Gibbs |
+| `quip-metal-otsuka` | Otsuka cluster anneal on `quip/twisted-ice-dimer` revision 1 jobs, simulated annealing on every other job |
 
-Prebuilt `arm64` binaries are attached to each
+Each
 [Release](https://gitlab.com/quip.network/quip-solver-metal/-/releases)
-(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+has prebuilt `arm64` binaries. A macOS CI runner builds them best-effort
+(see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -40,18 +42,46 @@ from crates.io at version 0.0.11, published from
 speaks protocol version 2, so the coordinator must also speak version 2.
 
 The miners accept `ISING_GENERATE` salt leases. The session draws each salt's
-problem from the lease, runs it through the same stream as a plain job, and
-sends a `Result` only for a salt whose reads meet the target. Each lease ends
+problem from the lease and runs it through the same stream as a plain job.
+It sends a `Result` only for a salt whose reads meet the target. Each lease ends
 with one `LeaseDone` summary and a credit refund.
 
-Every binary declares the generic problem-family tier. It advertises no
-`solver_id` and no generated or accepted family, because no Metal session
-expands family leases. The session rejects a family lease with
+The SA, Gibbs and MSA binaries declare the generic problem-family tier. Each
+advertises no `solver_id` and no generated or accepted family, because these
+sessions do not expand family leases. The session rejects a family lease with
 `FamilyUnsupported` and runs no fallback. For an explicit job with a
 `FamilyBinding`, the miner solves the plain model and the coordinator decides
 acceptance.
 `tests/family_compatibility.rs` checks the declaration, each kernel's limits,
 and both job paths.
+
+## Otsuka binary (`quip-metal-otsuka`)
+
+`quip-metal-otsuka` has the `solver_id` `quip-metal-otsuka/1`. It
+lists `quip/twisted-ice-dimer` revision 1 in its generated and accepted
+families. The session expands family leases of that revision and checks
+the `FamilyBinding` of explicit jobs.
+
+- A checked twisted-ice-dimer job runs on the Otsuka cluster kernel
+  (`kernels/cluster.metal`). Each read is one anneal, and a job has at most 256
+  reads. Every job uses the measured default schedule of `ClusterParams`:
+  65,536 sweeps, 2 rounds, a single-spin sweep after each cluster sweep, and
+  beta from 1 to 12. The job seed seeds the anneal. The host scores each read
+  on the original model.
+- Each other job runs on the Metal SA engine of `quip-metal-sa`. For the
+  same seed, a plain job returns the same reads on both binaries.
+- The cluster kernel and Metal SA never share the GPU. Each plans its
+  command buffers against the 500 ms ceiling as if it owns the GPU. A family job waits until every plain job ahead of it
+  answers, and no plain job starts while a family job runs.
+- A family job that does not fit the cluster layout, the memory budget, or the
+  single-buffer limit gets a `Capacity` reject with one refund, and the
+  session goes on. The miner refuses the job before it allocates a buffer.
+- When the IOKit governor asks the miner to yield, a family job stops before
+  its next command buffer, and the miner rejects it as busy.
+
+`tests/cluster_session.rs` checks the routing, the cancellation, the
+refusals, and the job order. `tests/family_compatibility.rs` checks that
+the binary passes the family gate for twisted-ice-dimer revision 1.
 
 ## Running
 
@@ -92,8 +122,14 @@ admission applies the same capacity model and the same one-sweep rule, so
   `2 * maxEdges / maxNodes`.
 - Both corners hold at every read count from 32 to 256, at 64 betas, and on
   every coefficient layout that the kernel runs.
-- Every binary advertises `maxDegree` 62, the sparse degree limit of the
-  weighted multi-spin kernel (`sampler::MSA_SPARSE_MAX_DEG`).
+- The SA, Gibbs and MSA binaries advertise `maxDegree` 62, the sparse degree
+  limit of the weighted multi-spin kernel (`sampler::MSA_SPARSE_MAX_DEG`).
+- `quip-metal-otsuka` advertises `maxDegree` 128. Its plain jobs run on SA.
+  The SA one-sweep limit refuses some models with the SA `maxEdges` and a
+  mean degree between 62 and 128. For that reason, the Otsuka `maxEdges` is
+  the coupler count of the largest regular degree-128 model that the session
+  admits. Its `maxNodes` is the largest node count that the session admits
+  for a model with that many couplers.
 - `--max-nodes N` lowers `maxNodes`. A value of 0 or past the limit is a
   configuration error (exit code 64), and the binary opens nothing.
 
@@ -105,11 +141,13 @@ memory, the limits are:
 | `quip-metal-sa` | 41,647 | 998,991 | 48.0 | 62 |
 | `quip-metal-gibbs` | 5,684,919 | 1,398,628 | 0.49 | 62 |
 | `quip-metal-msa` | 13,724,198 | 11,992,753 | 1.75 | 62 |
+| `quip-metal-otsuka` | 60,743 | 952,896 | 31.4 | 128 |
 
 The session admits every model inside `maxNodes`, `maxEdges` and
 `maxDegree`. The test `every_shape_in_the_advertised_box_is_admitted`
-checks a grid over that box. The harness refuses a model with a node past
-degree 62, which removes two kinds of refusal from inside the box:
+checks a grid over that box for all four binaries. For the SA, Gibbs, and MSA
+binaries, the harness refuses a model with a node past degree 62, which
+removes two kinds of refusal from inside the box:
 
 - A model past degree 62 runs only on dense-matrix storage. The one-sweep
   limit holds a dense model to 1,414 nodes on SA, 1,673 on Gibbs and 4,898
@@ -191,8 +229,8 @@ annealing in `quip-solver-cuda`'s `quip-cuda-msa` and `quip-solver-cpu`'s
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer
 comparison against an inline geometric threshold draw. The kernel drives
-spins one colour class at a time, using the Advantage2 four-colouring by
-default and falling back to the greedy colouring the Gibbs kernel uses when
+spins one color class at a time, using the Advantage2 four-coloring by
+default and falling back to the greedy coloring the Gibbs kernel uses when
 the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
 or `off` (case-insensitive) to force the greedy colouring. One threadgroup
 anneals one 32-replica word of one problem in
@@ -237,7 +275,7 @@ cargo test --release
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-solver-conformance`'s scripted driver and check energies against
 `conformance/golden_vectors.json`. The whole suite runs on a Mac with a Metal
-device; CI runs it on a macOS runner, which is the only configuration this
+device. CI runs it on a macOS runner, which is the only configuration this
 crate builds in.
 
 Two harnesses carry `#[ignore]` because they take minutes to hours of device
