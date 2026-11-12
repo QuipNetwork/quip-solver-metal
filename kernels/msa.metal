@@ -101,6 +101,28 @@ inline RngState seed_rng(uint seed) {
     return state;
 }
 
+// "No node": the value that makes a sweep leave no node out.
+#define MSA_NO_SIT_OUT 0xFFFFFFFFu
+
+// The node in [0, n) that one word leaves out of one sweep.
+//
+// Flat moves are always accepted and the colour order is fixed, so with every
+// node updated the domain walls of a zero-field chain all advance two sites
+// per sweep and walls on the same sublattice never meet. A wall that reaches
+// the node left out waits one step, changes sublattice and meets the rest.
+// Same rule as quip-solver-cpu's sa_msc.rs (QUI-1980).
+//
+// A pure hash of the word's seed and the sweep position, so every thread of
+// the threadgroup computes the same node and no RNG stream moves. A model of
+// fewer than two nodes leaves none out.
+inline uint sit_out_node(uint word_seed, int beta_idx, int sweep, int n) {
+    if (n < 2) {
+        return MSA_NO_SIT_OUT;
+    }
+    uint z = word_seed ^ (uint(beta_idx) * 0x9e3779b9u) ^ (uint(sweep) * 0x85ebca6bu);
+    return mulhi(splitmix32(z), uint(n));
+}
+
 // One geometric draw M with P(M >= m) = exp(-2 beta m), capped at
 // MSA_MAX_FIELD. Same distribution as the old per-rung threshold row
 // (M = max m with u < floor(exp(-2 beta m) 2^32)), drawn per word update so
@@ -546,7 +568,12 @@ static inline void msa_body(
     device const int* color_block_counts,
     device const int* color_node_indices,
     int N, int num_reads, int num_colors, int sweeps_per_beta,
-    int beta_start, int beta_end, uint init_seed, bool fresh, bool persist,
+    int beta_start, int beta_end, uint init_seed,
+    // The anneal these rungs belong to: the seed its words share, its first
+    // rung and its last. They place a sweep within the anneal however the
+    // host splits the anneal into dispatches.
+    uint word_seed, int first_beta, int last_beta,
+    bool fresh, bool persist,
     bool write_output, bool write_samples,
     uint w, uint tid, uint gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
@@ -593,12 +620,20 @@ static inline void msa_body(
         float two_beta = 2.0f * beta;
 
         for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+            // The last sweep of the anneal leaves no node out, so every node
+            // is settled at the coldest rung.
+            bool last_sweep = beta_idx == last_beta && sweep == sweeps_per_beta - 1;
+            uint skip = last_sweep ? MSA_NO_SIT_OUT
+                                   : sit_out_node(word_seed, beta_idx - first_beta, sweep, n);
             for (int color = 0; color < num_colors; color++) {
                 int block_start = color_block_starts[color];
                 int block_count = color_block_counts[color];
 
                 for (uint k = tid; k < uint(block_count); k += gsz) {
                     int var = color_node_indices[block_start + int(k)];
+                    if (uint(var) == skip) {
+                        continue;
+                    }
                     uint accept = flip_mask(couplings, my_csr_row_ptr, my_csr_col_ind,
                                             state, var, beta_idx, two_beta, rng);
                     state[var] ^= accept;
@@ -750,7 +785,8 @@ kernel void msa_anneal(
     uint problem_id = tg / uint(words);
     uint w = tg - problem_id * uint(words);
     int beta_end = min(beta_start + beta_count, num_betas);
-    uint init_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u);
+    uint word_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u);
+    uint init_seed = word_seed ^ (tid * 2246822519u);
     ModelCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                              &csr_h_vals[problem_id * uint(N)]};
     msa_body(csr_row_ptr, csr_col_ind, couplings, beta_schedule,
@@ -760,7 +796,7 @@ kernel void msa_anneal(
              &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
              N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
-             beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
+             word_seed, 0, num_betas - 1, beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
              &diag_accept_counts[tg * gsz + tid],
              &diag_energy_partials[(tg * gsz + tid) * MSA_LANES],
@@ -829,7 +865,8 @@ kernel void msa_anneal_weighted(
     uint problem_id = tg / uint(words);
     uint w = tg - problem_id * uint(words);
     int beta_end = min(beta_start + beta_count, num_betas);
-    uint init_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u) ^ (tid * 2246822519u);
+    uint word_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u);
+    uint init_seed = word_seed ^ (tid * 2246822519u);
 #ifdef QUIP_FLOAT
     WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                                 &csr_h_vals[problem_id * uint(N)]};
@@ -847,7 +884,7 @@ kernel void msa_anneal_weighted(
              &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
              N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
-             beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
+             word_seed, 0, num_betas - 1, beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
              state, lane_total);
 }
 
@@ -856,9 +893,11 @@ struct SlotStep {
     int  beta_start;  // 0 = initialise spins and RNG from seed
     int  beta_count;  // rungs this step
     int  num_betas;   // this slot's schedule length
-    uint seed;        // this leg's seed folded to 32 bits, never 0
+    uint seed;        // this anneal's seed folded to 32 bits, never 0
     uint flags;       // bit 0: write energies and packed samples
                       // bit 2: start a fresh anneal at beta_start
+    int  anneal_start; // schedule position where this step's anneal started
+    int  anneal_end;   // schedule position where it ends
 };
 
 kernel void msa_anneal_slots(
@@ -913,7 +952,8 @@ kernel void msa_anneal_slots(
     uint w = tg % uint(words);
     uint g = st.slot * uint(words) + w;
     int beta_end = min(st.beta_start + st.beta_count, st.num_betas);
-    uint init_seed = st.seed ^ (w * 2654435761u) ^ (tid * 2246822519u);
+    uint word_seed = st.seed ^ (w * 2654435761u);
+    uint init_seed = word_seed ^ (tid * 2246822519u);
     bool write_output = (st.flags & 1u) != 0;
     bool fresh = st.beta_start == 0 || (st.flags & 4u) != 0;
     ModelCouplings couplings{&csr_J_vals[st.slot * uint(j_stride)], &csr_h_vals[st.slot * uint(N)]};
@@ -923,7 +963,8 @@ kernel void msa_anneal_slots(
              &final_energies[st.slot * uint(num_reads)],
              &final_samples[st.slot * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed, fresh, true,
+             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed,
+             word_seed, st.anneal_start, st.anneal_end - 1, fresh, true,
              write_output, write_output, w, tid, gsz, state, lane_total);
 }
 
@@ -1070,7 +1111,8 @@ kernel void msa_screen(
              &final_energies[tg * uint(MSA_LANES)],
              &final_samples[tg * uint(MSA_LANES) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, MSA_LANES, num_colors, 1, 0, word.num_betas, init_seed, true, false,
+             N, MSA_LANES, num_colors, 1, 0, word.num_betas, init_seed,
+             word.seed, 0, word.num_betas - 1, true, false,
              true, true, 0, tid, gsz, state, lane_total);
 }
 
