@@ -214,7 +214,7 @@ kernel void pure_simulated_annealing(
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
     device const stored_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const stored_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
+    device const stored_t* my_h_vals = &csr_h_vals[ulong(problem_id) * ulong(N)];  // h values for this problem
 
     int n = N;
     int sweeps_per_beta_val = sweeps_per_beta;
@@ -417,7 +417,7 @@ kernel void pure_simulated_annealing(
 
     // Write final output (always — the Python side reads only after
     // the last chunk, but writing every time is cheaper than branching)
-    device int8_t* output = &final_samples[thread_id * packed_size];
+    device int8_t* output = &final_samples[ulong(thread_id) * ulong(packed_size)];
     for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
         output[byte_idx] = packed_state[uint(byte_idx) * stride];
     }

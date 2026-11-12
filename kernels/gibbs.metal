@@ -350,7 +350,7 @@ kernel void block_gibbs_sampler(
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
     device const stored_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const stored_t* my_h_vals = &csr_h_vals[problem_id * N];
+    device const stored_t* my_h_vals = &csr_h_vals[ulong(problem_id) * ulong(N)];
 
     int n = N;
     int num_beta_values = num_betas;
@@ -483,7 +483,7 @@ kernel void block_gibbs_sampler(
     }
 
     // Write final state to output (bit-packed)
-    device int8_t* output = &final_samples[thread_id * packed_size];
+    device int8_t* output = &final_samples[ulong(thread_id) * ulong(packed_size)];
     for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
         output[byte_idx] = packed_state[byte_idx];
     }
@@ -692,7 +692,7 @@ kernel void block_gibbs_parallel(
     device const int* my_csr_row_ptr = &csr_row_ptr[row_ptr_start];
     device const int* my_csr_col_ind = &csr_col_ind[col_ind_start];
     device const stored_t* my_csr_J_vals = &csr_J_vals[col_ind_start];
-    device const stored_t* my_h_vals = &csr_h_vals[problem_id * N];
+    device const stored_t* my_h_vals = &csr_h_vals[ulong(problem_id) * ulong(N)];
 
     int n = N;
     int packed_size = (n + 7) / 8;
@@ -899,7 +899,7 @@ kernel void block_gibbs_parallel(
 #endif
 
     // Write final state to output - convert unpacked to packed format
-    device int8_t* output = &final_samples[sample_id * packed_size];
+    device int8_t* output = &final_samples[ulong(sample_id) * ulong(packed_size)];
 
 #ifdef QUIP_GIBBS_SPILL
     // Each thread packs whole bytes: a model past the prefix has far more

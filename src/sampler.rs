@@ -178,8 +178,10 @@ const WEIGHTED_MSA_COST_FACTOR: f64 = 3.5;
 const SA_GLOBAL_COST_FACTOR: f64 = 2.0;
 /// Extra Gibbs work per spin update on the spill build, which reads and
 /// writes the spins past its threadgroup prefix in device memory, for chunk
-/// sizing. It multiplies the representation's factor. Measured in
-/// `docs/perf/2026-11-12-gibbs-spill.md`.
+/// sizing. It multiplies the representation's factor. It covers the measured
+/// ratio at 4,000 nodes (at most 2.53). The degree-20 ratios at 60,000 and
+/// 200,000 nodes (3.50 and 4.61) exceed it, so those models rely on the
+/// pessimistic Gibbs base rate; see `docs/perf/2026-11-12-gibbs-spill.md`.
 const GIBBS_SPILL_COST_FACTOR: f64 = 3.0;
 /// Float32 SA work per spin update for chunk sizing, measured in
 /// `docs/perf/2026-11-11-float-kernels.md`.

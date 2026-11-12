@@ -1,6 +1,6 @@
 # Spill measurements for Gibbs sampling, 2026-11-12
 
-The chromatic Gibbs kernel has a spill build, `QUIP_GIBBS_SPILL`, for models past its 4,800-spin threadgroup array. The build keeps the first spins of each read in threadgroup memory and the rest in the read's slice of the persistent spin buffer. On a model of 4,000 nodes the spill build updates spins 2.1 to 2.5 times slower than the threadgroup build. The chunk planner multiplies the Gibbs cost by `GIBBS_SPILL_COST_FACTOR = 3.0` on the spill build. The worst planned chunk was 117.8 ms, for a model of 20,000 nodes and degree 40 on the unit path, with 256 reads. Models of at most 4,800 nodes keep the threadgroup build, and the Gibbs digest `bc085a7fc384f073` does not change.
+The chromatic Gibbs kernel has a spill build, `QUIP_GIBBS_SPILL`, for models past its 4,800-spin threadgroup array. The build keeps the first spins of each read in threadgroup memory and the rest in the read's slice of the persistent spin buffer. On a model of 4,000 nodes the spill build updates spins 2.0 to 2.5 times slower than the threadgroup build. The chunk planner multiplies the Gibbs cost by `GIBBS_SPILL_COST_FACTOR = 3.0` on the spill build. The worst planned chunk was 117.8 ms, for a model of 20,000 nodes and degree 40 on the unit path, with 256 reads. Models of at most 4,800 nodes keep the threadgroup build, and the Gibbs digest `bc085a7fc384f073` does not change.
 
 ## Host and load
 
@@ -45,7 +45,7 @@ Rates are in billions of spin updates per second (Gupd/s). The ratio divides the
 
 The local rate varies between runs. An earlier run on a busier host measured 6.45, 5.36, 6.07 and 6.21 Gupd/s for the four paths, which gives ratios of 2.53, 2.45, 2.11 and 2.26 at 4,000 nodes. The factor of 3.0 rounds the largest ratio at 4,000 nodes, 2.53, up.
 
-The ratios of the larger models mix the build cost with the degree, which the planner does not model. At degree 40 each node reads twice as many neighbours, and the rate falls with it. The Gibbs planning rate of `GIBBS_UPDATES_PER_SEC` times `GIBBS_THROUGHPUT_SAFETY`, 0.84 Gupd/s, is far below the measured local rates of 4 to 6 Gupd/s. That margin absorbs the larger ratios, and the chunk table shows that no chunk came near the ceiling.
+The factor does not bound the ratio at every size. At degree 20, the models of 60,000 and 200,000 nodes reach 3.50 and 4.61 on the unit path, and the models at degree 40 reach 6.04. Those models stay safe because the planner's base rate is pessimistic. `GIBBS_UPDATES_PER_SEC` times `GIBBS_THROUGHPUT_SAFETY` is 0.84 Gupd/s, against measured local rates of 4 to 6 Gupd/s. With the factor of 3.0 the planner sizes a chunk at 0.28 Gupd/s, and the lowest spill rate in the table is 0.97 Gupd/s (0.72 Gupd/s in the review probe). A later change must not raise the base rate or lower the safety margin without measuring the large spill models again.
 
 ## Chunks
 
@@ -59,7 +59,7 @@ The planned runs used the cost factor of 3.0. A rung splits into sweep windows w
 | 60,000 | 20 | 8, 16, 16, 16 | 91.6, 29.6, 24.3, 54.4 |
 | 200,000 | 20 | 32, 64, 64, 32 | 105.8, 44.4, 45.3, 110.8 |
 
-The worst chunk was 117.8 ms, for 20,000 nodes at degree 40 on the unit path. That chunk is below the 200 ms goal and the 400 ms watchdog margin. No planned chunk was a single sweep, so the run did not exercise the one-sweep floor. The slowest sweep measured was on the 200,000-node Float32 model, where 64 sweeps took 3,369.3 ms in one command buffer, or 52.6 ms per sweep. A model whose single sweep passes the 500 ms ceiling would pass it, because the planner does not split a sweep. A separate bead, `quip-miner-metal-dvg`, owns the admission check for that floor.
+The worst chunk was 117.8 ms, for 20,000 nodes at degree 40 on the unit path. A review probe at lower read counts measured 130.5 ms (200,000 nodes, Float32, 160 reads) and a lowest whole-run rate of 0.72 Gupd/s (20,000 nodes, degree 40, unit, 32 reads). Each chunk is below the 200 ms goal and the 400 ms watchdog margin. No planned chunk was a single sweep, so the run did not exercise the one-sweep floor. The slowest sweep measured was on the 200,000-node Float32 model, where 64 sweeps took 3,369.3 ms in one command buffer, or 52.6 ms per sweep. A model whose single sweep passes the 500 ms ceiling would pass it, because the planner does not split a sweep. A separate bead, `quip-miner-metal-dvg`, owns the admission check for that floor.
 
 ## Device energy
 
@@ -73,6 +73,8 @@ The pm1 digests in the table below come from `cargo test --release --test pm1_ra
 | --- | --- |
 | ±1, unit SA | `e4e22f86b64cda5d` |
 | ±1, Gibbs | `bc085a7fc384f073` |
+| ±1.5, wide Gibbs | `e9069459b5895d15` |
+| ±1.0005, Float32 Gibbs | `eabc348f9005570c` |
 | ±1, unit multi-spin | `6ec8d35ff7c9f123` |
 | ±1.5, weighted multi-spin | `4ee84dd42f5d5ade` |
 | ±1.0005, Float32 multi-spin | `c103cce43c429e4b` |

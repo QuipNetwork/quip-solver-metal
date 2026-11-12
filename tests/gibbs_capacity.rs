@@ -94,6 +94,22 @@ fn a_spilled_gibbs_run_matches_a_threadgroup_run() {
         let graph = circulant(4_000, 20, path);
         let local = run(&dev, &graph, &p, Tuning::default());
         assert_eq!(local.reads.len(), 64, "{path:?}");
+        // One update per second windows every rung into single sweeps on the
+        // threadgroup build, which must compose to the whole run.
+        let windowed = run(
+            &dev,
+            &graph,
+            &p,
+            Tuning {
+                planning_rate: Some(1.0),
+                ..Tuning::default()
+            },
+        );
+        assert_eq!(windowed.plan.len(), 8, "{path:?}: {:?}", windowed.plan);
+        assert_eq!(
+            windowed.reads, local.reads,
+            "{path:?}: windowed local build"
+        );
         for rate in [Some(ONE_CHUNK), None, Some(1.0)] {
             let tuning = Tuning {
                 gibbs_prefix_cap: Some(1_000),
