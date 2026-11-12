@@ -210,9 +210,38 @@ const _: () = assert!(
 /// the kernel's `popcount21` covers.
 pub(crate) const MSA_MAX_DEG: usize = 20;
 
+/// Nodes one colour class held per threadgroup step when
+/// [`MSA_OCCUPANCY_CURVE`] was measured: 4577 Advantage2 nodes in eight
+/// classes, each class one step of a 1,024-thread group.
+const MSA_CURVE_NODES_PER_STEP: f64 = 4577.0 / 8.0;
+
+/// How much a sweep of this colouring costs beyond `n` word updates, at least
+/// one. Each colour class is `ceil(count / threads)` threadgroup steps closed
+/// by a barrier, and a step takes about as long with one node as with the
+/// calibration's 572 (`docs/perf/2026-11-11-float-kernels.md`), so a dense
+/// model of few nodes in many classes is planned by its steps, not its nodes.
+fn msa_colour_step_factor(counts: &[i32], threads_per_group: usize, n: usize) -> f64 {
+    let steps: usize = counts
+        .iter()
+        .map(|&count| {
+            usize::try_from(count)
+                .unwrap_or(0)
+                .div_ceil(threads_per_group.max(1))
+                .max(1)
+        })
+        .sum();
+    (steps as f64 * MSA_CURVE_NODES_PER_STEP / n.max(1) as f64).max(1.0)
+}
+
+/// Row chunks of [`MSA_MAX_DEG`] neighbours the float lane walks for a node
+/// of `degree`; at least one.
+fn msa_row_chunks(degree: usize) -> usize {
+    degree.div_ceil(MSA_MAX_DEG).max(1)
+}
+
 /// Largest CSR degree the multi-spin kernel admits for a model of `rep`.
-/// The Float32 lane walks a row in chunks of [`MSA_MAX_DEG`] up to
-/// `MSA_FLOAT_MAX_DEG` in `kernels/msa.metal`, CUDA's sparse limit; the unit
+/// The Float32 lane walks a row in chunks of [`MSA_MAX_DEG`] up to CUDA's
+/// sparse limit, [`crate::capacity::MSA_SPARSE_MAX_DEGREE`]; the unit
 /// and milli lanes unroll one chunk.
 pub(crate) const fn msa_max_degree(rep: Representation) -> usize {
     match rep {
@@ -1730,7 +1759,15 @@ fn encode_batch_inner(
         (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
         (Representation::Float32, Kernel::Gibbs) => FLOAT_GIBBS_COST_FACTOR,
-        (Representation::Float32, Kernel::Msa) => FLOAT_MSA_COST_FACTOR,
+        // The factor was measured at degree <= MSA_MAX_DEG, one row chunk;
+        // the float lane walks a row in chunks of MSA_MAX_DEG, so its cost
+        // grows with the chunk count. Every graph of a batch shares `first`'s
+        // topology, so its degree is the batch's.
+        (Representation::Float32, Kernel::Msa) => {
+            FLOAT_MSA_COST_FACTOR
+                * msa_row_chunks(max_csr_degree(first)) as f64
+                * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
+        }
         (Representation::Binary | Representation::Int8, _) => 1.0,
     };
     let plan = match plan_override {
@@ -2208,6 +2245,68 @@ mod tests {
                 let want = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
                 assert_eq!(r.energy_milli, want);
             }
+        }
+    }
+
+    /// Largest command buffer of Float32 MSA batches past one row chunk.
+    /// `docs/perf/2026-11-11-float-kernels.md` records a run:
+    /// `cargo test --release --lib float_msa_high_degree_chunks -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "device timing; see the doc comment"]
+    #[expect(clippy::print_stdout, reason = "report the measured chunk times")]
+    fn float_msa_high_degree_chunks_stay_under_the_ceiling() {
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let portfolio = crate::model_file::read_model(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/portfolio/family-b-draw000-factor.qmodel"),
+        )
+        .unwrap()
+        .graph;
+        // A circulant of degree 62 on MSA_MAX_NODES nodes: four row chunks.
+        let n = MSA_MAX_NODES;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=31).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let circulant = |seed: usize| {
+            let j = (0..edges.len())
+                .map(|e| {
+                    if (e * 7 + seed).is_multiple_of(3) {
+                        0.0011
+                    } else {
+                        -0.0007
+                    }
+                })
+                .collect();
+            IsingGraph::new(vec![0.0003; n], j, edges.clone())
+        };
+        let circulants: Vec<IsingGraph> = (0..8).map(circulant).collect();
+        let params = SampleParams {
+            num_reads: 128,
+            num_sweeps: 8192,
+            sweeps_per_beta: 128,
+            seed: 42,
+            ..Default::default()
+        };
+        let batches: [(&str, Vec<&IsingGraph>); 3] = [
+            ("portfolio x1", vec![&portfolio]),
+            ("circulant x1", vec![&circulants[0]]),
+            ("circulant x8", circulants.iter().collect()),
+        ];
+        for (name, graphs) in batches {
+            let degree = max_csr_degree(graphs[0]);
+            let mut batch =
+                encode_batch_inner(&dev, &graphs, &params, Kernel::Msa, 1, None, None).unwrap();
+            let chunks = batch.chunk_count();
+            while batch.commit_next(|| false) {
+                batch.wait_until_completed();
+            }
+            assert!(batch.failed_status().is_none(), "{name}");
+            let max_ms = batch.max_chunk_us() as f64 / 1000.0;
+            let total_ms = batch.gpu_time_us() as f64 / 1000.0;
+            println!(
+                "{{\"batch\":\"{name}\",\"degree\":{degree},\"chunks\":{chunks},\"max_chunk_ms\":{max_ms:.1},\"total_gpu_ms\":{total_ms:.1}}}"
+            );
+            assert!(max_ms < TARGET_DISPATCH_MS, "{name}: {max_ms} ms");
         }
     }
 
@@ -2695,6 +2794,20 @@ mod tests {
     fn validate_batch_accepts_msa_degree_at_the_budget() {
         let g = star(MSA_MAX_DEG);
         validate_batch(&[&g], &params(64), Kernel::Msa).unwrap();
+    }
+
+    #[test]
+    fn float_msa_plans_by_row_chunks_and_colour_steps() {
+        assert_eq!(msa_row_chunks(0), 1);
+        assert_eq!(msa_row_chunks(MSA_MAX_DEG), 1);
+        assert_eq!(msa_row_chunks(43), 3);
+        assert_eq!(msa_row_chunks(62), 4);
+        // The calibration shape plans by its nodes.
+        let advantage2 = [573, 572, 572, 572, 572, 572, 572, 572];
+        assert!((msa_colour_step_factor(&advantage2, 1024, 4577) - 1.0).abs() < 1e-3);
+        // A complete graph on 44 nodes: 44 one-node classes, 44 steps.
+        let factor = msa_colour_step_factor(&[1; 44], 1024, 44);
+        assert!((factor - MSA_CURVE_NODES_PER_STEP).abs() < 1e-9, "{factor}");
     }
 
     #[test]

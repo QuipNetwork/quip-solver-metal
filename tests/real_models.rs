@@ -102,9 +102,25 @@ fn proven_ground_states(count: usize) -> Vec<(String, f64)> {
     proven
 }
 
+/// A complete graph on 32 nodes, degree 31: the multi-spin float lane walks
+/// each row in two chunks of 20 neighbours.
+fn complete_real_model() -> IsingGraph {
+    let n = 32;
+    let edges: Vec<(usize, usize)> = (0..n)
+        .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+        .collect();
+    let palette = [0.37, -1.25e-3, -0.8125, 0.0421, 1.3333, -0.5005];
+    let j = (0..edges.len())
+        .map(|k| palette[(k * 7 + 3) % palette.len()] * 0.1)
+        .collect();
+    let h = (0..n).map(|i| palette[i % palette.len()]).collect();
+    IsingGraph::new(h, j, edges)
+}
+
 /// 128 reads of 8,192 sweeps in 64 beta steps at seed 42, as the fixture
-/// README states for the CUDA ground-state test.
-fn portfolio_models_reach_their_ground_states(kernel: Kernel) {
+/// README states for the CUDA ground-state test, over the first `count`
+/// fixtures.
+fn portfolio_models_reach_their_ground_states(kernel: Kernel, count: usize) {
     let Some(dev) = device() else {
         return;
     };
@@ -115,7 +131,7 @@ fn portfolio_models_reach_their_ground_states(kernel: Kernel) {
         seed: 42,
         ..Default::default()
     };
-    for (file, proven) in proven_ground_states(6) {
+    for (file, proven) in proven_ground_states(count) {
         let model = read_model(&portfolio_dir().join(&file)).unwrap();
         let reads = sample_ising(&dev, &model.graph, &params, kernel).unwrap();
         let best = reads
@@ -181,7 +197,6 @@ fn chunked_and_unchunked_real_anneals_match(kernel: Kernel) {
     let Some(dev) = device() else {
         return;
     };
-    let graph = twelve_node_model();
     let params = SampleParams {
         num_reads: 64,
         num_sweeps: 96,
@@ -190,11 +205,15 @@ fn chunked_and_unchunked_real_anneals_match(kernel: Kernel) {
         seed: 9,
         ..Default::default()
     };
-    let whole = sample_ising(&dev, &graph, &params, kernel).unwrap();
-    let split = sample_ising_chunked(&dev, &graph, &params, kernel, 1).unwrap();
-    assert_eq!(whole, split);
-    // The anneal moved: the reads are not all one state.
-    assert!(whole.iter().any(|r| r.spins != whole[0].spins));
+    // The complete model has degree 31, two row chunks in the multi-spin
+    // float lane.
+    for graph in [twelve_node_model(), complete_real_model()] {
+        let whole = sample_ising(&dev, &graph, &params, kernel).unwrap();
+        let split = sample_ising_chunked(&dev, &graph, &params, kernel, 1).unwrap();
+        assert_eq!(whole, split, "{} nodes", graph.num_nodes());
+        // The anneal moved: the reads are not all one state.
+        assert!(whole.iter().any(|r| r.spins != whole[0].spins));
+    }
 }
 
 mod sa {
@@ -207,7 +226,7 @@ mod sa {
 
     #[test]
     fn portfolio_models_reach_their_ground_states() {
-        super::portfolio_models_reach_their_ground_states(Kernel::Sa);
+        super::portfolio_models_reach_their_ground_states(Kernel::Sa, 6);
     }
 
     #[test]
@@ -236,7 +255,7 @@ mod gibbs {
 
     #[test]
     fn portfolio_models_reach_their_ground_states() {
-        super::portfolio_models_reach_their_ground_states(Kernel::Gibbs);
+        super::portfolio_models_reach_their_ground_states(Kernel::Gibbs, 6);
     }
 
     #[test]
@@ -265,7 +284,9 @@ mod msa {
 
     #[test]
     fn portfolio_models_reach_their_ground_states() {
-        super::portfolio_models_reach_their_ground_states(Kernel::Msa);
+        // Three fixtures keep the slower float lane inside the test budget;
+        // reads and sweeps stay at the README values.
+        super::portfolio_models_reach_their_ground_states(Kernel::Msa, 3);
     }
 
     #[test]

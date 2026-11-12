@@ -32,8 +32,9 @@ using namespace metal;
 // host scores its energies.
 // The QUIP_FLOAT build of `msa_anneal_weighted` (the float lane, after
 // quip-solver-cuda's QUIP_MSA_COEF_F32 lane) reads `float` coefficients,
-// sums each lane's local field in `float`, and walks CSR rows of up to
-// MSA_FLOAT_MAX_DEG neighbours in chunks of MSA_MAX_DEG. Each lane draws its
+// sums each lane's local field in `float`, and walks CSR rows in chunks of
+// MSA_MAX_DEG; the host admits up to `capacity::MSA_SPARSE_MAX_DEGREE`
+// neighbours (62, CUDA's MSA_MAX_DEG). Each lane draws its
 // own uniform: one xoshiro128** draw per word update, as in the int lane,
 // hashed with the lane index. A lane flips where its energy change `de` is
 // at most zero or `beta * de < -log(u)`, the log form of `u < exp(-beta de)`,
@@ -51,9 +52,6 @@ using namespace metal;
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
 #define MSA_MAX_DEG    20
-// Neighbours per spin the float lane walks, in chunks of MSA_MAX_DEG. Must
-// equal `capacity::MSA_SPARSE_MAX_DEGREE`, CUDA's MSA_MAX_DEG.
-#define MSA_FLOAT_MAX_DEG 62
 // Threshold entries per rung for the weighted entry. Must equal
 // `wide_tables::WIDE_ROW`.
 #define WIDE_ROW       2048
@@ -400,8 +398,9 @@ inline float lane_uniform(uint draw, int lane) {
 }
 
 // The float lane: each lane's local field sums `h` and then the CSR row in
-// order, in `float`. A lane with spin s flips where `s * field >= 0`
-// (`de = 2 s field <= 0`) or `two_beta * (s * field) < -log(u)`, which is
+// order, in `float`. With `uphill = -s * field` for spin s, a lane flips
+// where `uphill <= 0` (`de = 2 * uphill <= 0`) or
+// `two_beta * uphill < -log(u)`, which is
 // `beta * de < -log(u)` with one product of two finite values. The host
 // refuses a beta past half of f32::MAX, so `two_beta` is finite, and a
 // field whose `2 * field` overflows, so the product is never `inf * 0`.
@@ -447,7 +446,7 @@ inline uint flip_mask(
 
     uint accept = 0u;
     for (int lane = 0; lane < MSA_LANES; ++lane) {
-        // s * field, with s = -1 where bit 1 is set: de = -2 s field.
+        // -s * field, with s = -1 where bit 1 is set: de = -2 s field.
         float uphill = ((bi >> uint(lane)) & 1u) ? field[lane] : -field[lane];
         bool ok = uphill <= 0.0f;
         if (!ok) {

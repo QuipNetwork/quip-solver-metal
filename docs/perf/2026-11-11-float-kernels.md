@@ -199,3 +199,34 @@ The unit digest `6ec8d35ff7c9f123` and the weighted digest `4ee84dd42f5d5ade` ar
 Float32 MSA divided by weighted MSA is `0.8007 / 0.5337 = 1.5003` in the first run and `0.8008 / 0.5342 = 1.4991` in the second run. The factor is `1.5 * 3.5 = 5.25`, rounded up to `5.3`. Both times are wall time and include the host scoring of every read, because neither lane writes device energies.
 
 The Float32 lane costs more than the weighted lane for two reasons. It takes a logarithm for each lane that moves uphill, where the weighted lane reads one threshold for the whole word. It also keeps 32 `float` fields while it walks the row in chunks of 20 neighbours. The mean best energy of the Float32 jobs is not comparable with the other values, because every coefficient is 1.0005 times larger.
+
+### Rows past one chunk
+
+The Advantage2 jobs that set `FLOAT_MSA_COST_FACTOR` fit each row in one chunk of 20 neighbours, and each color class of those jobs holds about 572 nodes. Two planning terms extend it to other models. Both apply to the Float32 lane only:
+
+- The row term multiplies the factor by the row chunks of the largest degree, `ceil(degree / 20)`, at least one. A degree of 43 gives 3, and a degree of 62 gives 4.
+- The color term multiplies it by `steps * 572 / n`, at least one. `steps` is the sum, over the color classes, of `ceil(class nodes / threads per group)`. Each class ends with a barrier, so a class of one node costs a full threadgroup step. A complete model of 44 nodes has 44 classes of one node, so its term is 572.
+
+The row term alone did not hold the ceiling. With the row term and without the color term, the portfolio batch in the next table ran as one command buffer of 3,952.3 ms.
+
+The ignored test `float_msa_high_degree_chunks_stay_under_the_ceiling` in `src/sampler.rs` runs three batches with both terms. Each batch has 128 reads and 8,192 sweeps in 64 rungs, at seed 42:
+
+- `family-b-draw000-factor.qmodel`, a complete model of 44 nodes with degree 43.
+- A circulant model of 6,016 nodes with degree 62, alone.
+- Eight circulant models in one batch.
+
+The host was the M4 Max of the preceding runs. `uptime` before the run reported `19:28  up 20 days,  5:35, 5 users, load averages: 11.45 6.70 6.59`.
+
+```sh
+cargo test --release --lib float_msa_high_degree_chunks --no-run
+uptime
+cargo test --release --lib float_msa_high_degree_chunks -- --ignored --nocapture
+```
+
+```json
+{"batch":"portfolio x1","degree":43,"chunks":64,"max_chunk_ms":80.1,"total_gpu_ms":3951.9}
+{"batch":"circulant x1","degree":62,"chunks":64,"max_chunk_ms":87.8,"total_gpu_ms":5598.7}
+{"batch":"circulant x8","degree":62,"chunks":64,"max_chunk_ms":142.4,"total_gpu_ms":8174.0}
+```
+
+Each batch splits into one command buffer per rung, and the largest one takes 142.4 ms, under the 400 ms chunk target and the 500 ms ceiling. The portfolio batch takes the same total GPU time as the batch with one command buffer, 3,951.9 ms against 3,952.3 ms. The plan cannot split a rung, so a single rung of more sweeps than these runs use can still take longer.
