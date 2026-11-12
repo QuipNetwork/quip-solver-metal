@@ -736,7 +736,7 @@ The table gives the largest node count that the admission accepts for one proble
 | Gibbs spill | 4 | 5,684,919 | extrapolated | 365.4, 248.9 |
 | Gibbs spill | 20 | 978,887 | extrapolated | 288.7, 301.3 |
 | Gibbs spill | 62 | 358,494 | measured (400,000 nodes) | 288.3, 249.3, 346.0, 317.9, 305.1 (`int32`) |
-| Gibbs spill | 200 | 91,959 | measured (100,000 and 200,000 nodes) | 290.0, 274.1 and 313.1 (`int32`, Task 5.4b) |
+| Gibbs spill | 200 | 91,959 | measured (91,959 and 107,927 nodes) | 290.0, 274.1 and 313.1 (`int32`, Task 5.4b) |
 | MSA spill | 4 | 13,724,198 | extrapolated | 357.0, 340.5 |
 | MSA spill | 20 | 6,932,120 | extrapolated | 343.7 |
 | MSA spill | 62 | 1,433,223 | extrapolated | 277.9 (`int32`) |
@@ -789,7 +789,7 @@ Task 5.4b ran the Gibbs spill build again at degree 200, 16 sweeps of one sweep 
 | 91,959 | `936c262` | 274.1 | 8.70, 6.53, 6.58 |
 | 91,959 | `936c262` | 313.1 | 8.05, 6.46, 6.56 |
 
-No quiet run was possible, so the degree-200 point takes the conservative value of 14.775 ns. That value comes from the slower of the two Task 5.3b chunks at a load average under 8 (408.2 ms at 7.51). The limit at degree 200 falls from 107,927 to 91,959 nodes. At that limit, the longest chunk was 313.1 ms at a load average of 8.05.
+No quiet run was possible, so the degree-200 point takes the conservative value of 14.775 ns. That value comes from the slower of the two Task 5.3b chunks at a load average under 8 (408.2 ms at 7.51). The limit at degree 200 falls from 107,927 to 91,959 nodes. At that limit, the longest chunk was 313.1 ms at a load average of 8.05. The new runs at 107,927 nodes peaked at 352.0 ms, so they alone would not require the tightening. The tightening rests on the Task 5.3b chunk.
 
 The 500 ms ceiling does not cover these chunks. The margin to the macOS GPU watchdog prevents a fault at these times. The `TARGET_DISPATCH_MS` doc comment in `src/sampler.rs` says that the watchdog aborts a command buffer that runs more than a few seconds, and that MLX measured watchdog kills at about 1.2 s per operation with a display attached. The longest chunk here, 707.5 ms, is below 1.2 s.
 
