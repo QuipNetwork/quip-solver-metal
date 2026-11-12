@@ -1851,7 +1851,7 @@ pub(crate) fn kernel_representation(
 /// the row's couplings, widened by the rounding bound of `degree + 1` `f32`
 /// additions. The beta rule is CUDA's `build_planned_beta_schedule` (commit
 /// `7d97e41`).
-fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
+pub(crate) fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
     if let Some(index) = beta.iter().position(|b| !b.is_finite()) {
         return Err(SampleError::TooLarge(format!(
             "beta schedule value at index {index} is outside the finite f32 range"
