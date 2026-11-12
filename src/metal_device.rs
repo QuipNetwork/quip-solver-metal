@@ -91,6 +91,15 @@ fn sa_matrix(defines: &str) -> String {
     format!("{SA_GLOBAL_DEFINE}{defines}{SA_SRC}\n{SA_DENSE_SRC}")
 }
 
+/// The dense-matrix Gibbs kernel, appended to [`GIBBS_SRC`] for its typedefs,
+/// RNG, and heat-bath helper; see `kernels/gibbs_dense.metal`.
+const GIBBS_DENSE_SRC: &str = include_str!("../kernels/gibbs_dense.metal");
+
+/// The dense-matrix Gibbs kernel source after the `defines` of its variant.
+fn gibbs_matrix(defines: &str) -> String {
+    format!("{defines}{GIBBS_SRC}\n{GIBBS_DENSE_SRC}")
+}
+
 /// Multi-spin coded SA, see `kernels/msa.metal`.
 const MSA_SRC: &str = include_str!("../kernels/msa.metal");
 
@@ -231,6 +240,16 @@ pub struct MetalDevice {
     pub(crate) sa_matrix_int: ComputePipelineState,
     /// Dense-matrix SA with a `float` matrix.
     pub(crate) sa_matrix_float: ComputePipelineState,
+    /// Dense-matrix Gibbs (`kernels/gibbs_dense.metal`) with an `int8_t`
+    /// matrix of whole units. A unit model runs here too.
+    pub(crate) gibbs_matrix_i8: ComputePipelineState,
+    /// Dense-matrix Gibbs with an `int8_t` matrix times one integer scale and
+    /// the wide build's integer field.
+    pub(crate) gibbs_matrix_wide_i8: ComputePipelineState,
+    /// Dense-matrix Gibbs with a milli `int` matrix.
+    pub(crate) gibbs_matrix_int: ComputePipelineState,
+    /// Dense-matrix Gibbs with a `float` matrix.
+    pub(crate) gibbs_matrix_float: ComputePipelineState,
     /// Multi-spin slot-table dispatch with per-slot state and schedules.
     pub(crate) msa_slots: ComputePipelineState,
     /// Nonce-parallel screen: eight models of four reads per word.
@@ -355,6 +374,13 @@ impl MetalDevice {
         let sa_matrix_wide_i8 = sa_matrix_pipeline(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
         let sa_matrix_int = sa_matrix_pipeline(WIDE_DEFINE)?;
         let sa_matrix_float = sa_matrix_pipeline(FLOAT_DEFINE)?;
+        let gibbs_matrix_pipeline =
+            |defines: &str| compile_pipeline(&device, &gibbs_matrix(defines), "block_gibbs_matrix");
+        let gibbs_matrix_i8 = gibbs_matrix_pipeline("")?;
+        let gibbs_matrix_wide_i8 =
+            gibbs_matrix_pipeline(&format!("{WIDE_DEFINE}{WIDE_I8_DEFINE}"))?;
+        let gibbs_matrix_int = gibbs_matrix_pipeline(WIDE_DEFINE)?;
+        let gibbs_matrix_float = gibbs_matrix_pipeline(FLOAT_DEFINE)?;
         let msa_slots = compile_pipeline(&device, MSA_SRC, "msa_anneal_slots")?;
         let msa_screen = compile_pipeline(&device, MSA_SRC, "msa_screen")?;
         let msa_frustration_draw = compile_pipeline(&device, MSA_SRC, "msa_frustration_draw")?;
@@ -401,6 +427,10 @@ impl MetalDevice {
             sa_matrix_wide_i8,
             sa_matrix_int,
             sa_matrix_float,
+            gibbs_matrix_i8,
+            gibbs_matrix_wide_i8,
+            gibbs_matrix_int,
+            gibbs_matrix_float,
             msa_slots,
             msa_screen,
             msa_frustration_draw,
@@ -546,6 +576,10 @@ mod tests {
             ("sa_matrix_wide_i8", &dev.sa_matrix_wide_i8),
             ("sa_matrix_int", &dev.sa_matrix_int),
             ("sa_matrix_float", &dev.sa_matrix_float),
+            ("gibbs_matrix_i8", &dev.gibbs_matrix_i8),
+            ("gibbs_matrix_wide_i8", &dev.gibbs_matrix_wide_i8),
+            ("gibbs_matrix_int", &dev.gibbs_matrix_int),
+            ("gibbs_matrix_float", &dev.gibbs_matrix_float),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");

@@ -253,6 +253,30 @@ fn sa_matrix_rate(in_flight: usize) -> f64 {
     SA_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_THROUGHPUT_SAFETY / in_flight.max(1) as f64
 }
 
+/// Matrix columns the reads of one dense-matrix Gibbs dispatch walk per
+/// second, at most [`MAX_READS`] reads of one problem: an update walks the
+/// `n` columns of its row, the threadgroups of a dispatch run side by side,
+/// and one sweep of every read costs `n * n` columns of the one rate, at
+/// every read count. It is a per-chunk worst case: the slowest single chunk
+/// measured on a quiet GPU in `docs/perf/2026-11-12-gibbs-dense.md`, less a
+/// margin for contention from other GPU work. The planner and the one-sweep
+/// admission limit both use it.
+const GIBBS_MATRIX_COLUMNS_PER_SEC: f64 = 7.0e6;
+
+/// The dense-matrix Gibbs kernel keeps its spins in the 4,800-spin
+/// threadgroup array, so the one-sweep limit must admit fewer nodes.
+const _: () = assert!(
+    GIBBS_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_MAX_SWEEP_MS / 1000.0
+        < (GIBBS_MAX_NODES * GIBBS_MAX_NODES) as f64,
+    "the dense Gibbs sweep limit must stay below the threadgroup spin array"
+);
+
+/// Planned column walks per second of one dense-matrix Gibbs dispatch that
+/// shares the GPU with `in_flight` batches of the same shape.
+fn gibbs_matrix_rate(in_flight: usize) -> f64 {
+    GIBBS_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_THROUGHPUT_SAFETY / in_flight.max(1) as f64
+}
+
 /// The estimated GPU time of one sweep of an `n`-node dense-matrix batch, in
 /// milliseconds: the planner's column count at the kernel's rate, without
 /// the planning margin. Every threadgroup (multi-spin) or SIMD group (SA)
@@ -261,7 +285,8 @@ fn sa_matrix_rate(in_flight: usize) -> f64 {
 fn matrix_sweep_ms(kernel: Kernel, n: usize) -> f64 {
     let rate = match kernel {
         Kernel::Sa => SA_MATRIX_COLUMNS_PER_SEC,
-        Kernel::Msa | Kernel::Gibbs => MSA_MATRIX_COLUMNS_PER_SEC,
+        Kernel::Gibbs => GIBBS_MATRIX_COLUMNS_PER_SEC,
+        Kernel::Msa => MSA_MATRIX_COLUMNS_PER_SEC,
     };
     n as f64 * n as f64 / rate * 1000.0
 }
@@ -564,7 +589,7 @@ pub struct Tuning {
     /// memory, at most [`GIBBS_MAX_NODES`]. A model of more nodes runs the
     /// spill build.
     pub gibbs_prefix_cap: Option<usize>,
-    /// Runs a multi-spin model on dense-matrix storage
+    /// Runs a model on dense-matrix storage
     /// ([`crate::capacity::Storage::Dense`]) whatever tier the capacity
     /// model routes it to. A model with a repeated coupler or a self-loop
     /// is refused.
@@ -959,7 +984,7 @@ pub(crate) enum TopologyKind {
     Bare,
 }
 
-/// Free shared-storage buffers for later multi-spin and SA batches. At most 64.
+/// Free shared-storage buffers for later batches. At most 64.
 #[derive(Debug, Default)]
 pub(crate) struct BufferPool {
     free: std::sync::Mutex<Vec<metal::Buffer>>,
@@ -2347,7 +2372,9 @@ fn encode_batch_storage(
     let gibbs_prefix = tuning
         .gibbs_prefix_cap
         .map_or(GIBBS_MAX_NODES, |cap| cap.min(GIBBS_MAX_NODES));
-    let gibbs_spill = kernel == Kernel::Gibbs && n > gibbs_prefix;
+    // The dense-matrix Gibbs kernel keeps every spin in the threadgroup array;
+    // the one-sweep limit keeps `n` below it.
+    let gibbs_spill = kernel == Kernel::Gibbs && !matrix && n > gibbs_prefix;
     let wide = rep == Representation::Wide;
     let float = rep == Representation::Float32;
     // Wide and float SA and Gibbs hold 4-byte deltas and share a dispatch
@@ -2403,7 +2430,7 @@ fn encode_batch_storage(
     // only the dispatch geometry below differs.
     // Only the chromatic kernel has a spill build, so a model past its
     // threadgroup array runs it whatever `QUIP_METAL_GIBBS_SEQUENTIAL` says.
-    let node_parallel = kernel == Kernel::Gibbs && (gibbs_node_parallel() || gibbs_spill);
+    let node_parallel = kernel == Kernel::Gibbs && (gibbs_node_parallel() || gibbs_spill || matrix);
     // A milli model with a row past one chunk takes the weighted lane's dense
     // build, on `int` storage; the default build keeps the one-chunk code
     // alone. A weighted model past `K` takes the spill build, whose milli
@@ -2453,6 +2480,10 @@ fn encode_batch_storage(
             Kernel::Sa if wide => &device.sa_matrix_int,
             Kernel::Sa if float => &device.sa_matrix_float,
             Kernel::Sa => &device.sa_matrix_i8,
+            Kernel::Gibbs if dense_i8.is_some() => &device.gibbs_matrix_wide_i8,
+            Kernel::Gibbs if wide => &device.gibbs_matrix_int,
+            Kernel::Gibbs if float => &device.gibbs_matrix_float,
+            Kernel::Gibbs => &device.gibbs_matrix_i8,
             _ if unit && rep == Representation::Binary => &device.msa_matrix_bits_unit,
             _ if unit => &device.msa_matrix_bits,
             _ if dense_i8.is_some() => &device.msa_matrix_i8,
@@ -2507,6 +2538,19 @@ fn encode_batch_storage(
                 )));
             }
             (num_samples, WIDE_GIBBS_GROUP)
+        }
+        Kernel::Gibbs if node_parallel && matrix => {
+            // The dense kernel keeps the RNG streams of the sparse chromatic
+            // kernel, so it takes that kernel's group width.
+            let width = 256
+                .min(sparse_pipeline.max_total_threads_per_threadgroup() as usize)
+                .max(1);
+            if max_threads < width {
+                return Err(SampleError::TooLarge(format!(
+                    "the dense-matrix Gibbs kernel needs {width} threads per group; this device admits {max_threads}"
+                )));
+            }
+            (num_samples, width)
         }
         Kernel::Gibbs if node_parallel => (num_samples, 256.min(max_threads).max(1)),
         Kernel::Sa | Kernel::Gibbs if four_byte => {
@@ -2592,6 +2636,9 @@ fn encode_batch_storage(
         let cached = if kernel == Kernel::Sa {
             device.topology_cache.get_or_build_bare(device, first)?
         } else {
+            // Multi-spin and Gibbs read the colour classes. The greedy
+            // colouring of a model without CSR arrays is the one the sparse
+            // build gives, so Gibbs keeps the sparse update order.
             device
                 .topology_cache
                 .get_or_build_colors(device, first, four_color)?
@@ -2627,6 +2674,10 @@ fn encode_batch_storage(
         // dispatch walks `n * n` columns (`num_threads * n * cost`), at
         // `sa_matrix_rate` columns per second.
         (_, Kernel::Sa) if matrix => n.max(1) as f64 / dims.num_threads.max(1) as f64,
+        // The same for a Gibbs update: it walks the `n` columns of its row,
+        // and the threadgroups of a dispatch run side by side, at
+        // `gibbs_matrix_rate` columns per second.
+        (_, Kernel::Gibbs) if matrix => n.max(1) as f64 / dims.num_threads.max(1) as f64,
         (Representation::Wide, Kernel::Sa) => WIDE_SA_COST_FACTOR,
         (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
@@ -2675,7 +2726,8 @@ fn encode_batch_storage(
             if matrix {
                 Some(tuning.planning_rate.unwrap_or_else(|| match kernel {
                     Kernel::Sa => sa_matrix_rate(in_flight),
-                    _ => msa_matrix_rate(groups, in_flight),
+                    Kernel::Gibbs => gibbs_matrix_rate(in_flight),
+                    Kernel::Msa => msa_matrix_rate(groups, in_flight),
                 }))
             } else {
                 tuning.planning_rate
@@ -2727,6 +2779,10 @@ fn encode_batch_storage(
                         threads_per_group,
                     )?;
                     pooled.extend(persist.iter().cloned());
+                    if matrix {
+                        // The dense inputs are rented from the pool too.
+                        pooled.extend([inputs.j.clone(), inputs.h.clone()]);
+                    }
                     persist
                 },
                 shared_spins: gibbs_spill.then(|| i32::try_from(gibbs_prefix).unwrap_or(i32::MAX)),
@@ -3748,6 +3804,55 @@ mod tests {
             let message = too_large_msg(err);
             assert!(message.contains("one dense-matrix sweep"), "{message}");
             assert!(message.contains("400.445 ms"), "{message}");
+        }
+        // The CSR gates never take dense storage, so the limit does not
+        // reach them.
+        assert_ne!(
+            admit(above, DenseMode::Off).unwrap().storage,
+            Storage::Dense
+        );
+    }
+
+    /// One dense-matrix Gibbs sweep of 1,673 nodes is estimated at 399.8 ms
+    /// and one of 1,674 nodes at 400.325 ms, at any read count. The longer
+    /// sweep is refused before any buffer exists, under Auto and Forced, with
+    /// no fall back to CSR storage; the shorter one is admitted dense.
+    #[test]
+    fn a_dense_gibbs_sweep_past_one_chunk_is_refused_before_allocation() {
+        assert!(matrix_sweep_ms(Kernel::Gibbs, 1_673) <= MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(matrix_sweep_ms(Kernel::Gibbs, 1_674) > MSA_MATRIX_MAX_SWEEP_MS);
+        let p = SampleParams {
+            num_reads: 256,
+            num_sweeps: 1,
+            ..Default::default()
+        };
+        let admit = |graph: &'static IsingGraph, dense| {
+            validate_batch_within(
+                &[graph],
+                &p,
+                Kernel::Gibbs,
+                host_device_limits(),
+                true,
+                None,
+                dense,
+            )
+        };
+        let below: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_673)));
+        let admitted = admit(below, DenseMode::Auto).unwrap();
+        assert_eq!(admitted.storage, Storage::Dense);
+        assert_eq!(admitted.rep, Representation::Wide);
+        assert!(admitted.i8_scale.is_none());
+
+        let above: &'static IsingGraph = Box::leak(Box::new(complete_int32(1_674)));
+        for mode in [DenseMode::Auto, DenseMode::Forced] {
+            let err = admit(above, mode).unwrap_err();
+            assert_eq!(
+                err.to_sample_error(),
+                quip_solver_core::SampleError::Capacity
+            );
+            let message = too_large_msg(err);
+            assert!(message.contains("one dense-matrix sweep"), "{message}");
+            assert!(message.contains("400.325 ms"), "{message}");
         }
         // The CSR gates never take dense storage, so the limit does not
         // reach them.
