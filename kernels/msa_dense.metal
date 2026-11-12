@@ -151,6 +151,8 @@ kernel void msa_matrix_anneal(
     device uint* my_state = &persistent_state[tg * uint(n)];
     device uint* my_rng = &persistent_rng[tg * uint(vthreads) * 4u];
     SplitSpins spins{state, my_state, shared_spins};
+    // The sparse kernel's seed of this word, shared by its V streams.
+    uint word_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u);
 
     // The matrix of one problem can pass 2^32 elements across a batch, so
     // its base is computed once in 64 bits; rows inside it index in 32.
@@ -169,7 +171,7 @@ kernel void msa_matrix_anneal(
     if (fresh) {
         // The sparse kernel's thread v seeds its stream and draws the words
         // of nodes v, v + V, ...; lanes emulate the V threads in turn.
-        uint seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u);
+        uint seed = word_seed;
         for (int v = int(lane); v < vthreads; v += MSA_LANES) {
             RngState rng = seed_rng(seed ^ (uint(v) * 2246822519u));
             for (int var = v; var < n; var += vthreads) {
@@ -197,11 +199,21 @@ kernel void msa_matrix_anneal(
         device const int* rung_rows = &wide_rows[uint(beta_idx) * uint(WIDE_ROW)];
 #endif
         for (int sweep = sweep_start; sweep < sweep_end; sweep++) {
+            // The sparse kernel's node left out (`msa_body`): a hash of the
+            // word's seed and the sweep's place in the anneal. The last sweep
+            // leaves no node out.
+            bool last_sweep = beta_idx == num_betas - 1 && sweep == sweeps_per_beta - 1;
+            uint skip = last_sweep ? MSA_NO_SIT_OUT : sit_out_node(word_seed, beta_idx, sweep, n);
             for (int color = 0; color < num_colors; color++) {
                 int block_start = color_block_starts[color];
                 int block_count = color_block_counts[color];
                 for (int k = 0; k < block_count; ++k) {
                     int var = color_node_indices[block_start + k];
+                    // The sparse thread that owns position k skips the node
+                    // before its draw, so stream k % V does not advance.
+                    if (uint(var) == skip) {
+                        continue;
+                    }
                     device const matrix_elem_t* row = my_matrix + uint(var) * row_elems;
 
                     // The draw of stream k % V, the sparse thread that owns
