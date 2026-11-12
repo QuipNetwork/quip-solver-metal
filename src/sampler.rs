@@ -1978,6 +1978,8 @@ struct ValidBatch<'a> {
     rep: Representation,
     /// The `int8_t` storage scale, when the batch takes that storage.
     i8_scale: Option<i32>,
+    /// The scale for dense storage, which has no CSR row restriction.
+    dense_i8_scale: Option<i32>,
     /// An MSA batch with a CSR row past one chunk of [`MSA_UNIT_MAX_DEG`]:
     /// on CSR storage it runs on the dense-rows weighted pipeline.
     dense_rows: bool,
@@ -2129,9 +2131,17 @@ fn validate_batch_within<'a>(
             return Err(SampleError::TooLarge(message));
         }
     }
-    let i8_scale = batch_i8_scale(graphs, rep, i8.csr && !dense_rows);
-    let dense_i8 = !unit && batch_i8_scale(graphs, rep, i8.dense).is_some();
-    let shape = model_shape(first, params, rep, unit, i8_scale.is_some(), dense_i8);
+    let scale = batch_i8_scale(graphs, rep, i8.csr || i8.dense);
+    let i8_scale = scale.filter(|_| i8.csr && !dense_rows);
+    let dense_i8_scale = scale.filter(|_| i8.dense && !unit);
+    let shape = model_shape(
+        first,
+        params,
+        rep,
+        unit,
+        i8_scale.is_some(),
+        dense_i8_scale.is_some(),
+    );
     if dense == DenseMode::Forced {
         if !crate::capacity::runnable_storages(kernel).contains(&Storage::Dense) {
             return Err(SampleError::TooLarge(format!(
@@ -2160,6 +2170,7 @@ fn validate_batch_within<'a>(
         n,
         rep,
         i8_scale,
+        dense_i8_scale,
         dense_rows,
         storage,
         shape,
@@ -2319,8 +2330,9 @@ pub fn model_footprint(
         dense_rows = degree > MSA_UNIT_MAX_DEG;
     }
     let i8 = I8Storage::batch_path(kernel, graph.num_nodes());
-    let i8_csr = batch_i8_scale(&[graph], rep, i8.csr && !dense_rows).is_some();
-    let i8_dense = !unit && batch_i8_scale(&[graph], rep, i8.dense).is_some();
+    let scale = batch_i8_scale(&[graph], rep, i8.csr || i8.dense);
+    let i8_csr = scale.is_some() && i8.csr && !dense_rows;
+    let i8_dense = scale.is_some() && i8.dense && !unit;
     crate::capacity::routed_runnable_footprint(
         kernel,
         graph,
@@ -2903,6 +2915,7 @@ fn encode_batch_storage(
         n,
         rep,
         i8_scale,
+        dense_i8_scale,
         dense_rows,
         storage,
         shape: _,
@@ -3032,11 +3045,7 @@ fn encode_batch_storage(
     // unit model, holds the narrowest matrix its coefficients fit: `int8_t`
     // storage needs no CSR rule here.
     let (pipeline, i8_scale) = if matrix {
-        let dense_i8 = if unit {
-            None
-        } else {
-            batch_i8_scale(graphs, rep, wide_i8)
-        };
+        let dense_i8 = dense_i8_scale;
         let pipeline = match kernel {
             Kernel::Sa if dense_i8.is_some() => &device.sa_matrix_wide_i8,
             Kernel::Sa if wide => &device.sa_matrix_int,
