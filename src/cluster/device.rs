@@ -302,8 +302,13 @@ impl std::fmt::Debug for ClusterDevice {
 }
 
 impl ClusterDevice {
+    pub(crate) fn limits(&self) -> DeviceLimits {
+        self.limits
+    }
+
     /// Open device `device_index` in `Device::all()` order and compile the
-    /// cluster kernel. Memory limits come from the host's unified memory.
+    /// cluster kernel. Memory budget comes from the host's unified memory;
+    /// the single-buffer limit comes from the opened device.
     ///
     /// # Errors
     /// [`MetalError::NoDevice`], a compile or pipeline error, or a parameter
@@ -322,11 +327,12 @@ impl ClusterDevice {
             ));
         }
         let queue = device.new_command_queue();
+        let limits = crate::sampler::device_limits(&device);
         Ok(Self {
             device,
             queue,
             pipeline,
-            limits: *crate::sampler::host_device_limits(),
+            limits,
         })
     }
 

@@ -235,15 +235,12 @@ impl OtsukaSampler {
     ) -> Result<Self, OpenError> {
         let cluster =
             ClusterDevice::open(device).map_err(|e| OpenError(format!("cluster device: {e}")))?;
+        let limits = cluster.limits();
         let sa = CombinedSampler::new(Kernel::Sa, device, utilization, yielding);
         if check {
             sa.check()?;
         }
-        Ok(Self::with_backends(
-            cluster,
-            MetalSa(sa),
-            *crate::sampler::host_device_limits(),
-        ))
+        Ok(Self::with_backends(cluster, MetalSa(sa), limits))
     }
 }
 
