@@ -1983,6 +1983,8 @@ struct ValidBatch<'a> {
     dense_rows: bool,
     /// The storage tier the admission priced the batch on.
     storage: Storage,
+    /// The footprint selected by the same admission that chose `storage`.
+    footprint: crate::capacity::Footprint,
     /// The size of one model, as the admission priced it.
     shape: ModelShape,
     /// Every coupling and field is in {-1, 0, 1}. Only the multi-spin kernel
@@ -2145,7 +2147,7 @@ fn validate_batch_within<'a>(
             ));
         }
     }
-    let storage = admit_shape(
+    let footprint = admit_shape(
         kernel,
         &shape,
         limits,
@@ -2161,7 +2163,8 @@ fn validate_batch_within<'a>(
         rep,
         i8_scale,
         dense_rows,
-        storage,
+        storage: footprint.storage,
+        footprint,
         shape,
         unit,
     })
@@ -2191,7 +2194,7 @@ fn admit_shape(
     over_budget: Option<String>,
     problems: usize,
     in_flight: usize,
-) -> Result<Storage, SampleError> {
+) -> Result<crate::capacity::Footprint, SampleError> {
     let too_large = |e: crate::capacity::CapacityError| {
         SampleError::TooLarge(format!("{kernel:?} model of {} nodes: {e}", shape.nodes))
     };
@@ -2238,7 +2241,7 @@ fn admit_shape(
         in_flight,
         cores: host_gpu_cores(),
     })?;
-    Ok(footprint.storage)
+    Ok(footprint)
 }
 
 /// Whether the session admits one model of `shape` on its own: what
@@ -2310,24 +2313,17 @@ pub fn model_footprint(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<crate::capacity::Footprint, SampleError> {
-    let mut rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
-    let unit = rep == Representation::Binary;
-    let mut dense_rows = false;
-    if kernel == Kernel::Msa {
-        let degree = max_csr_degree(graph);
-        rep = msa_lane(rep, degree, graph.num_nodes());
-        dense_rows = degree > MSA_UNIT_MAX_DEG;
-    }
-    let i8 = I8Storage::batch_path(kernel, graph.num_nodes());
-    let i8_csr = batch_i8_scale(&[graph], rep, i8.csr && !dense_rows).is_some();
-    let i8_dense = !unit && batch_i8_scale(&[graph], rep, i8.dense).is_some();
-    crate::capacity::routed_runnable_footprint(
+    validate_batch_within(
+        &[graph],
+        params,
         kernel,
-        graph,
-        &model_shape(graph, params, rep, unit, i8_csr, i8_dense),
         host_device_limits(),
+        I8Storage::batch_path(kernel, graph.num_nodes()),
+        None,
+        DenseMode::Auto,
+        1,
     )
-    .map_err(|e| SampleError::TooLarge(format!("{kernel:?} model: {e}")))
+    .map(|batch| batch.footprint)
 }
 
 /// A buffer, or a capacity refusal when the allocation returned a null
@@ -2906,6 +2902,7 @@ fn encode_batch_storage(
         dense_rows,
         storage,
         shape: _,
+        footprint: _,
         unit,
     } = validate_batch_within(
         graphs,
@@ -5212,6 +5209,7 @@ mod tests {
                 1,
             )
             .unwrap();
+            assert_eq!(batch.footprint, model_footprint(graph, &p, kernel).unwrap());
             (batch.storage, batch.shape, batch.i8_scale)
         };
         let (storage, unit, _) = shape(&complete_with(100, -1.0), Kernel::Msa);
