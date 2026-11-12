@@ -1940,6 +1940,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     fn observe_points_write_output_without_becoming_checkpoints() {
         let Some(device) = device() else {
             return;
@@ -2044,6 +2048,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     fn observe_points_do_not_change_the_final_energies_or_spins() {
         let Some(device) = device() else {
             return;

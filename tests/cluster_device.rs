@@ -391,6 +391,10 @@ fn the_final_descent_reaches_a_local_minimum() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "long-tests"),
+    ignore = "over 10 s in a debug build: run with --features long-tests"
+)]
 fn a_4577_node_instance_runs() {
     let device = device();
     let p = advantage2(8);

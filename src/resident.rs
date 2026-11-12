@@ -3155,6 +3155,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     #[expect(
         clippy::print_stderr,
         reason = "host preparation cost informs the fixed worker budget"

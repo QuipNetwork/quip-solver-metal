@@ -477,7 +477,10 @@ fn every_portfolio_fixture_runs_dense() {
 }
 
 #[test]
-#[ignore = "the long-tests feature does not exist until Task 7.1; the fixtures after the first six take minutes: run with --release --ignored"]
+#[cfg_attr(
+    not(feature = "long-tests"),
+    ignore = "the fixtures after the first six take minutes: run with --features long-tests"
+)]
 fn every_later_portfolio_fixture_runs_dense() {
     portfolio_fixtures_run_dense(6..usize::MAX);
 }

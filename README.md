@@ -279,6 +279,7 @@ See `tests/msa_bench.rs` for the commands to repeat each run.
 
 ```sh
 cargo test --release
+cargo test --release --features long-tests   # adds the tests that take more than ten seconds
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via

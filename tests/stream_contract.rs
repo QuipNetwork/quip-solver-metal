@@ -296,6 +296,10 @@ fn complete_int32(n: usize) -> IsingGraph {
 /// jobs of the same topology each return the reads of `sample_ising` with
 /// their seed, every one scored exactly.
 #[test]
+#[cfg_attr(
+    not(feature = "long-tests"),
+    ignore = "over 30 s in a debug build: run with --features long-tests"
+)]
 fn a_complete_model_runs_dense_in_the_stream() {
     let graph = complete_int32(1_000);
     each_kernel(|kernel| {

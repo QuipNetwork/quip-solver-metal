@@ -56,6 +56,11 @@ toml = "0.8"
 rayon = "1.10"
 objc = "0.2"
 
+# Opt-in coverage that takes more than ten seconds in a debug build. A plain
+# `cargo test` marks these tests `#[ignore]`; `--features long-tests` runs them.
+[features]
+long-tests = []
+
 [dev-dependencies]
 quip-solver-conformance = "0.0.11"
 tonic = "=0.12.3"

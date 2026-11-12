@@ -1050,6 +1050,10 @@ mod tests {
     /// in flight, runs as the only batch, and completes. The job after it
     /// streams as before.
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     fn a_job_that_passes_only_alone_runs_as_the_only_batch() {
         let n = sampler::kernel_max_nodes(Kernel::Gibbs);
         let edges: Vec<(usize, usize)> = (0..n)

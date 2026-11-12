@@ -1517,6 +1517,10 @@ mod tests {
     /// coefficients, at the smallest and the largest read count, and one
     /// node more is refused as a capacity error.
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 30 s in a debug build: run with --features long-tests"
+    )]
     fn the_advertised_corners_pass_the_session_admission() {
         use quip_solver_core::SampleParams;
         let unit: fn(usize) -> f64 = |k| if k % 2 == 0 { 1.0 } else { -1.0 };

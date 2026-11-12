@@ -33,16 +33,24 @@ cache:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
 
-# Lint, format and the full test suite, including the tests that need a real
-# GPU. The runner is a Mac with Metal, so nothing is skipped.
+# Lint, format and the fast test suite, including the tests that need a real
+# GPU. The runner is a Mac with Metal, so no device test is skipped. Tests that
+# take more than ten seconds sit behind the `long-tests` feature. The deadline
+# is ten seconds as a warning and thirty seconds as a failure for every test.
 test:
   extends: .macos
   stage: test
+  variables:
+    # libtest's --ensure-time is unstable and requires RUSTC_BOOTSTRAP.
+    RUSTC_BOOTSTRAP: "1"
+    RUST_TEST_TIME_UNIT: "10000,30000"
+    RUST_TEST_TIME_INTEGRATION: "10000,30000"
+    RUST_TEST_TIME_DOCTEST: "10000,30000"
   script:
     - rustup component add clippy rustfmt
     - cargo fmt --check
     - cargo clippy --all-targets --all-features -- -D warnings
-    - cargo test
+    - cargo test -- --test-threads=1 -Z unstable-options --ensure-time
 
 .build:
   stage: build

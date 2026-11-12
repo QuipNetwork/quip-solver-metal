@@ -284,9 +284,9 @@ mod msa {
 
     #[test]
     fn portfolio_models_reach_their_ground_states() {
-        // Three fixtures keep the slower float lane inside the test budget;
+        // Two fixtures keep the slower float lane inside the test budget;
         // reads and sweeps stay at the README values.
-        super::portfolio_models_reach_their_ground_states(Kernel::Msa, 3);
+        super::portfolio_models_reach_their_ground_states(Kernel::Msa, 2);
     }
 
     #[test]
