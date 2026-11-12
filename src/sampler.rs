@@ -2332,9 +2332,8 @@ fn upload_inputs(
             checked_buffer(device.new_buffer_from_slice(&tile_i32(base_col, num_problems)))?,
         )
     };
-    // `capacity::check_indices` bounds these offsets for SA and Gibbs, and the
-    // multi-spin batch path runs one problem; the conversion refuses rather
-    // than wraps if a caller passes either.
+    // `capacity::check_indices` bounds these offsets before any buffer
+    // exists; the conversion refuses rather than wraps if a caller skips it.
     let offsets = |len: usize| -> Result<Vec<i32>, SampleError> {
         (0..=num_problems)
             .map(|p| {
@@ -2839,15 +2838,6 @@ fn encode_batch_storage(
     // `K`, the spin words the weighted multi-spin kernel keeps in threadgroup
     // memory. A model past it runs the spill build, which holds `int`
     // coefficients only, as the dense build does.
-    // Every multi-spin caller of the batch path passes one graph
-    // (`sample_ising`, `resident::run_fallback`), and the capacity model
-    // mirrors the multi-spin J offsets and output index for one problem.
-    if kernel == Kernel::Msa && graphs.len() > 1 {
-        return Err(SampleError::Driver(format!(
-            "the multi-spin batch path runs one problem per batch, not {}",
-            graphs.len()
-        )));
-    }
     let tg_limit = device.device.max_threadgroup_memory_length() as usize;
     let k = msa_shared_spins(tg_limit, tuning.shared_spins_cap);
     let past_k = kernel == Kernel::Msa && graphs.first().is_some_and(|g| g.num_nodes() > k);
@@ -5197,46 +5187,6 @@ mod tests {
             assert_eq!(sparse.precision, Precision::Int8Scaled, "{kernel:?}");
             assert!(i8_scale.is_some(), "{kernel:?}");
         }
-    }
-
-    /// The multi-spin batch path runs one problem per batch: its J offsets
-    /// and output index are mirrored for one problem only, so a batch of two
-    /// is an error, not a panic or a wrapped index.
-    #[test]
-    fn a_multi_spin_batch_of_two_problems_is_refused() {
-        if crate::metal_device::MetalDevice::device_count() == 0 {
-            return;
-        }
-        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
-        let g = ring();
-        let err = encode_batch_storage(
-            &dev,
-            &[&g, &g],
-            &params(64),
-            Kernel::Msa,
-            1,
-            None,
-            None,
-            true,
-            Tuning::default(),
-            DenseMode::Auto,
-        )
-        .map(drop)
-        .unwrap_err();
-        assert!(driver_msg(err).contains("one problem"));
-        encode_batch_storage(
-            &dev,
-            &[&g],
-            &params(64),
-            Kernel::Msa,
-            1,
-            None,
-            None,
-            true,
-            Tuning::default(),
-            DenseMode::Auto,
-        )
-        .unwrap();
     }
 
     /// The chromatic Gibbs builds index the RNG streams as

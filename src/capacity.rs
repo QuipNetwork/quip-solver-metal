@@ -381,10 +381,12 @@ const RNG_WORDS_PER_STREAM: usize = RNG_BYTES_PER_STREAM / 4;
 ///   `(sample * 256 + thread) * 4`. The shared and dense builds also index
 ///   the spins as `sample * N`; the spill build addresses them in 64 bits.
 /// - Multi-spin: each threadgroup's words are `threadgroup * N`, with one
-///   threadgroup per problem and 32-read word.
+///   threadgroup per problem and 32-read word, and the packed output is
+///   `(problem * reads + read) * packed_size + byte`.
 /// - Dense: a row of one problem's matrix is `row * row_elems`.
-/// - CSR: `row_ptr` and the per-problem offsets are `int`. SA and Gibbs tile
-///   one copy per problem; the multi-spin kernel reads one copy.
+/// - CSR: `row_ptr` and the per-problem offsets are `int`. Every kernel tiles
+///   the couplings per problem. SA and Gibbs also tile the structure; the
+///   multi-spin kernel reads one copy of it.
 ///
 /// # Errors
 ///
@@ -408,13 +410,18 @@ pub(crate) fn check_indices(
     if kernel == Kernel::Gibbs && storage != Storage::Spill {
         uint.push(samples.saturating_mul(n));
     }
+    if kernel == Kernel::Msa {
+        uint.push(samples.saturating_mul(n.div_ceil(8)));
+    }
     let mut int = Vec::new();
     if storage == Storage::Dense {
         uint.push(n.saturating_mul(dense_row_elems(shape.dense_precision, n)));
     } else {
-        let copies = if kernel == Kernel::Msa { 1 } else { problems };
-        int.push(copies.saturating_mul(shape.edges.saturating_mul(2).max(1)));
-        int.push(copies.saturating_mul(n.saturating_add(1)));
+        // The couplings are tiled per problem on every kernel; the multi-spin
+        // kernel shares one `row_ptr`.
+        int.push(problems.saturating_mul(shape.edges.saturating_mul(2).max(1)));
+        let structures = if kernel == Kernel::Msa { 1 } else { problems };
+        int.push(structures.saturating_mul(n.saturating_add(1)));
     }
     let over = |entries: &[usize], max: usize| {
         entries
@@ -1806,11 +1813,13 @@ mod tests {
     }
 
     /// The multi-spin kernel indexes each threadgroup's words as
-    /// `threadgroup * N` in 32 bits: 8 words of 256 reads.
+    /// `threadgroup * N` in 32 bits: 8 words of 256 reads. Its packed output
+    /// index, 32 bytes per node at 256 reads, binds first.
     #[test]
     fn the_capacity_model_mirrors_the_multi_spin_index_guard() {
         let last = u32::MAX as usize / 8;
-        footprint(Kernel::Msa, &edgeless(last, Precision::Int32), &HUGE).unwrap();
+        let output_last = (u32::MAX as usize / 256) * 8;
+        footprint(Kernel::Msa, &edgeless(output_last, Precision::Int32), &HUGE).unwrap();
         assert!(matches!(
             footprint(Kernel::Msa, &edgeless(last + 1, Precision::Int32), &HUGE),
             Err(CapacityError::Index { .. })
@@ -1863,6 +1872,41 @@ mod tests {
                 "{kernel:?}"
             );
         }
+    }
+
+    /// The multi-spin kernel reads one shared CSR structure but tiles the
+    /// couplings per problem through `int` offsets, and indexes its packed
+    /// output as `(problem * reads + read) * packed_size + byte` in 32 bits.
+    #[test]
+    fn the_multi_spin_coupling_offsets_and_output_index_are_32_bit() {
+        let shape = ModelShape {
+            edges: 1_000_000,
+            max_degree: 1_000,
+            reads: 32,
+            ..edgeless(2_000, Precision::Int32)
+        };
+        let copies = i32::MAX as usize / 2_000_000;
+        assert_eq!(
+            check_indices(Kernel::Msa, Storage::Spill, &shape, copies),
+            Ok(())
+        );
+        assert!(check_indices(Kernel::Msa, Storage::Spill, &shape, copies + 1).is_err());
+        // One problem of 256 reads: the output index binds before the
+        // per-word state at `256 * ceil(N / 8)` entries.
+        let packed = |nodes: usize| 256 * nodes.div_ceil(8);
+        let last = (u32::MAX as usize / 256) * 8;
+        assert!(packed(last) <= u32::MAX as usize);
+        assert!(packed(last + 8) > u32::MAX as usize);
+        let at = |nodes| {
+            check_indices(
+                Kernel::Msa,
+                Storage::Spill,
+                &edgeless(nodes, Precision::Int32),
+                1,
+            )
+        };
+        assert_eq!(at(last), Ok(()));
+        assert!(at(last + 8).is_err());
     }
 
     /// A dense row of an `n`-node model is indexed in 32 bits: `n` cells,
