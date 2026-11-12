@@ -207,13 +207,10 @@ fn an_explicit_cap_below_the_local_frame_is_honored() {
 fn global_state_rates() {
     let dev = MetalDevice::open(0).unwrap();
     let sweeps = 256;
-    for (nodes, degree, reads) in [
-        (4_000, 20, 256),
-        (4_000, 20, 1_024),
-        (20_000, 20, 256),
-        (20_000, 40, 256),
-        (60_000, 20, 1_024),
-    ] {
+    // The kernel runs at most 256 reads (`MAX_READS`), so every shape asks
+    // for no more and the update count uses the reads that ran.
+    let reads = 256;
+    for (nodes, degree) in [(4_000, 20), (20_000, 20), (20_000, 40), (60_000, 20)] {
         for path in PATHS {
             let graph = circulant(nodes, degree, path);
             let p = params(reads, sweeps, 4, 9);
@@ -237,6 +234,7 @@ fn global_state_rates() {
                     .collect();
                 times.sort_unstable();
                 let out = run(&dev, &graph, &p, planned);
+                assert_eq!(out.reads.len(), reads, "every requested read ran");
                 let updates = (reads * nodes * sweeps) as f64;
                 let median = times[1].max(1) as f64;
                 writeln!(
