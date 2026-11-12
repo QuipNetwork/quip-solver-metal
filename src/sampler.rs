@@ -205,10 +205,15 @@ const _: () = assert!(
     MSA_MAX_NODES * 4 + MSA_STATIC_TG_BYTES <= APPLE_TG_MEMORY_BYTES,
     "MSA_MAX_NODES spin words must fit in Apple threadgroup memory"
 );
-/// Largest CSR degree the kernel's unrolled 20-neighbour prefetch admits.
+/// Largest CSR degree the unit kernel's unrolled 20-neighbour prefetch
+/// admits, and the neighbours per row chunk of the weighted lanes' walk.
 /// Zephyr (Advantage2) is degree 20. A nonzero field is a 21st input, which
 /// the kernel's `popcount21` covers.
-pub(crate) const MSA_MAX_DEG: usize = 20;
+pub(crate) const MSA_UNIT_MAX_DEG: usize = 20;
+/// Largest CSR degree the weighted multi-spin lanes (milli and Float32) walk,
+/// in row chunks of [`MSA_UNIT_MAX_DEG`]: CUDA's sparse `MSA_MAX_DEG`. Above
+/// it only `capacity::Storage::Dense` admits.
+pub const MSA_SPARSE_MAX_DEG: usize = 62;
 
 /// Nodes one colour class held per threadgroup step when
 /// [`MSA_OCCUPANCY_CURVE`] was measured: 4577 Advantage2 nodes in eight
@@ -233,20 +238,31 @@ fn msa_colour_step_factor(counts: &[i32], threads_per_group: usize, n: usize) ->
     (steps as f64 * MSA_CURVE_NODES_PER_STEP / n.max(1) as f64).max(1.0)
 }
 
-/// Row chunks of [`MSA_MAX_DEG`] neighbours the float lane walks for a node
-/// of `degree`; at least one.
+/// Row chunks of [`MSA_UNIT_MAX_DEG`] neighbours the weighted lanes walk for
+/// a node of `degree`; at least one.
 fn msa_row_chunks(degree: usize) -> usize {
-    degree.div_ceil(MSA_MAX_DEG).max(1)
+    degree.div_ceil(MSA_UNIT_MAX_DEG).max(1)
 }
 
 /// Largest CSR degree the multi-spin kernel admits for a model of `rep`.
-/// The Float32 lane walks a row in chunks of [`MSA_MAX_DEG`] up to CUDA's
-/// sparse limit, [`crate::capacity::MSA_SPARSE_MAX_DEGREE`]; the unit
-/// and milli lanes unroll one chunk.
+/// The weighted lanes (milli and Float32) walk a row in chunks of
+/// [`MSA_UNIT_MAX_DEG`] up to [`MSA_SPARSE_MAX_DEG`]; the unit kernel
+/// unrolls one chunk.
 pub(crate) const fn msa_max_degree(rep: Representation) -> usize {
     match rep {
-        Representation::Float32 => crate::capacity::MSA_SPARSE_MAX_DEGREE,
-        Representation::Binary | Representation::Int8 | Representation::Wide => MSA_MAX_DEG,
+        Representation::Wide | Representation::Float32 => MSA_SPARSE_MAX_DEG,
+        Representation::Binary | Representation::Int8 => MSA_UNIT_MAX_DEG,
+    }
+}
+
+/// The MSA lane a model of `rep` runs on when its CSR rows reach `degree`.
+/// A unit model denser than the unit kernel's [`MSA_UNIT_MAX_DEG`] is a
+/// whole-milli model, so it runs on the weighted lane, which walks rows up
+/// to [`MSA_SPARSE_MAX_DEG`].
+const fn msa_lane(rep: Representation, degree: usize) -> Representation {
+    match rep {
+        Representation::Binary if degree > MSA_UNIT_MAX_DEG => Representation::Wide,
+        other => other,
     }
 }
 
@@ -1260,14 +1276,15 @@ fn validate_batch_within<'a>(
             params.num_sweeps
         )));
     }
-    let rep = batch_representation(graphs, kernel)?;
+    let mut rep = batch_representation(graphs, kernel)?;
     if kernel == Kernel::Msa {
-        // The unit and milli lanes unroll a fixed 20-neighbour prefetch, and
-        // the float lane walks at most `msa_max_degree` neighbours; a denser
-        // node would read past them. Capacity, not a driver fault: the
-        // coordinator routes the job to a backend that walks CSR rows of any
-        // length.
+        // The unit kernel unrolls a fixed 20-neighbour prefetch, so a denser
+        // unit model moves to the weighted lane, and the weighted lanes walk
+        // at most `msa_max_degree` neighbours. A denser node is capacity,
+        // not a driver fault: the coordinator routes the job to a backend
+        // that walks CSR rows of any length.
         let max_deg = max_csr_degree(first);
+        rep = msa_lane(rep, max_deg);
         let budget = msa_max_degree(rep);
         if max_deg > budget {
             return Err(SampleError::TooLarge(format!(
@@ -1338,7 +1355,10 @@ pub fn model_footprint(
     params: &SampleParams,
     kernel: Kernel,
 ) -> Result<crate::capacity::Footprint, SampleError> {
-    let rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
+    let mut rep = kernel_representation(graph, kernel).map_err(SampleError::TooLarge)?;
+    if kernel == Kernel::Msa {
+        rep = msa_lane(rep, max_csr_degree(graph));
+    }
     let i8_scale = batch_i8_scale(&[graph], rep, true);
     shape_footprint(
         graph,
@@ -1764,14 +1784,21 @@ fn encode_batch_storage(
     // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
     // only the dispatch geometry below differs.
     let node_parallel = kernel == Kernel::Gibbs && gibbs_node_parallel();
+    // Every graph of a batch shares `first`'s topology, so its degree is the
+    // batch's. A milli model with a row past one chunk takes the weighted
+    // lane's dense build; the default build keeps the one-chunk code alone.
+    let degree = max_csr_degree(first);
+    let dense_rows = degree > MSA_UNIT_MAX_DEG;
     let pipeline = match kernel {
         Kernel::Sa if i8_scale.is_some() => &device.sa_wide_i8,
+        Kernel::Msa if i8_scale.is_some() && dense_rows => &device.msa_weighted_i8_dense,
         Kernel::Msa if i8_scale.is_some() => &device.msa_weighted_i8,
         Kernel::Gibbs if node_parallel && i8_scale.is_some() => &device.gibbs_parallel_wide_i8,
         Kernel::Gibbs if i8_scale.is_some() => &device.gibbs_wide_i8,
         Kernel::Sa if wide => &device.sa_wide,
         Kernel::Sa if float => &device.sa_float,
         Kernel::Sa => &device.sa,
+        Kernel::Msa if wide && dense_rows => &device.msa_weighted_dense,
         Kernel::Msa if wide => &device.msa_weighted,
         Kernel::Msa if float => &device.msa_float,
         Kernel::Msa => &device.msa,
@@ -1866,16 +1893,26 @@ fn encode_batch_storage(
     let cost = match (rep, kernel) {
         (Representation::Wide, Kernel::Sa) => WIDE_SA_COST_FACTOR,
         (Representation::Wide, Kernel::Gibbs) => WIDE_GIBBS_COST_FACTOR,
-        (Representation::Wide, Kernel::Msa) => WEIGHTED_MSA_COST_FACTOR,
         (Representation::Float32, Kernel::Sa) => FLOAT_SA_COST_FACTOR,
         (Representation::Float32, Kernel::Gibbs) => FLOAT_GIBBS_COST_FACTOR,
-        // The factor was measured at degree <= MSA_MAX_DEG, one row chunk;
-        // the float lane walks a row in chunks of MSA_MAX_DEG, so its cost
-        // grows with the chunk count. Every graph of a batch shares `first`'s
-        // topology, so its degree is the batch's.
+        // Both weighted factors were measured at degree <= MSA_UNIT_MAX_DEG,
+        // one row chunk. A denser row is walked in chunks of
+        // MSA_UNIT_MAX_DEG, so the cost grows with the chunk count, and a
+        // dense model of few nodes is planned by its colour steps. The milli
+        // lane keeps its one-chunk plan up to MSA_UNIT_MAX_DEG, so
+        // Advantage2 plans as it did.
+        (Representation::Wide, Kernel::Msa) => {
+            if !dense_rows {
+                WEIGHTED_MSA_COST_FACTOR
+            } else {
+                WEIGHTED_MSA_COST_FACTOR
+                    * msa_row_chunks(degree) as f64
+                    * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
+            }
+        }
         (Representation::Float32, Kernel::Msa) => {
             FLOAT_MSA_COST_FACTOR
-                * msa_row_chunks(max_csr_degree(first)) as f64
+                * msa_row_chunks(degree) as f64
                 * msa_colour_step_factor(&cached.topo.colors.counts, threads_per_group, n)
         }
         (Representation::Binary | Representation::Int8, _) => 1.0,
@@ -2890,14 +2927,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_batch_rejects_msa_degree_over_the_prefetch_budget() {
-        // The kernel unrolls a fixed 20-neighbour prefetch; a denser node
-        // would read past it. Capacity, not DeviceFault: the coordinator
-        // routes the job to another backend.
-        let g = star(21);
+    fn validate_batch_rejects_msa_degree_over_the_sparse_budget() {
+        // The weighted lanes walk at most 62 neighbours; a denser node is
+        // capacity, not DeviceFault: the coordinator routes the job to
+        // another backend.
+        let g = star(MSA_SPARSE_MAX_DEG + 1);
         let err = validate_batch(&[&g], &params(64), Kernel::Msa).unwrap_err();
         let msg = too_large_msg(err);
-        assert!(msg.contains("degree 21"), "{msg}");
+        assert!(msg.contains("degree 63"), "{msg}");
         // The other kernels walk CSR rows of any length.
         validate_batch(&[&g], &params(64), Kernel::Sa).unwrap();
         validate_batch(&[&g], &params(64), Kernel::Gibbs).unwrap();
@@ -2905,14 +2942,14 @@ mod tests {
 
     #[test]
     fn validate_batch_accepts_msa_degree_at_the_budget() {
-        let g = star(MSA_MAX_DEG);
+        let g = star(MSA_SPARSE_MAX_DEG);
         validate_batch(&[&g], &params(64), Kernel::Msa).unwrap();
     }
 
     #[test]
     fn float_msa_plans_by_row_chunks_and_colour_steps() {
         assert_eq!(msa_row_chunks(0), 1);
-        assert_eq!(msa_row_chunks(MSA_MAX_DEG), 1);
+        assert_eq!(msa_row_chunks(MSA_UNIT_MAX_DEG), 1);
         assert_eq!(msa_row_chunks(43), 3);
         assert_eq!(msa_row_chunks(62), 4);
         // The calibration shape plans by its nodes.
@@ -2924,27 +2961,98 @@ mod tests {
     }
 
     #[test]
-    fn the_float_lane_admits_msa_degree_up_to_the_sparse_limit() {
+    fn the_weighted_lanes_admit_msa_degree_up_to_the_sparse_limit() {
         let scaled = |leaves: usize, j: f64| {
             let edges: Vec<(usize, usize)> = (1..=leaves).map(|i| (0, i)).collect();
             IsingGraph::new(vec![0.0; leaves + 1], vec![j; leaves], edges)
         };
-        let budget = crate::capacity::MSA_SPARSE_MAX_DEGREE;
-        let (_, _, rep) =
-            validate_batch(&[&scaled(budget, 0.0005)], &params(64), Kernel::Msa).unwrap();
-        assert_eq!(rep, Representation::Float32);
-        let msg = too_large_msg(
-            validate_batch(&[&scaled(budget + 1, 0.0005)], &params(64), Kernel::Msa).unwrap_err(),
+        let budget = MSA_SPARSE_MAX_DEG;
+        for (j, want) in [
+            (0.0005, Representation::Float32),
+            (1.5, Representation::Wide),
+        ] {
+            let (_, _, rep) =
+                validate_batch(&[&scaled(budget, j)], &params(64), Kernel::Msa).unwrap();
+            assert_eq!(rep, want);
+            let msg = too_large_msg(
+                validate_batch(&[&scaled(budget + 1, j)], &params(64), Kernel::Msa).unwrap_err(),
+            );
+            assert!(msg.contains(&format!("degree {}", budget + 1)), "{msg}");
+        }
+    }
+
+    #[test]
+    fn msa_runs_denser_unit_models_on_the_weighted_lane() {
+        let (_, _, rep) = validate_batch(&[&star(20)], &params(64), Kernel::Msa).unwrap();
+        assert_eq!(rep, Representation::Binary);
+        for leaves in [21, 62] {
+            let (_, _, rep) = validate_batch(&[&star(leaves)], &params(64), Kernel::Msa).unwrap();
+            assert_eq!(rep, Representation::Wide, "star of {leaves}");
+        }
+        let msg =
+            too_large_msg(validate_batch(&[&star(63)], &params(64), Kernel::Msa).unwrap_err());
+        assert!(msg.contains("degree 63"), "{msg}");
+    }
+
+    /// K_40 has degree 39, two row chunks. Integer fields are exact in any
+    /// order, and every carry-over resumes from the persistent buffers, so a
+    /// split plan returns the reads of one whole chunk, on both storages.
+    #[test]
+    fn the_weighted_lane_resumes_rows_past_one_chunk_without_changing_reads() {
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let n = 40;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let weighted = IsingGraph::new(
+            (0..n)
+                .map(|i| f64::from((i % 3) as i32 - 1) * 0.5)
+                .collect(),
+            edges
+                .iter()
+                .map(|&(u, v)| f64::from(((u * 7 + v * 3) % 5) as i32 - 2) * 0.75)
+                .collect(),
+            edges.clone(),
         );
-        assert!(msg.contains(&format!("degree {}", budget + 1)), "{msg}");
-        // A milli model keeps the one-chunk budget of the int lane.
-        let msg = too_large_msg(
-            validate_batch(&[&scaled(MSA_MAX_DEG + 1, 1.5)], &params(64), Kernel::Msa).unwrap_err(),
+        let unit = IsingGraph::new(
+            vec![0.0; n],
+            edges
+                .iter()
+                .map(|&(u, v)| if (u + v) % 2 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+            edges,
         );
-        assert!(
-            msg.contains(&format!("degree {}", MSA_MAX_DEG + 1)),
-            "{msg}"
-        );
+        let p = SampleParams {
+            num_reads: 64,
+            num_sweeps: 256,
+            seed: 7,
+            ..Default::default()
+        };
+        let whole = [(0, 256)];
+        let split = [(0, 100), (100, 156)];
+        for graph in [&weighted, &unit] {
+            let (_, _, rep) = validate_batch(&[graph], &p, Kernel::Msa).unwrap();
+            assert_eq!(rep, Representation::Wide);
+            let mut storages = Vec::new();
+            for wide_i8 in [true, false] {
+                let a =
+                    sample_planned(&dev, graph, &p, Kernel::Msa, Some(&whole), wide_i8).unwrap();
+                let b =
+                    sample_planned(&dev, graph, &p, Kernel::Msa, Some(&split), wide_i8).unwrap();
+                assert_eq!(a, b, "wide_i8 {wide_i8}");
+                for r in &a {
+                    assert_eq!(
+                        r.energy_milli,
+                        energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+                    );
+                }
+                storages.push(a);
+            }
+            assert_eq!(storages[0], storages[1], "int8 and int storage agree");
+        }
     }
 
     #[test]

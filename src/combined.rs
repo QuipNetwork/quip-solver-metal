@@ -285,9 +285,9 @@ struct EdgeFacts {
     /// No self-loop and no repeated undirected edge. Only meaningful in bounds.
     simple: bool,
     /// No node has more than 20 in-bounds incident edges; a self-loop counts once.
-    /// The bound stays at the unit and milli lanes' 20 although capacity admits
-    /// 62 for Float32 MSA models: coordinator jobs cannot be Float32 today,
-    /// because the backend identity refuses off-step coefficients first.
+    /// The bound stays at the unit lane's and the ANE's 20, the degree the
+    /// backend identity advertises, although the batch path's weighted lanes
+    /// admit 62.
     degree_ok: bool,
 }
 

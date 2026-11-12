@@ -176,12 +176,14 @@ pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::Mod
 /// Gibbs's model limits, the same wide bound as [`METAL_SA_LIMITS`].
 pub const METAL_GIBBS_LIMITS: quip_solver_core::ModelLimits = METAL_SA_LIMITS;
 
-/// MSA's model limits. Both GPU kernels and the ANE unroll
-/// `sampler::MSA_MAX_DEG` neighbours, which caps the degree. Unit models run
-/// on the unit kernel (or the ANE); any other milli-exact model runs on the
-/// weighted kernel, whose field bound is the wide SA path's.
+/// MSA's model limits. The unit kernel and the ANE unroll
+/// `sampler::MSA_UNIT_MAX_DEG` neighbours, which caps the advertised degree.
+/// Unit models run on the unit kernel (or the ANE); any other milli-exact
+/// model, and a library unit model denser than that cap, runs on the weighted
+/// kernel, which walks up to `sampler::MSA_SPARSE_MAX_DEG` neighbours and
+/// whose field bound is the wide SA path's.
 pub const METAL_MSA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
-    max_degree: Some(crate::sampler::MSA_MAX_DEG as u32),
+    max_degree: Some(crate::sampler::MSA_UNIT_MAX_DEG as u32),
     max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
     exact_resolution_milli: Some(1),
 };

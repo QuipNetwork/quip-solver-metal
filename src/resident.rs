@@ -787,7 +787,14 @@ impl Preparer {
                         // established only after validate_batch, and coefficient filling
                         // checks exact topology equality on every hit. Recounting degree
                         // would allocate and walk the same 41,515 edges on every job.
-                        sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                        let (_, _, rep) =
+                            sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                        // A unit model denser than the unit kernel's rows runs on the
+                        // weighted lane, which only the batch path has. Its topology is
+                        // never cached, so a cache hit is always a unit-lane topology.
+                        if rep != crate::representation::Representation::Binary {
+                            return Ok(None);
+                        }
                         // This cache contains no Metal objects. Coloring does not
                         // change the CSR positions used for coefficient order.
                         let topology = SelfFeedingTopology::build(&job.graph);
@@ -3826,7 +3833,19 @@ mod tests {
         let settings = CascadeSettings::default();
         let mut input = job(0, 32);
         preparer.prepare(&mut input, settings, true).unwrap();
-        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        // A unit model past the unit kernel's degree takes the batch path's
+        // weighted lane; past the weighted lane's degree it is capacity.
+        input.graph.edges = (1..=sampler::MSA_UNIT_MAX_DEG + 1)
+            .map(|v| (0, v))
+            .collect();
+        input.graph.j = vec![1.0; input.graph.edges.len()];
+        assert!(preparer
+            .prepare(&mut input, settings, true)
+            .unwrap()
+            .is_none());
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG + 1)
+            .map(|v| (0, v))
+            .collect();
         input.graph.j = vec![1.0; input.graph.edges.len()];
         assert!(matches!(
             preparer.prepare(&mut input, settings, true),
@@ -4217,7 +4236,9 @@ mod tests {
             .unwrap()
             .is_none());
         input.params.num_sweeps = 64;
-        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG + 1)
+            .map(|v| (0, v))
+            .collect();
         input.graph.j = vec![0.5; input.graph.edges.len()];
         assert!(matches!(
             preparer.prepare(&mut input, CascadeSettings::default(), true),

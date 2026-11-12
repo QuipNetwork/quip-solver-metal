@@ -11,7 +11,8 @@
 //!
 //! - [`Storage::Threadgroup`]: spin state lives in threadgroup memory. Only
 //!   models up to the kernel node cap fit, and multi-spin also needs degree
-//!   at most [`MSA_MAX_DEG`], or [`MSA_SPARSE_MAX_DEGREE`] for Float32. The sizes come from the buffers that
+//!   at most [`MSA_UNIT_MAX_DEG`] on the unit lane, or [`MSA_SPARSE_MAX_DEG`]
+//!   on the weighted lanes. The sizes come from the buffers that
 //!   `sampler::encode_batch` allocates.
 //! - [`Storage::Spill`]: the threadgroup-tier buffers, plus a device buffer
 //!   for the spin state of the nodes past the threadgroup cap. This kernel
@@ -24,14 +25,10 @@
 //! correct one without touching the routing.
 
 use crate::sampler::{
-    simd_rounded_reads, Kernel, GIBBS_MAX_NODES, MSA_LANES, MSA_MAX_DEG, MSA_MAX_NODES,
-    MSA_THREADS, SA_MAX_NODES,
+    simd_rounded_reads, Kernel, GIBBS_MAX_NODES, MSA_LANES, MSA_MAX_NODES, MSA_SPARSE_MAX_DEG,
+    MSA_THREADS, MSA_UNIT_MAX_DEG, SA_MAX_NODES,
 };
 use crate::streaming::batch_size_for_reads;
-
-/// Highest degree the sparse multi-spin kernel admits. Above it only
-/// [`Storage::Dense`] admits.
-pub const MSA_SPARSE_MAX_DEGREE: usize = 62;
 
 /// Largest node count the 32-bit kernel indexing can address.
 pub const MAX_NODES: usize = i32::MAX as usize;
@@ -310,17 +307,17 @@ const fn node_cap(kernel: Kernel) -> usize {
 fn admits(kernel: Kernel, storage: Storage, shape: &ModelShape) -> bool {
     match storage {
         Storage::Threadgroup => {
-            // `sampler::msa_max_degree`: the float lane walks rows up to the
-            // sparse limit, the other lanes one chunk of MSA_MAX_DEG.
-            let msa_degree = if shape.precision == Precision::Float32 {
-                MSA_SPARSE_MAX_DEGREE
-            } else {
-                MSA_MAX_DEG
+            // `sampler::msa_max_degree`: the weighted lanes (milli, its
+            // int8 storage, and Float32) walk rows up to the sparse limit;
+            // the unit lane, sized as Binary or Int8, unrolls one chunk.
+            let msa_degree = match shape.precision {
+                Precision::Binary | Precision::Int8 => MSA_UNIT_MAX_DEG,
+                Precision::Int32 | Precision::Int8Scaled | Precision::Float32 => MSA_SPARSE_MAX_DEG,
             };
             shape.nodes <= node_cap(kernel)
                 && (kernel != Kernel::Msa || shape.max_degree <= msa_degree)
         }
-        Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEGREE,
+        Storage::Spill => kernel != Kernel::Msa || shape.max_degree <= MSA_SPARSE_MAX_DEG,
         Storage::Dense => true,
     }
 }
@@ -548,7 +545,7 @@ pub fn footprint(
         first_error.get_or_insert(error);
     }
     Err(first_error.unwrap_or(CapacityError::Degree {
-        max: MSA_SPARSE_MAX_DEGREE,
+        max: MSA_SPARSE_MAX_DEG,
     }))
 }
 
@@ -812,12 +809,12 @@ mod tests {
     #[test]
     fn msa_above_sparse_degree_admits_only_dense() {
         let mut shape = sparse_shape();
-        shape.max_degree = MSA_SPARSE_MAX_DEGREE + 1;
+        shape.max_degree = MSA_SPARSE_MAX_DEG + 1;
         shape.nodes = 1_000;
         shape.edges = 40_000;
         let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
         assert_eq!(fp.storage, Storage::Dense);
-        shape.max_degree = MSA_SPARSE_MAX_DEGREE;
+        shape.max_degree = MSA_SPARSE_MAX_DEG;
         let fp = footprint(Kernel::Msa, &shape, &ROOMY).unwrap();
         assert_ne!(fp.storage, Storage::Dense);
     }

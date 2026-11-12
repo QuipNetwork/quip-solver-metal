@@ -1318,10 +1318,12 @@ mod tests {
         let device = MetalDevice::open(0).unwrap();
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        // Past the weighted lane's 62 neighbours, so capacity on MSA.
+        let leaves = crate::sampler::MSA_SPARSE_MAX_DEG + 1;
         let star = IsingGraph::new(
-            vec![0.0; 22],
-            vec![1.0; 21],
-            (1..=21).map(|leaf| (0, leaf)).collect(),
+            vec![0.0; leaves + 1],
+            vec![1.0; leaves],
+            (1..=leaves).map(|leaf| (0, leaf)).collect(),
         );
         job_tx.blocking_send(job(b"star", star, 64, 32, 1)).unwrap();
         job_tx

@@ -118,14 +118,76 @@ fn complete_graphs_at_16_64_65_and_200_nodes_report_exact_energies() {
         // best() asserts reported == recomputed for every read.
         best(&dev, &graph, Kernel::Sa, 64);
         best(&dev, &graph, Kernel::Gibbs, 64);
-        // MSA unrolls 20 neighbours: K_16 runs, denser graphs are capacity.
-        if n - 1 <= 20 {
+        // MSA walks at most 62 neighbours: K_16 runs, denser graphs are
+        // capacity.
+        if n - 1 <= 62 {
             best(&dev, &graph, Kernel::Msa, 64);
         } else {
             let err = sample_ising(&dev, &graph, &params(64), Kernel::Msa).unwrap_err();
             assert!(matches!(err, SampleError::TooLarge(_)), "K_{n}: {err:?}");
         }
     }
+}
+
+/// K_63 with unit antiferromagnetic couplings, degree 62: past the unit
+/// kernel's 20 neighbours, so MSA runs it on the weighted lane. With `M` the
+/// spin sum, `E = sum_{i<j} s_i s_j = (M^2 - 63) / 2`, and 63 spins make `M`
+/// odd, so the ground energy is `(1 - 63) / 2 = -31`, at `|M| = 1`.
+#[test]
+fn a_degree_62_model_runs_on_msa() {
+    let Some(dev) = device() else { return };
+    let n = 63;
+    let edges: Vec<(usize, usize)> = (0..n)
+        .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+        .collect();
+    let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+    let reads = sample_ising(&dev, &graph, &params(1000), Kernel::Msa).unwrap();
+    assert_eq!(reads.len(), 64);
+    for r in &reads {
+        assert_eq!(
+            r.energy_milli,
+            energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+        );
+        assert_eq!(r.energy_milli, -31_000, "every read reaches the ground");
+    }
+}
+
+/// A weighted star whose hub has 30 leaves, so the hub's row takes two row
+/// chunks of the weighted lane. Each leaf `i` settles against the hub spin
+/// `s0` at `-|J_i s0 + h_i|`, so the ground energy is
+/// `min over s0 of (h_0 s0 - sum_i |J_i s0 + h_i|)`.
+#[test]
+fn a_weighted_star_past_one_row_chunk_reaches_its_ground_state() {
+    let Some(dev) = device() else { return };
+    let leaves = 30;
+    let j: Vec<f64> = (0..leaves)
+        .map(|i| f64::from((i % 7) as i32 - 3) * 0.75)
+        .collect();
+    let mut h: Vec<f64> = (0..leaves)
+        .map(|i| f64::from((i % 5) as i32 - 2) * 0.5)
+        .collect();
+    h.insert(0, 1.25);
+    let edges = (1..=leaves).map(|v| (0, v)).collect();
+    let graph = IsingGraph::new(h.clone(), j.clone(), edges);
+    let want = [1.0, -1.0]
+        .iter()
+        .map(|&s0| {
+            h[0] * s0
+                - j.iter()
+                    .zip(&h[1..])
+                    .map(|(&jj, &hh)| (jj * s0 + hh).abs())
+                    .sum::<f64>()
+        })
+        .fold(f64::INFINITY, f64::min);
+    let want = (want * 1000.0).round() as i64;
+    let reads = sample_ising(&dev, &graph, &params(500), Kernel::Msa).unwrap();
+    for r in &reads {
+        assert_eq!(
+            r.energy_milli,
+            energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+        );
+    }
+    assert!(reads.iter().all(|r| r.energy_milli == want), "want {want}");
 }
 
 #[test]

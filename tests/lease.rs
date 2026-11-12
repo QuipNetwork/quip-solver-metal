@@ -343,6 +343,36 @@ async fn a_plain_job_during_a_lease_returns_all_its_reads() {
     assert_eq!(s.shutdown(2_000).await, 0);
 }
 
+/// Degree 21 is past the unit kernel's 20 neighbours but within the weighted
+/// lane's 62, so every salt runs on the batch path and the lease completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_degree_21_lease_runs() {
+    let mut s = Session::start(&msa(), 4, "").await;
+    let (mut topology, _) = ring(22, RING_A);
+    topology.edges = Some(EdgeList {
+        u: vec![0; 21],
+        v: (1..22).collect(),
+    });
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    s.send(coord_msg::Msg::Job(lease(b"degree-21", 3, RING_A, 0, 8)))
+        .await;
+    s.until("degree-21 lease done", LONG, |log| {
+        log.done(b"degree-21").is_some()
+    })
+    .await;
+    assert_eq!(s.log.done(b"degree-21").expect("LeaseDone").salts_done, 8);
+    assert_eq!(
+        s.log.results_for(b"degree-21").len(),
+        8,
+        "an i64::MAX target makes every salt win"
+    );
+    assert!(s.log.rejects.is_empty(), "{:?}", s.log.rejects);
+    assert_eq!(s.shutdown(2_000).await, 0);
+    assert!(s.log.fatal.is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_leases_are_rejected_with_refunds() {
     let mut s = Session::start(&msa(), 4, "").await;

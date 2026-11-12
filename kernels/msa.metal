@@ -24,17 +24,22 @@ using namespace metal;
 //   persistent spin and RNG buffers.
 // - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
-// The host checks CSR degree <= MSA_MAX_DEG. The unit entries read each J and
-// h by sign, and the host sends them unit models only (J and h in {-1, 0, 1}).
+// The host checks CSR degree <= MSA_UNIT_MAX_DEG for the unit entries and
+// <= MSA_SPARSE_MAX_DEG for `msa_anneal_weighted`. The unit entries read each
+// J and h by sign, and the host sends them unit models only (J and h in
+// {-1, 0, 1}) of degree at most MSA_UNIT_MAX_DEG; a denser unit model takes
+// the weighted entry.
 // `msa_anneal_weighted` reads milli `int` coefficients and accepts each flip
 // against a host-built integer threshold row (`wide_tables::metropolis_rows`),
 // so it holds any model whose local fields fit `WIDE_MAX_FIELD_MILLI`; the
-// host scores its energies.
+// host scores its energies. A row of at most MSA_ROW_CHUNK neighbours takes
+// the one-chunk code. In the QUIP_MSA_DENSE build, which the host selects for
+// a model with a denser row, such a row takes `weighted_accept_dense`, which
+// walks it with `weighted_lane_fields` (after quip-solver-cuda 1ac73d5).
 // The QUIP_FLOAT build of `msa_anneal_weighted` (the float lane, after
 // quip-solver-cuda's QUIP_MSA_COEF_F32 lane) reads `float` coefficients,
-// sums each lane's local field in `float`, and walks CSR rows in chunks of
-// MSA_MAX_DEG; the host admits up to `capacity::MSA_SPARSE_MAX_DEGREE`
-// neighbours (62, CUDA's MSA_MAX_DEG). Each lane draws its
+// sums each lane's local field in `float`, and walks every CSR row with
+// `weighted_lane_fields`. Each lane draws its
 // own uniform: one xoshiro128** draw per word update, as in the int lane,
 // hashed with the lane index. A lane flips where its energy change `de` is
 // at most zero or `beta * de < -log(u)`, the log form of `u < exp(-beta de)`,
@@ -51,7 +56,14 @@ using namespace metal;
 #define MSA_PLANES     6
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
-#define MSA_MAX_DEG    20
+// Largest CSR degree of the unit entries: one unrolled prefetch of 20
+// neighbours, plus a field as the 21st `popcount21` input.
+#define MSA_UNIT_MAX_DEG   20
+// Largest CSR degree of `msa_anneal_weighted` (CUDA's MSA_MAX_DEG). The host
+// enforces it; the kernel walks any row in chunks of MSA_ROW_CHUNK.
+#define MSA_SPARSE_MAX_DEG 62
+// Neighbours the weighted row walk prefetches per chunk.
+#define MSA_ROW_CHUNK      MSA_UNIT_MAX_DEG
 // Threshold entries per rung for the weighted entry. Must equal
 // `wide_tables::WIDE_ROW`.
 #define WIDE_ROW       2048
@@ -210,8 +222,11 @@ struct ScreenCouplings {
 struct WeightedCouplings {
     device const float* j;
     device const float* h;
+    inline float field(int var) const { return h[var]; }
+    inline float coupling(int p) const { return j[p]; }
 };
 typedef float weighted_coef_t;
+typedef float weighted_field_t;
 #else
 // One model per word with milli `int` couplings and fields, plus the
 // batch's Metropolis threshold rows: one row of WIDE_ROW milli thresholds
@@ -229,6 +244,7 @@ struct WeightedCouplings {
     inline int coupling(int p) const { return int(j[p]) * scale; }
 };
 typedef int8_t weighted_coef_t;
+typedef int weighted_field_t;
 #else
 struct WeightedCouplings {
     device const int* j;
@@ -238,8 +254,50 @@ struct WeightedCouplings {
     inline int coupling(int p) const { return j[p]; }
 };
 typedef int weighted_coef_t;
+typedef int weighted_field_t;
 #endif
 #endif
+
+// The weighted row walk, shared by the float lane and the int lane's dense
+// rows: `field[l]` becomes the local field of lane `lane0 + l` for the
+// `GROUP` lanes from `lane0`, `h` and then the CSR slots [pstart, pend) in
+// order, MSA_ROW_CHUNK slots per chunk. Each chunk prefetches its couplings
+// and neighbour words, then adds them to the group's fields, which stay in
+// registers. Slots past `pend` read node 0 with a zero coupling.
+template <int GROUP>
+inline void weighted_lane_fields(
+    thread weighted_field_t* field,
+    WeightedCouplings couplings,
+    device const int* my_csr_col_ind,
+    threadgroup const uint* state,
+    int var, int pstart, int pend, int lane0
+) {
+    weighted_field_t h = couplings.field(var);
+    for (int l = 0; l < GROUP; ++l) {
+        field[l] = h;
+    }
+    for (int base = pstart; base < pend; base += MSA_ROW_CHUNK) {
+        weighted_field_t jj[MSA_ROW_CHUNK];
+        uint sw[MSA_ROW_CHUNK];
+        #pragma unroll
+        for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
+            int p = base + q;
+            bool ok = p < pend;
+            jj[q] = ok ? couplings.coupling(p) : weighted_field_t(0);
+            sw[q] = state[ok ? my_csr_col_ind[p] : 0];
+        }
+        for (int l = 0; l < GROUP; ++l) {
+            weighted_field_t f = field[l];
+            uint lane = uint(lane0 + l);
+            #pragma unroll
+            for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
+                // Spin bit 1 is -1. Missing neighbours have J = 0.
+                f += ((sw[q] >> lane) & 1u) ? -jj[q] : jj[q];
+            }
+            field[l] = f;
+        }
+    }
+}
 
 // Per-lane energy in milli of the spin words in `state` for the nodes this
 // thread owns (var = tid, tid + gsz, ...). h*spin*1000 per node plus one
@@ -266,7 +324,7 @@ inline void lane_energies(
             int spin = ((bi >> r) & 1) ? -1 : 1;
             ener[r] += h * spin * 1000;
         }
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
             int p = pstart + q;
             if (p < pend && couplings.bond(p).nonzero) {
                 int nb = col_ind[p];
@@ -304,12 +362,12 @@ inline void lane_energies(
         uint bi = state[var];
         int pstart = row_ptr[var];
         int pend = row_ptr[var + 1];
-        uint x[MSA_MAX_DEG + 1];
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        uint x[MSA_UNIT_MAX_DEG + 1];
+        for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
             int p = pstart + q;
             x[q] = (p < pend) ? (couplings.bond(p).neg ^ bi ^ state[col_ind[p]]) : 0u;
         }
-        x[MSA_MAX_DEG] = 0u;
+        x[MSA_UNIT_MAX_DEG] = 0u;
         slots += pend - pstart;
         uint planes[MSA_PLANES];
         popcount21(x, planes);
@@ -363,11 +421,11 @@ inline uint flip_mask(
     // Prefetch every neighbour index and coupling before
     // touching threadgroup memory. Slots past the degree read
     // node 0 with a zero coupling and contribute nothing.
-    int nb[MSA_MAX_DEG];
-    uint neg[MSA_MAX_DEG];
-    bool nz[MSA_MAX_DEG];
+    int nb[MSA_UNIT_MAX_DEG];
+    uint neg[MSA_UNIT_MAX_DEG];
+    bool nz[MSA_UNIT_MAX_DEG];
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+    for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
         int p = pstart + q;
         bool ok = p < pend;
         Bond bond = ok ? couplings.bond(p) : Bond{0u, false};
@@ -377,10 +435,10 @@ inline uint flip_mask(
     }
 
     uint bi = state[var];
-    uint x[MSA_MAX_DEG + 1];
+    uint x[MSA_UNIT_MAX_DEG + 1];
     int d = 0;
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+    for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
         uint sj = state[nb[q]];
         // Set on the replicas where bond q is satisfied.
         uint l = neg[q] ^ bi ^ sj;
@@ -388,7 +446,7 @@ inline uint flip_mask(
         d += int(nz[q]);
     }
     // A field is one more bond to a spin pinned at +1.
-    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
+    x[MSA_UNIT_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
     d += (h != 0);
 
     uint planes[MSA_PLANES];
@@ -434,30 +492,8 @@ inline uint flip_mask(
     int pstart = my_csr_row_ptr[var];
     int pend = my_csr_row_ptr[var + 1];
     float field[MSA_LANES];
-    float h = couplings.h[var];
-    for (int lane = 0; lane < MSA_LANES; ++lane) {
-        field[lane] = h;
-    }
-    for (int base = pstart; base < pend; base += MSA_MAX_DEG) {
-        float jj[MSA_MAX_DEG];
-        uint sw[MSA_MAX_DEG];
-        #pragma unroll
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
-            int p = base + q;
-            bool ok = p < pend;
-            jj[q] = ok ? couplings.j[p] : 0.0f;
-            sw[q] = state[ok ? my_csr_col_ind[p] : 0];
-        }
-        for (int lane = 0; lane < MSA_LANES; ++lane) {
-            float f = field[lane];
-            #pragma unroll
-            for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                // Spin bit 1 is -1. Missing neighbours have J = 0.
-                f += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
-            }
-            field[lane] = f;
-        }
-    }
+    weighted_lane_fields<MSA_LANES>(field, couplings, my_csr_col_ind, state,
+                                    var, pstart, pend, 0);
     uint bi = state[var];
     uint draw = xoshiro128starstar(rng);
 
@@ -474,6 +510,43 @@ inline uint flip_mask(
     return accept;
 }
 #else
+// Lanes go in groups of MSA_LANE_GROUP, whose fields stay in registers while
+// the row's neighbour words are reloaded chunk by chunk for each group
+// (quip-solver-cuda 1ac73d5), so the dense path's frame stays near the
+// one-chunk path's.
+#define MSA_LANE_GROUP 8
+
+// `flip_mask` for a row denser than MSA_ROW_CHUNK: the same fields, draw, and
+// threshold test as the one-chunk code. Integer sums are exact in any order,
+// so the chunking does not change the result. Only the QUIP_MSA_DENSE build
+// calls it, which the host selects for a model with a row denser than
+// MSA_ROW_CHUNK, so the default build (every Advantage2 model) compiles the
+// one-chunk code alone and keeps its registers and rate.
+inline uint weighted_accept_dense(
+    WeightedCouplings couplings,
+    device const int* my_csr_col_ind,
+    threadgroup const uint* state,
+    int var, int pstart, int pend, int beta_idx,
+    thread RngState& rng
+) {
+    uint bi = state[var];
+    uint draw = xoshiro128starstar(rng) & uint(WIDE_ROW - 1);
+    int threshold = couplings.rows[uint(beta_idx) * uint(WIDE_ROW) + draw];
+
+    uint accept = 0u;
+    for (int lane0 = 0; lane0 < MSA_LANES; lane0 += MSA_LANE_GROUP) {
+        int field[MSA_LANE_GROUP];
+        weighted_lane_fields<MSA_LANE_GROUP>(field, couplings, my_csr_col_ind, state,
+                                             var, pstart, pend, lane0);
+        for (int l = 0; l < MSA_LANE_GROUP; ++l) {
+            uint lane = uint(lane0 + l);
+            int de = ((bi >> lane) & 1u) ? 2 * field[l] : -2 * field[l];
+            accept |= uint(de <= threshold) << lane;
+        }
+    }
+    return accept;
+}
+
 // The weighted overload sums each lane's local field in milli and flips where
 // the energy change `de = -2 s field` is at most one threshold drawn from the
 // rung's row, shared by the word's 32 lanes as the unit draw is. Every entry
@@ -489,12 +562,18 @@ inline uint flip_mask(
 ) {
     int pstart = my_csr_row_ptr[var];
     int pend = my_csr_row_ptr[var + 1];
+#ifdef QUIP_MSA_DENSE
+    if (pend - pstart > MSA_ROW_CHUNK) {
+        return weighted_accept_dense(couplings, my_csr_col_ind, state,
+                                     var, pstart, pend, beta_idx, rng);
+    }
+#endif
     int h = couplings.field(var);
 
-    int jj[MSA_MAX_DEG];
-    uint sw[MSA_MAX_DEG];
+    int jj[MSA_ROW_CHUNK];
+    uint sw[MSA_ROW_CHUNK];
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+    for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
         int p = pstart + q;
         bool ok = p < pend;
         jj[q] = ok ? couplings.coupling(p) : 0;
@@ -509,7 +588,7 @@ inline uint flip_mask(
     for (int lane = 0; lane < MSA_LANES; ++lane) {
         int field = h;
         #pragma unroll
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
             // Spin bit 1 is -1. Missing neighbours have J = 0.
             field += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
         }
