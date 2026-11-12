@@ -976,7 +976,7 @@ kernel void msa_anneal_weighted(
     device uint* my_state = &persistent_state[tg * uint(N)];
     // The QUIP_MSA_SPILL build keeps words [shared_spins, N) in device
     // memory; every other build keeps all N in threadgroup memory. A runtime
-    // choice between the two cost 0.5% of the Advantage2 rate
+    // choice between the two cost about 0.4% of the Advantage2 rate
     // (docs/perf/2026-11-12-msa-spill.md), so the host picks the build.
 #ifdef QUIP_MSA_SPILL
     SplitSpins spins{state, my_state, shared_spins};

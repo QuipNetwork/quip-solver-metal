@@ -288,6 +288,15 @@ impl SlotPool {
             ..Default::default()
         };
         sampler::validate_batch(&[graph], &params, Kernel::Msa)?;
+        // The batch path spills a larger model; the slot kernel keeps every
+        // spin word in threadgroup memory, up to the advertised nodes.
+        let max_nodes = sampler::kernel_max_nodes(Kernel::Msa);
+        if graph.num_nodes() > max_nodes {
+            return Err(SampleError::TooLarge(format!(
+                "slot pool of {} nodes exceeds the unit kernel's {max_nodes}",
+                graph.num_nodes()
+            )));
+        }
         if graph.num_nodes() == 0 || num_reads == 0 || capacity == 0 || sched_stride == 0 {
             return Err(SampleError::TooLarge(
                 "slot pool dimensions must be nonzero".into(),
@@ -1497,6 +1506,28 @@ mod tests {
         pool.reads_many(&[0, 1], 33).unwrap_err();
         pool.reads_many(&[3], 33).unwrap_err();
         pool.reads_many(&[4], 33).unwrap_err();
+    }
+
+    #[test]
+    fn a_slot_pool_refuses_more_nodes_than_the_unit_kernel_runs() {
+        let Some(device) = device() else { return };
+        let ring = |n: usize| {
+            IsingGraph::new(
+                vec![1.0; n],
+                vec![-1.0; n],
+                (0..n).map(|i| (i, (i + 1) % n)).collect(),
+            )
+        };
+        let max = sampler::kernel_max_nodes(Kernel::Msa);
+        let pool = SlotPool::new(&device, &ring(max), READS, 1, 32).unwrap();
+        assert!(pool.allocated_bytes() > 0);
+        let Err(error) = SlotPool::new(&device, &ring(max + 1), READS, 1, 32) else {
+            panic!("a slot pool admitted {} nodes", max + 1);
+        };
+        assert!(
+            matches!(&error, SampleError::TooLarge(message) if message.contains("unit kernel")),
+            "{error:?}"
+        );
     }
 
     fn device() -> Option<MetalDevice> {
