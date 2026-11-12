@@ -172,7 +172,7 @@ pub struct MetalDevice {
     pub(crate) msa_frustration_count: ComputePipelineState,
     /// One CSR topology, replaced when `n`, edges, or the colouring flag change.
     pub(crate) topology_cache: crate::sampler::TopologyCache,
-    /// Multi-spin batch buffers returned after their command buffers retire.
+    /// Multi-spin and SA batch buffers returned after their command buffers retire.
     pub(crate) buffer_pool: std::sync::Arc<crate::sampler::BufferPool>,
 }
 

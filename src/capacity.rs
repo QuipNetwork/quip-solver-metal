@@ -504,6 +504,45 @@ pub fn footprint(
     shape: &ModelShape,
     limits: &DeviceLimits,
 ) -> Result<Footprint, CapacityError> {
+    footprint_in(
+        kernel,
+        shape,
+        limits,
+        &[Storage::Threadgroup, Storage::Spill, Storage::Dense],
+    )
+}
+
+/// The tiers a kernel of this crate runs. No SA or Gibbs dense kernel
+/// exists, so those kernels upload CSR whatever tier [`footprint`] prices.
+/// A dense kernel adds its tier here.
+#[must_use]
+pub const fn runnable_storages(kernel: Kernel) -> &'static [Storage] {
+    match kernel {
+        Kernel::Sa | Kernel::Gibbs | Kernel::Msa => &[Storage::Threadgroup, Storage::Spill],
+    }
+}
+
+/// [`footprint`] over only the tiers in [`runnable_storages`]: the bytes the
+/// sampler allocates, which its admission checks before any buffer exists.
+///
+/// # Errors
+///
+/// The errors of [`footprint`].
+pub fn runnable_footprint(
+    kernel: Kernel,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+) -> Result<Footprint, CapacityError> {
+    footprint_in(kernel, shape, limits, runnable_storages(kernel))
+}
+
+/// [`footprint`] over the tiers in `tiers`, in their cost order.
+fn footprint_in(
+    kernel: Kernel,
+    shape: &ModelShape,
+    limits: &DeviceLimits,
+    tiers: &[Storage],
+) -> Result<Footprint, CapacityError> {
     if shape.nodes > MAX_NODES {
         return Err(CapacityError::Nodes { max: MAX_NODES });
     }
@@ -520,7 +559,7 @@ pub fn footprint(
         (Storage::Dense, dense_sizes(kernel, shape)),
     ]
     .into_iter()
-    .filter(|(storage, _)| admits(kernel, *storage, shape))
+    .filter(|(storage, _)| tiers.contains(storage) && admits(kernel, *storage, shape))
     .map(|(storage, sizes)| {
         let tiling = models_per_buffer(kernel, shape.reads);
         let footprint = Footprint {
@@ -804,6 +843,51 @@ mod tests {
             let local = footprint(Kernel::Sa, &smaller, &ROOMY).unwrap();
             assert_eq!(local.storage, Storage::Threadgroup, "{precision:?}");
         }
+    }
+
+    /// No SA dense kernel exists, so the sampler's admission prices an SA
+    /// complete model past the local frame on CSR, and refuses it when CSR
+    /// does not fit, even where the dense tier would.
+    #[test]
+    fn an_sa_complete_model_past_the_frame_is_priced_on_csr() {
+        let shape = ModelShape {
+            nodes: 5_000,
+            edges: 5_000 * 4_999 / 2,
+            max_degree: 4_999,
+            precision: Precision::Int8,
+            betas: 64,
+            reads: 256,
+        };
+        assert_eq!(
+            footprint(Kernel::Sa, &shape, &ROOMY).unwrap().storage,
+            Storage::Dense
+        );
+        let runnable = runnable_footprint(Kernel::Sa, &shape, &ROOMY).unwrap();
+        assert_eq!(runnable.storage, Storage::Spill);
+        assert_eq!(
+            runnable.per_instance_bytes,
+            sum(&spill_sizes(Kernel::Sa, &shape).per_instance)
+        );
+        let col_ind = shape.edges * 2 * COL_IND_ENTRY_BYTES;
+        assert!(runnable.per_instance_bytes > col_ind);
+
+        // Room for the dense tier but not for CSR.
+        let dense = footprint(Kernel::Sa, &shape, &ROOMY).unwrap();
+        let in_flight = instances(Kernel::Sa, shape.reads);
+        let memory = (dense.total(in_flight) + runnable.total(in_flight)) / 2 / 4 * 5;
+        let limits = DeviceLimits {
+            memory_bytes: memory,
+            tg_memory_bytes: TG_MEMORY_BYTES,
+            max_buffer_bytes: memory,
+        };
+        assert_eq!(
+            footprint(Kernel::Sa, &shape, &limits).unwrap().storage,
+            Storage::Dense
+        );
+        assert!(matches!(
+            runnable_footprint(Kernel::Sa, &shape, &limits),
+            Err(CapacityError::Memory { .. })
+        ));
     }
 
     #[test]

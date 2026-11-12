@@ -41,7 +41,7 @@ pub enum Kernel {
     Gibbs,
 }
 
-use crate::capacity::{footprint as capacity_footprint, host_limits, DeviceLimits, ModelShape};
+use crate::capacity::{host_limits, runnable_footprint, DeviceLimits, ModelShape};
 use crate::representation::{batch_wide_i8_scale, classify, classify_msa, Representation};
 use crate::topology::{fill_h_j, fill_h_j_float, fill_h_j_wide, SelfFeedingTopology};
 use quip_solver_core::beta::default_ising_beta_range;
@@ -818,7 +818,7 @@ fn build_cached_topology(
     })
 }
 
-/// Free shared-storage buffers for later multi-spin batches. At most 64.
+/// Free shared-storage buffers for later multi-spin and SA batches. At most 64.
 #[derive(Debug, Default)]
 pub(crate) struct BufferPool {
     free: std::sync::Mutex<Vec<metal::Buffer>>,
@@ -949,7 +949,7 @@ pub(crate) struct EncodedBatch {
     )]
     cached: std::sync::Arc<CachedTopology>,
     pool: std::sync::Arc<BufferPool>,
-    /// Multi-spin buffers rented from `pool`.
+    /// Multi-spin and SA carry-over buffers rented from `pool`.
     pooled: Vec<metal::Buffer>,
 }
 
@@ -1411,8 +1411,9 @@ fn validate_batch_within<'a>(
     .min(node_cap.unwrap_or(usize::MAX));
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
-        // before the sampler; this catches drift before it overruns the
-        // kernel's fixed-size thread-local arrays.
+        // before the sampler. For Gibbs this catches drift before it overruns
+        // the kernel's fixed-size thread-local arrays. For SA and MSA it
+        // applies the memory-scale bound or an explicit node cap.
         return Err(SampleError::TooLarge(format!(
             "graph N={n} exceeds {kernel:?} kernel limit {cap}"
         )));
@@ -1497,7 +1498,7 @@ fn shape_footprint(
         reads: params.num_reads,
     };
     // `footprint` compares the total for `instances` with `usable_bytes`.
-    capacity_footprint(kernel, &shape, limits)
+    runnable_footprint(kernel, &shape, limits)
 }
 
 /// The footprint `encode_batch` admits `graph` at, for tests of the storage
@@ -1701,22 +1702,26 @@ fn bind_shared_args(
     enc.set_buffer(15, Some(&inputs.h), 0);
 }
 
-/// SA-only chunked-dispatch persistent buffers (indices 16..21).
+/// SA carry-over buffers (indices 18..21): packed spins, `delta_energy`,
+/// the RNG word, and the running energy of every read, rented from `pool`.
 ///
-/// Single-shot run: beta_start = 0, beta_count = num_betas, so these are
-/// written but never re-read — allocated as zeroed scratch.
+/// The first chunk writes every read's state before any read of it, and
+/// every chunk writes all four at its end, so pooled buffers need no
+/// zeroing. The global build works in the first two in place.
 fn new_sa_persistent(
-    device: &crate::metal_device::MetalDevice,
+    pool: &BufferPool,
+    device: &metal::DeviceRef,
     dims: &BatchDims,
     delta_bytes: usize,
 ) -> Result<[metal::Buffer; 4], SampleError> {
     Ok([
-        checked_buffer(device.new_zeroed_buffer((dims.num_threads * dims.packed_size) as u64))?,
-        checked_buffer(
-            device.new_zeroed_buffer((dims.num_threads * dims.n.max(1) * delta_bytes) as u64),
+        pool.take(device, (dims.num_threads * dims.packed_size) as u64)?,
+        pool.take(
+            device,
+            (dims.num_threads * dims.n.max(1) * delta_bytes) as u64,
         )?,
-        checked_buffer(device.new_zeroed_buffer((dims.num_threads * 4) as u64))?, // uint rng
-        checked_buffer(device.new_zeroed_buffer((dims.num_threads * 4) as u64))?, // int energy
+        pool.take(device, (dims.num_threads * 4) as u64)?, // uint rng
+        pool.take(device, (dims.num_threads * 4) as u64)?, // int energy
     ])
 }
 
@@ -2164,7 +2169,16 @@ fn encode_batch_storage(
                 energies: checked_buffer(device.new_zeroed_buffer((num_samples * 4) as u64))?, // i32
             },
             KernelEncode::Sa {
-                persist: new_sa_persistent(device, &dims, if four_byte { 4 } else { 1 })?,
+                persist: {
+                    let persist = new_sa_persistent(
+                        &device.buffer_pool,
+                        &device.device,
+                        &dims,
+                        if four_byte { 4 } else { 1 },
+                    )?;
+                    pooled.extend(persist.iter().cloned());
+                    persist
+                },
             },
         ),
         Kernel::Gibbs => (
@@ -2381,7 +2395,8 @@ pub(crate) fn audit_device_energies(
 /// Returns [`SampleError::TooLarge`] (harness `SampleError::Capacity`) when:
 /// - `graph.num_nodes()` exceeds the Gibbs kernel node cap
 ///   (`GIBBS_MAX_NODES`);
-/// - the model does not fit the device's memory (`capacity::footprint`),
+/// - the model does not fit the device's memory
+///   (`capacity::runnable_footprint`),
 ///   which bounds SA and MSA models;
 /// - `params.num_sweeps` exceeds `MAX_SWEEPS`, the sampler's guard against an
 ///   unbounded coordinator-supplied beta schedule.
