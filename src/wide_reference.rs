@@ -100,9 +100,22 @@ pub(crate) fn reference_sa(graph: &IsingGraph, params: &SampleParams) -> Vec<Vec
                 .map(|_| if xorshift32(&mut rng) & 1 == 1 { -1 } else { 1 })
                 .collect();
             let mut de: Vec<i32> = (0..n).map(|v| -2 * s[v] * field(&c, v, &s)).collect();
+            let mut sweeps_left = rows.as_chunks::<WIDE_ROW>().0.len() * sweeps_per;
             for row in rows.as_chunks::<WIDE_ROW>().0 {
                 for _ in 0..sweeps_per {
+                    // One draw per sweep picks the node that sits it out;
+                    // the last sweep and a model of one node leave none out.
+                    let draw = xorshift32(&mut rng);
+                    sweeps_left -= 1;
+                    let skip = if sweeps_left == 0 || n < 2 {
+                        usize::MAX
+                    } else {
+                        ((u64::from(draw) * n as u64) >> 32) as usize
+                    };
                     for var in 0..n {
+                        if var == skip {
+                            continue;
+                        }
                         let d = de[var];
                         let flip =
                             d <= 0 || d <= row[(xorshift32(&mut rng) as usize) & (WIDE_ROW - 1)];

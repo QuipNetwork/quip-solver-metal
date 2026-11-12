@@ -230,3 +230,19 @@ cargo test --release --lib float_msa_high_degree_chunks -- --ignored --nocapture
 ```
 
 Each batch splits into one command buffer per rung, and the largest one takes 142.4 ms, under the 400 ms chunk target and the 500 ms ceiling. The portfolio batch takes the same total GPU time as the batch with one command buffer, 3,951.9 ms against 3,952.3 ms. The plan cannot split a rung, so a single rung of more sweeps than these runs use can still take longer.
+
+## Digests after the sweep change of November 12
+
+QUI-2265 (merge request !33 on main) changes the SA and MSA sweeps. Every sweep of an anneal except the last leaves one node out, so the SA and MSA samples change. The SA and MSA digests in the preceding sections come from the kernels before that change, while the Gibbs kernel and its digest stay the same.
+
+After the merge of `feat/capacity-model` into `feat/precision-tiers`, the `pm1_rates` runs gave these digests:
+
+| Run | Digest before QUI-2265 | Digest after QUI-2265 |
+| --- | --- | --- |
+| SA, int8 ±1 | `e4e22f86b64cda5d` | `e5ba74a87a6dadad` |
+| Gibbs, int8 ±1 | `bc085a7fc384f073` | `bc085a7fc384f073` |
+| MSA unit, ±1 | `6ec8d35ff7c9f123` | `a68757003e4eac09` |
+| MSA weighted, ±1.5 | `4ee84dd42f5d5ade` | `be4c5e92185633b9` |
+| MSA Float32, ±1.0005 | `c103cce43c429e4b` | `af08be780113298d` |
+
+The Float32 SA digest `04210f9bbe78e5d8` also comes from the kernel before the change, and this file does not record a new value for it. The cost factors in this file were not measured again.

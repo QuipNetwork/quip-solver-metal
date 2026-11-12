@@ -63,3 +63,7 @@ Baseline ±1, second run:
 | Weighted MSA mean best | −22,436,250 milli, equal to wide SA |
 
 The weighted ratio uses wall time, which includes host scoring of each weighted read, so the GPU share of the ratio is at most 3.34. The unit kernel's mean best, scaled by 1.5, is −22,441,500 milli. The weighted mean best is 5,250 milli higher, a difference of 0.02 percent.
+
+## Digests after the sweep change of November 12
+
+QUI-2265 (merge request !33 on main) changes the SA and MSA sweeps, so the SA and MSA digests in this file are from the kernels before that change. The Gibbs digest `bc085a7fc384f073` does not change. `2026-11-11-float-kernels.md` gives the digests after the change.
