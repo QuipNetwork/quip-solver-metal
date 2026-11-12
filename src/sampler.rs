@@ -201,21 +201,46 @@ const WEIGHTED_MSA_DENSE_COST_FACTOR: f64 = 6.8;
 
 /// Matrix columns one threadgroup of the dense-matrix multi-spin kernel
 /// walks per second: a word update of an `n`-node model walks `n` columns.
-/// The slowest shape measured in `docs/perf/2026-11-12-msa-dense.md`
-/// (Int8, 64 nodes, 256 reads on an M4 Max). Each threadgroup is one SIMD
-/// group whose column walk is bound by latency, so the rate scales with the
-/// threadgroups and not with the GPU cores, unlike
-/// [`MSA_OCCUPANCY_CURVE`].
-const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 7.0e7;
+/// It is below every rate measured in `docs/perf/2026-11-12-msa-dense.md`
+/// (M4 Max, 1 to 8 threadgroups), including the slowest single chunk:
+/// 68.2 million columns per second, one sweep of an Int32 model of 6,016
+/// nodes. Each threadgroup is one SIMD group whose column walk is bound by
+/// latency, so the rate scales with the threadgroups and not with the GPU
+/// cores, unlike [`MSA_OCCUPANCY_CURVE`].
+const MSA_MATRIX_COLUMNS_PER_SEC: f64 = 6.5e7;
 /// Margin on [`MSA_MATRIX_COLUMNS_PER_SEC`], so a chunk planned at the
 /// 500 ms ceiling runs about 200 ms on the slowest measured shape.
 const MSA_MATRIX_THROUGHPUT_SAFETY: f64 = 0.4;
+/// Threadgroups the dense-matrix rate was measured at, at most: one problem
+/// of [`MAX_READS`] reads, the only batch the dense path runs. More
+/// threadgroups at once can saturate the GPU, which the linear rate does not
+/// model.
+const MSA_MATRIX_MEASURED_GROUPS: usize = MAX_READS / MSA_LANES;
+/// Longest single sweep a dense-matrix batch may plan, in milliseconds. A
+/// chunk is at least one sweep, so the planner cannot split a longer sweep,
+/// and a measured chunk must stay below 400 ms.
+const MSA_MATRIX_MAX_SWEEP_MS: f64 = 400.0;
 
 /// Planned column updates per second of `groups` dense-matrix threadgroups
 /// that share the GPU with `in_flight` batches of the same shape.
 fn msa_matrix_rate(groups: usize, in_flight: usize) -> f64 {
+    debug_assert!(
+        groups <= MSA_MATRIX_MEASURED_GROUPS,
+        "{groups} dense-matrix threadgroups exceed the measured {MSA_MATRIX_MEASURED_GROUPS}"
+    );
     MSA_MATRIX_COLUMNS_PER_SEC * MSA_MATRIX_THROUGHPUT_SAFETY * groups.max(1) as f64
         / in_flight.max(1) as f64
+}
+
+/// The estimated GPU time of one sweep of an `n`-node dense-matrix batch
+/// of `groups` threadgroups, in milliseconds: the planner's column count at
+/// [`MSA_MATRIX_COLUMNS_PER_SEC`], without the planning margin. Every
+/// threadgroup walks its rows at once, so the estimate is `n * n` columns
+/// at the rate of one threadgroup, whatever the read count.
+fn msa_matrix_sweep_ms(n: usize, groups: usize) -> f64 {
+    let groups = groups.max(1) as f64;
+    let columns = groups * n as f64 * n as f64;
+    columns / (MSA_MATRIX_COLUMNS_PER_SEC * groups) * 1000.0
 }
 
 /// Fill whole SIMD groups while keeping each wide sequential read's global ID.
@@ -1598,6 +1623,36 @@ fn validate_batch_within<'a>(
         }
     }
     .map_err(too_large)?;
+    let footprint = if footprint.storage == Storage::Dense {
+        // A chunk is at least one sweep. A dense batch whose one sweep would
+        // pass the ceiling takes a sparse tier that fits, or is refused
+        // before any buffer exists.
+        let groups = graphs.len() * simd_rounded_reads(params.num_reads) / MSA_LANES;
+        let sweep_ms = msa_matrix_sweep_ms(n, groups);
+        if sweep_ms <= MSA_MATRIX_MAX_SWEEP_MS {
+            footprint
+        } else {
+            let sparse = (dense == DenseMode::Auto)
+                .then(|| {
+                    crate::capacity::footprint_in(
+                        kernel,
+                        &shape,
+                        limits,
+                        &[Storage::Threadgroup, Storage::Spill],
+                    )
+                    .ok()
+                })
+                .flatten();
+            sparse.ok_or_else(|| {
+                SampleError::TooLarge(format!(
+                    "{kernel:?} model of {n} nodes: one dense-matrix sweep is estimated at \
+                     {sweep_ms:.1} ms, past the {MSA_MATRIX_MAX_SWEEP_MS:.0} ms limit of one chunk"
+                ))
+            })?
+        }
+    } else {
+        footprint
+    };
     if footprint.storage != Storage::Dense {
         if let Some(message) = over_budget {
             return Err(SampleError::TooLarge(message));
@@ -3525,6 +3580,81 @@ mod tests {
         // `graphs[0]`.
         let err = validate_batch(&[], &params(64), Kernel::Sa).unwrap_err();
         assert!(driver_msg(err).contains("at least one graph"));
+    }
+
+    /// A complete Int32 model on `n` nodes: couplings 1.3 and -0.127 have
+    /// milli gcd 1, so no `int8_t` scale holds them.
+    fn complete_int32(n: usize) -> IsingGraph {
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let j = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        IsingGraph::new(vec![0.0; n], j, edges)
+    }
+
+    /// One dense-matrix sweep of 5,099 nodes is estimated at 400.0 ms and
+    /// one of 5,100 nodes past it, at any read count. The longer sweep is
+    /// refused before any buffer exists; the shorter one is admitted dense.
+    #[test]
+    fn a_dense_sweep_past_one_chunk_is_refused_before_allocation() {
+        assert!(msa_matrix_sweep_ms(5_099, 8) <= MSA_MATRIX_MAX_SWEEP_MS);
+        assert!(msa_matrix_sweep_ms(5_100, 8) > MSA_MATRIX_MAX_SWEEP_MS);
+        assert!((msa_matrix_sweep_ms(5_100, 1) - msa_matrix_sweep_ms(5_100, 8)).abs() < 1e-9);
+        let p = SampleParams {
+            num_reads: 256,
+            num_sweeps: 1,
+            ..Default::default()
+        };
+        let below = complete_int32(5_099);
+        let admitted = validate_batch_within(
+            &[&below],
+            &p,
+            Kernel::Msa,
+            host_device_limits(),
+            true,
+            None,
+            DenseMode::Auto,
+        )
+        .unwrap();
+        assert_eq!(admitted.storage, Storage::Dense);
+        assert_eq!(admitted.rep, Representation::Wide);
+        assert!(admitted.i8_scale.is_none());
+
+        // `encode_batch_storage` validates before it touches the device, so
+        // a refusal here allocates nothing. Device allocations of the
+        // parallel tests make a process-wide byte count unusable as a check.
+        let above = complete_int32(5_100);
+        let err = validate_batch_within(
+            &[&above],
+            &p,
+            Kernel::Msa,
+            host_device_limits(),
+            true,
+            None,
+            DenseMode::Auto,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        let message = too_large_msg(err);
+        assert!(message.contains("one dense-matrix sweep"), "{message}");
+        assert!(message.contains("400.2 ms"), "{message}");
+        // A forced dense run is refused the same way.
+        let err = validate_batch_within(
+            &[&above],
+            &p,
+            Kernel::Msa,
+            host_device_limits(),
+            true,
+            None,
+            DenseMode::Forced,
+        )
+        .unwrap_err();
+        assert!(too_large_msg(err).contains("one dense-matrix sweep"));
     }
 
     #[test]

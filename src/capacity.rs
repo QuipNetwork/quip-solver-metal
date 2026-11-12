@@ -445,7 +445,8 @@ fn spill_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
 
 /// Dense-tier sizes: an `N * N` coupling matrix at the precision's width
 /// (1 bit, 1, 4, 4 bytes) replaces the CSR structure and couplings. The
-/// fields, the outputs, and the carry-over buffers remain.
+/// fields, the outputs, and the carry-over buffers remain. The multi-spin
+/// kernel also shares one colour start and one count per node.
 fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     let mut per_instance = vec![
         shape
@@ -455,9 +456,15 @@ fn dense_sizes(kernel: Kernel, shape: &ModelShape) -> Sizes {
     ];
     per_instance.extend(output_buffers(shape));
     per_instance.extend(persistent_buffers(kernel, shape));
+    let mut shared = common_shared(shape);
+    if kernel == Kernel::Msa {
+        // The colour start and count arrays: a complete model has one
+        // colour per node (`sampler::encode_batch_storage`).
+        shared.extend([shape.nodes.saturating_mul(4); 2]);
+    }
     Sizes {
         per_instance,
-        shared: common_shared(shape),
+        shared,
     }
 }
 

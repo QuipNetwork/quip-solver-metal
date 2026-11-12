@@ -35,7 +35,9 @@
 //   them one after another reads the same fields as visiting them at once.
 // - Each lane sums its local field in ascending column order: `h`, then
 //   every column. The CSR rows are sorted ascending, and a zero entry adds
-//   nothing, so the Float32 sum equals the CSR walk's.
+//   nothing, so the Float32 sum takes the CSR walk's order of additions.
+//   `the_dense_path_matches_the_sparse_path` (tests/msa_dense.rs) pins it
+//   with a model whose fields round differently in another order.
 // - The acceptance rule is the one the sparse kernel applies to the model:
 //   the unit kernel's geometric draw (QUIP_MSA_MATRIX_UNIT), or the threshold
 //   rows of the weighted lane, or the float lane's per-lane uniform.
@@ -47,19 +49,6 @@ typedef uint matrix_elem_t;
 #else
 typedef weighted_coef_t matrix_elem_t;
 #endif
-
-// `geometric_draw` with the cap raised to `cap`. A row of d terms needs a
-// draw of at most d, so a cap of max(d, MSA_MAX_FIELD) accepts exactly as
-// the uncapped draw does, and equals `geometric_draw` whenever d is at most
-// MSA_MAX_FIELD, as every row of the unit kernel is.
-inline int matrix_geometric_draw(uint u, float two_beta, int cap) {
-    if (two_beta <= 0.0f) {
-        return cap;
-    }
-    float x = min((float(u) + 1.0f) * 2.3283064365386963e-10f, 1.0f);
-    float m = floor(-log(x) / two_beta);
-    return int(clamp(m, 0.0f, float(cap)));
-}
 
 // The words a row of the matrix occupies.
 inline uint matrix_row_elems(int n) {
@@ -254,7 +243,10 @@ kernel void msa_matrix_anneal(
                     }
 #ifdef QUIP_MSA_MATRIX_UNIT
                     // The unit kernel's rule: flip where L <= (d + M) / 2.
-                    int m = matrix_geometric_draw(draw, two_beta, max(d, MSA_MAX_FIELD));
+                    // Only a model of degree at most MSA_UNIT_MAX_DEG takes
+                    // this build, so d <= 21 and the draw's cap of
+                    // MSA_MAX_FIELD never binds, as in the unit kernel.
+                    int m = geometric_draw(draw, two_beta);
                     int limit = (d + m) >> 1;
                     accept = limit >= d || satisfied <= limit;
 #else

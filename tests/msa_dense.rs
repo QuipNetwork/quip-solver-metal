@@ -224,6 +224,66 @@ fn the_dense_path_matches_the_sparse_path() {
             );
         }
     }
+    // A unit model past the unit kernel takes the bit matrix with the milli
+    // threshold rows, and Int8 past one row chunk compares dense `int8_t`
+    // with the sparse `int` storage of dense rows. 3,000 nodes at degree 4
+    // put about 1,000 nodes in a colour class, so the class wraps the 1,024
+    // RNG streams.
+    let mut shapes = vec![
+        (circulant(200, 30, Precision::Binary), p.clone()),
+        (circulant(200, 30, Precision::Int8), p),
+    ];
+    for precision in PRECISIONS {
+        shapes.push((circulant(3_000, 4, precision), params(64, 16, 4, 7)));
+    }
+    // Fields that round differently in another order of addition.
+    shapes.push((cancelling_float_model(10), cold(params(64, 64, 4, 7))));
+    for (graph, p) in shapes {
+        let label = format!("{} nodes, {} edges", graph.num_nodes(), graph.edges.len());
+        let sparse = run(&dev, &graph, &p, Tuning::default());
+        assert_ne!(sparse.storage, Storage::Dense, "{label}");
+        let dense_run = run(&dev, &graph, &p, dense(Tuning::default()));
+        assert_eq!(dense_run.storage, Storage::Dense, "{label}");
+        assert_eq!(dense_run.reads, sparse.reads, "{label}");
+        assert!(
+            sparse
+                .reads
+                .iter()
+                .any(|r| r.spins != sparse.reads[0].spins),
+            "{label}"
+        );
+    }
+}
+
+/// `params` on a cold fixed schedule, so a field of 0 and a field of 1 flip
+/// with clearly different odds.
+fn cold(p: SampleParams) -> SampleParams {
+    SampleParams {
+        beta_range: Some((1.0, 8.0)),
+        ..p
+    }
+}
+
+/// `gadgets` copies of a node `x` with three neighbours, in ascending
+/// columns: couplings `2^24`, `1`, and `-2^24`. In `f32`, `2^24 + 1` rounds
+/// to `2^24` but `-2^24 + 1` is exact, so the field of `x` is 0 in one order
+/// of addition and 1 in another whenever the two large terms cancel. One
+/// extra node with a field off the milli grid makes the model Float32.
+fn cancelling_float_model(gadgets: usize) -> IsingGraph {
+    let big = f64::from(1_u32 << 24);
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for g in 0..gadgets {
+        let x = 4 * g;
+        for (offset, value) in [(1, big), (2, 1.0), (3, -big)] {
+            edges.push((x, x + offset));
+            j.push(value);
+        }
+    }
+    let n = 4 * gadgets + 1;
+    let mut h = vec![0.0; n];
+    h[n - 1] = 0.0005;
+    IsingGraph::new(h, j, edges)
 }
 
 /// A repeated coupler or a self-loop has no single matrix cell, so such a
@@ -252,6 +312,36 @@ fn a_repeated_coupler_or_a_self_loop_stays_sparse() {
     let err =
         sample_ising_tuned(&dev, &small, &p, Kernel::Msa, dense(Tuning::default())).unwrap_err();
     assert!(matches!(err, SampleError::TooLarge(_)), "{err:?}");
+}
+
+/// The largest complete Int32 model whose one sweep the planner estimates
+/// at 400 ms or less runs dense at 256 reads, with every chunk below the
+/// 500 ms ceiling. One more node is refused before any buffer: see
+/// `a_dense_sweep_past_one_chunk_is_refused_before_allocation` in
+/// `src/sampler.rs`.
+#[test]
+#[ignore = "host scoring of 256 reads over 13 million couplers: run with --release --ignored"]
+fn the_largest_admitted_dense_sweep_runs() {
+    let dev = MetalDevice::open(0).unwrap();
+    let (graph, _) = planted_complete(5_099, Precision::Int32);
+    let p = params(MAX_READS, 2, 1, 5);
+    let out = run(&dev, &graph, &p, Tuning::default());
+    assert_eq!(out.storage, Storage::Dense);
+    assert_eq!(out.reads.len(), MAX_READS);
+    writeln!(
+        io::stdout().lock(),
+        "5,099 nodes: {} chunks, longest {:.1} ms",
+        out.plan.len(),
+        out.max_chunk_us as f64 / 1e3
+    )
+    .unwrap();
+    assert!(out.max_chunk_us < 500_000, "{} us", out.max_chunk_us);
+    let (over, _) = planted_complete(5_100, Precision::Int32);
+    let err = sample_ising_tuned(&dev, &over, &p, Kernel::Msa, Tuning::default()).unwrap_err();
+    assert!(
+        matches!(&err, SampleError::TooLarge(m) if m.contains("one dense-matrix sweep")),
+        "{err:?}"
+    );
 }
 
 fn portfolio_dir() -> PathBuf {
@@ -339,7 +429,7 @@ const MAX_READS: usize = 256;
 /// `docs/perf/2026-11-12-msa-dense.md`. Each shape runs 256 reads with the
 /// production chunk plan and reports the measured column rate of one
 /// threadgroup and the longest chunk. The large shapes run a few sweeps,
-/// one sweep per chunk, to find where one sweep passes 400 ms.
+/// one sweep per chunk, up to the largest model the admission accepts.
 #[test]
 #[ignore = "minutes of device time: run with --release --ignored --nocapture"]
 fn dense_rates() {
@@ -351,8 +441,8 @@ fn dense_rates() {
         (1_024, 1 << 20),
         (4_096, 1 << 20),
         (4_800, 1 << 17),
-        (5_600, 1 << 17),
-        (6_016, 1 << 17),
+        // The largest model whose one sweep the admission accepts.
+        (5_099, 1 << 17),
     ];
     for precision in PRECISIONS {
         for (nodes, budget) in shapes {
