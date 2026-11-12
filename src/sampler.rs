@@ -5478,6 +5478,13 @@ mod tests {
             seed: 7,
             ..Default::default()
         };
+        // The CSR rows past one chunk are the subject, so the batch stays
+        // off the dense-matrix tier, which holds this complete model in less
+        // memory.
+        let sparse = Tuning {
+            force_sparse: true,
+            ..Tuning::default()
+        };
         let whole = [(0, 256)];
         let split = [(0, 100), (100, 156)];
         for graph in [&weighted, &unit] {
@@ -5493,20 +5500,22 @@ mod tests {
                 None,
                 None,
                 true,
-                Tuning::default(),
+                sparse,
                 DenseMode::Auto,
             )
             .unwrap();
             assert!(
                 batch.coef_scale.is_none(),
-                "a dense batch takes int storage"
+                "a batch of CSR rows past one chunk takes int storage"
             );
             let mut storages = Vec::new();
             for wide_i8 in [true, false] {
-                let a =
-                    sample_planned(&dev, graph, &p, Kernel::Msa, Some(&whole), wide_i8).unwrap();
-                let b =
-                    sample_planned(&dev, graph, &p, Kernel::Msa, Some(&split), wide_i8).unwrap();
+                let run = |plan: &[(i32, i32)]| {
+                    run_planned(&dev, graph, &p, Kernel::Msa, Some(plan), wide_i8, sparse)
+                        .unwrap()
+                        .reads
+                };
+                let (a, b) = (run(&whole), run(&split));
                 assert_eq!(a, b, "wide_i8 {wide_i8}");
                 for r in &a {
                     assert_eq!(
