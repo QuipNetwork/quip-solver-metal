@@ -124,9 +124,9 @@ one refund.
 The complete models that set `maxEdges` pass degree 62. They run only
 through the library API (`sample_ising`), not through a session.
 
-The largest admitted node count at a fixed regular degree, computed from the
-capacity model for an Apple M4 Max with a 40-core GPU and 128 GB, in 1 percent
-steps, is:
+This table gives the largest admitted node count at a fixed regular degree.
+The capacity model computed it in 1 percent steps for an Apple M4 Max with a
+40-core GPU and 128 GB:
 
 | Binary | Degree 4 | Degree 20 | Degree 62 | Degree 200 |
 |---|---:|---:|---:|---:|
