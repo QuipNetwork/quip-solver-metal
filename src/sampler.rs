@@ -5147,6 +5147,24 @@ mod tests {
         IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges)
     }
 
+    /// The model of the lease test
+    /// `a_lease_past_the_one_sweep_limit_returns_capacity_without_faulting`:
+    /// 5,000 nodes and a hub of degree 63. Only dense-matrix storage admits
+    /// it, and the session admission refuses its one sweep of 5,000 * 5,000
+    /// columns.
+    #[test]
+    fn admit_one_refuses_the_one_sweep_lease_model_for_its_sweep() {
+        let n = 5_000;
+        let edges: Vec<(usize, usize)> = (1..64).map(|v| (0, v)).collect();
+        let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+        let msg = too_large_msg(admit_one(&graph, &params(32), Kernel::Msa).unwrap_err());
+        assert!(
+            msg.contains("one dense-matrix sweep is estimated at 416.667 ms")
+                && msg.contains("past the 400 ms limit"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn validate_batch_rejects_msa_degree_over_the_sparse_budget() {
         // The weighted lanes walk at most 62 neighbours; a denser node is

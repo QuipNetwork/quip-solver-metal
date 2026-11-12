@@ -18,7 +18,7 @@
 //! `Sampler::sample_stream`; every Metal object stays on that thread.
 
 use crate::metal_device::MetalDevice;
-use crate::sampler::{self, kernel_max_nodes, Kernel};
+use crate::sampler::{self, Kernel};
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleError, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
@@ -460,10 +460,6 @@ fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
             answer_empty(ctx.out, job);
             continue;
         }
-        if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) {
-            send_reject(ctx.out, job, SampleError::Capacity);
-            continue;
-        }
         return Some(job);
     }
 }
@@ -493,9 +489,6 @@ fn fill_batch(
         match ctx.jobs.try_recv() {
             Ok(job) if ctx.cancel.is_cancelled(job.watermark) => send_cancelled(ctx.out, job),
             Ok(job) if job.graph.num_nodes() == 0 => answer_empty(ctx.out, job),
-            Ok(job) if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) => {
-                send_reject(ctx.out, job, SampleError::Capacity)
-            }
             Ok(job) if key.matches(&job, ctx.kernel) => {
                 matches.push(job);
                 last_arrival = Instant::now();
@@ -705,9 +698,9 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
             }
             Err(e) => {
                 // Every job in a batch shares the encode inputs that can be
-                // refused for size (`num_sweeps` is part of the batch key, and `N`
-                // is pre-filtered by `next_seed`), so a capacity refusal applies to
-                // all of them alike — reject the batch with the condition the
+                // refused for size (the batch key holds the topology and
+                // `num_sweeps`), so a capacity refusal applies to all of them
+                // alike — reject the batch with the condition the
                 // failure actually carries rather than a blanket `DeviceFault`.
                 let err = e.to_sample_error();
                 tracing::error!(error = %e, ?err, "metal batch encode failed");
@@ -1434,43 +1427,49 @@ mod tests {
         assert_eq!(r.device_access_time_us, 0);
     }
 
+    /// The stream refuses a model only when the capacity model or the
+    /// one-sweep limit refuses it: a complete Int32 SA model of 1,415 nodes
+    /// runs only on dense-matrix storage, where one sweep is estimated past
+    /// 400 ms. The ring after it still completes.
     #[test]
-    fn next_seed_rejects_too_large() {
-        let n = kernel_max_nodes(Kernel::Sa) + 1;
-        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
-        let huge = job(
-            b"huge",
-            IsingGraph::new(vec![0.0; n], vec![], vec![]),
-            1,
-            64,
-            1,
-        );
-        job_tx.blocking_send(huge).unwrap();
+    fn run_stream_rejects_a_model_the_capacity_model_refuses() {
+        let device = MetalDevice::open(0).unwrap();
+        let n = 1_415;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let j = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let complete = IsingGraph::new(vec![0.0; n], j, edges);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        job_tx
+            .blocking_send(job(b"huge", complete, 64, 32, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"ring", ring4(), 64, 32, 1))
+            .unwrap();
         drop(job_tx);
-
-        let mut pending = None;
-        let mut ctx = StreamCtx {
-            jobs: &mut job_rx,
-            out: &out_tx,
-            pending: &mut pending,
-            kernel: Kernel::Sa,
-            gov: &NoGovernor,
-            cancel: &CancelToken::default(),
-            solo_next: false,
-        };
-        assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
-
-        let Some(r) = out_rx.blocking_recv() else {
-            assert_eq!("got", "TooLarge reject on out channel");
-            return;
-        };
-        assert_eq!(r.job_id, b"huge");
-        let is_too_large = matches!(
-            r.outcome,
-            StreamOutcome::Completed(Err(SampleError::Capacity))
+        run_stream(
+            &device,
+            Kernel::Sa,
+            job_rx,
+            &out_tx,
+            &NoGovernor,
+            &CancelToken::default(),
         );
-        assert!(is_too_large, "expected Capacity, got unexpected reject/ok");
+        drop(out_tx);
+        let rejected = out_rx.blocking_recv().expect("huge rejection");
+        assert_eq!(rejected.job_id, b"huge");
+        assert!(matches!(
+            rejected.outcome,
+            StreamOutcome::Completed(Err(SampleError::Capacity))
+        ));
+        let completed = out_rx.blocking_recv().expect("ring result after rejection");
+        assert_eq!(completed.job_id, b"ring");
+        assert!(matches!(completed.outcome, StreamOutcome::Completed(Ok(_))));
+        assert!(out_rx.blocking_recv().is_none());
     }
 
     #[test]

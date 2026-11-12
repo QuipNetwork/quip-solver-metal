@@ -385,6 +385,7 @@ async fn refused_lease_then_ring_lease(s: &mut Session, refused: &[u8]) {
     assert!(s.log.results_for(refused).is_empty());
     assert_eq!(s.log.refunds(), 1, "one refund for the refused lease");
     assert!(s.log.fatal.is_none(), "{:?}", s.log.fatal);
+    assert_eq!(s.jobs_done().await, 0);
 
     let (topology, _) = ring(64, RING_B);
     s.send(coord_msg::Msg::Topology(topology)).await;
@@ -397,6 +398,7 @@ async fn refused_lease_then_ring_lease(s: &mut Session, refused: &[u8]) {
     assert_eq!(s.log.done(b"next").expect("LeaseDone").salts_done, 8);
     assert_eq!(s.log.results_for(b"next").len(), 8);
     assert_eq!(s.log.refunds(), 2, "the refused lease and the next lease");
+    assert_eq!(s.jobs_done().await, 8);
     assert_eq!(s.shutdown(2_000).await, 0);
     assert_eq!(s.log.done_count(refused), 1);
     assert!(s.log.rejects.is_empty(), "{:?}", s.log.rejects);

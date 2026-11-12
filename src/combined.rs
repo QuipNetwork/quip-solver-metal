@@ -356,12 +356,10 @@ fn eligibility(
     // spill build, which the resident runner bounds by its capacity
     // footprint. Metal takes such a model only when the ANE cannot.
     let spill = kernel == Kernel::Msa && n > crate::sampler::kernel_max_nodes(kernel);
-    let metal_nodes = match kernel {
-        Kernel::Msa => crate::capacity::MAX_NODES,
-        Kernel::Sa | Kernel::Gibbs => crate::sampler::kernel_max_nodes(kernel),
-    };
+    // Every kernel runs a model past its frame on a spill build that the
+    // capacity footprint bounds.
     let mut metal = cfg.enable_metal
-        && n <= metal_nodes
+        && n <= crate::capacity::MAX_NODES
         && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
     metal &= crate::sampler::kernel_representation(graph, kernel).is_ok();
@@ -386,11 +384,16 @@ fn eligibility(
     if kernel != Kernel::Msa {
         return [metal, false];
     }
-    // The tier the capacity model routes the model to, dense-matrix storage
-    // included, and the one-sweep limit: the admission of the batch path
-    // that runs a model past the unit lane.
-    metal = metal && (n == 0 || crate::sampler::admit_one(graph, params, kernel).is_ok());
     let facts = edge_facts.get(n, &graph.edges);
+    // A model past the unit lane's degree or nodes runs on the batch path:
+    // Metal takes it when the capacity model admits it, on the tier it
+    // routes to (dense-matrix storage included), within the one-sweep limit.
+    // A unit-lane model skips the check, which costs about 350 µs on
+    // Advantage2; the resident runner still refuses it as `Capacity` if it
+    // does not fit.
+    if metal && (!facts.degree_ok || spill) {
+        metal = crate::sampler::admit_one(graph, params, kernel).is_ok();
+    }
     ane &= facts.in_bounds && facts.simple;
     if ane && facts.degree_ok {
         // Nonzero couplings are a subset of the edges, so a topology within
@@ -1340,12 +1343,14 @@ mod tests {
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
+        // Past the kernel's frame, SA and Gibbs run the batch path's spill
+        // build, which the capacity footprint bounds.
         for kernel in [Kernel::Sa, Kernel::Gibbs] {
             let n = crate::sampler::kernel_max_nodes(kernel) + 1;
             j.graph = IsingGraph::new(vec![0.0; n], vec![], vec![]);
             assert_eq!(
                 eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
-                [false, false],
+                [true, false],
                 "{kernel:?}"
             );
         }

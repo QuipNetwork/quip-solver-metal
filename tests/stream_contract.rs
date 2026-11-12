@@ -337,6 +337,37 @@ fn a_complete_model_runs_dense_in_the_stream() {
     });
 }
 
+/// A ring one node past the SA thread-private frame (4,593) and one past
+/// the Gibbs threadgroup array (4,800) runs on the spill build, which the
+/// capacity footprint bounds. The stream returns the reads of `sample_ising`
+/// with the same seed, every one scored exactly.
+#[test]
+fn a_model_past_the_kernel_frame_runs_in_the_stream() {
+    for (kernel, n) in [(Kernel::Sa, 4_594), (Kernel::Gibbs, 4_801)] {
+        let Some(sampler) = open(kernel) else { return };
+        let graph = ring(n);
+        let jobs = vec![job("past-frame", graph.clone(), params(64, 64, 7), None)];
+        let results = stream(&sampler, jobs, &CancelToken::default(), || {});
+        assert_eq!(results.len(), 1, "{kernel:?}");
+        let reads = match &results[0].outcome {
+            StreamOutcome::Completed(Ok(reads)) => reads,
+            StreamOutcome::Completed(Err(error)) => panic!("{kernel:?}: failed: {error:?}"),
+            StreamOutcome::Cancelled => panic!("{kernel:?}: cancelled"),
+        };
+        assert_eq!(reads.len(), 64, "{kernel:?}");
+        for read in reads {
+            assert_eq!(
+                read.energy_milli,
+                energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges),
+                "{kernel:?}"
+            );
+        }
+        let dev = MetalDevice::open(0).unwrap();
+        let direct = sample_ising(&dev, &graph, &params(64, 64, 7), kernel).unwrap();
+        assert_eq!(reads, &direct, "{kernel:?}");
+    }
+}
+
 #[test]
 fn a_cancelled_watermark_returns_cancelled() {
     each_kernel(|kernel| {
@@ -364,12 +395,16 @@ fn a_cancelled_watermark_returns_cancelled() {
     });
 }
 
+/// A complete model of 1,700 nodes is refused for every kernel: SA and
+/// Gibbs by the one-sweep limit on dense-matrix storage, and MSA by the
+/// 1,000,000-edge limit of the resident runner (1,444,150 edges).
 #[test]
 fn an_oversized_job_fails_without_a_panic() {
+    let oversized = complete_int32(1_700);
     each_kernel(|kernel| {
         let Some(sampler) = open(kernel) else { return };
         let jobs = vec![
-            job("oversized", ring(1 << 20), params(8, 64, 1), None),
+            job("oversized", oversized.clone(), params(8, 64, 1), None),
             job("valid", ring(16), params(8, 64, 2), None),
         ];
         let results = stream(&sampler, jobs, &CancelToken::default(), || {});
