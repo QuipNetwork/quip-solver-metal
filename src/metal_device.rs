@@ -329,12 +329,21 @@ mod tests {
             ("gibbs_parallel_float", &dev.gibbs_parallel_float),
             ("msa_weighted", &dev.msa_weighted),
             ("msa_float", &dev.msa_float),
+            ("sa_wide_i8", &dev.sa_wide_i8),
+            ("gibbs_wide_i8", &dev.gibbs_wide_i8),
+            ("gibbs_parallel_wide_i8", &dev.gibbs_parallel_wide_i8),
+            ("msa_weighted_i8", &dev.msa_weighted_i8),
         ] {
             let max = pipeline.max_total_threads_per_threadgroup();
             eprintln!("{name}: max threads per threadgroup {max}");
             assert!(max >= 32, "{name} admits only {max} threads");
         }
         assert!(dev.gibbs_parallel_wide.max_total_threads_per_threadgroup() >= 128);
+        assert!(
+            dev.gibbs_parallel_wide_i8
+                .max_total_threads_per_threadgroup()
+                >= 128
+        );
     }
 
     #[test]
@@ -380,6 +389,7 @@ mod tests {
         for pipeline in [
             &dev.msa,
             &dev.msa_weighted,
+            &dev.msa_weighted_i8,
             &dev.msa_float,
             &dev.msa_slots,
             &dev.msa_screen,
@@ -400,6 +410,7 @@ mod tests {
         for pipeline in [
             &dev.msa,
             &dev.msa_weighted,
+            &dev.msa_weighted_i8,
             &dev.msa_float,
             &dev.msa_slots,
             &dev.msa_screen,

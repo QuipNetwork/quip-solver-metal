@@ -31,7 +31,8 @@ pub struct ProbeCell {
     pub slowdown: Option<f64>,
 }
 
-/// Every precision, in declaration order.
+/// The four precisions the probe grid reports, in declaration order.
+/// `Precision::Int8Scaled` is a storage variant of the wide tier, not a column.
 const PRECISIONS: [Precision; 4] = [
     Precision::Binary,
     Precision::Int8,

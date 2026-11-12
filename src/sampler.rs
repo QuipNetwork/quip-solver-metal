@@ -3040,6 +3040,18 @@ mod tests {
             ..Default::default()
         };
         for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            // The i8 side binds the scale and the i8 pipeline; the forced
+            // side binds neither.
+            let narrow =
+                encode_batch_storage(&dev, &[&graph], &p, kernel, 1, None, None, true).unwrap();
+            let plain =
+                encode_batch_storage(&dev, &[&graph], &p, kernel, 1, None, None, false).unwrap();
+            assert_eq!(
+                narrow.coef_scale.map(|(_, scale)| scale),
+                Some(250),
+                "{kernel:?}"
+            );
+            assert!(plain.coef_scale.is_none(), "{kernel:?}");
             let plan = [(0, 100), (100, 156)];
             for plan in [None, Some(&plan[..])] {
                 let i8_reads = sample_planned(&dev, &graph, &p, kernel, plan, true).unwrap();
