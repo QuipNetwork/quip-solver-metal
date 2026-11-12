@@ -199,6 +199,16 @@ impl ScreenBank {
         Ok(bank)
     }
 
+    /// Bytes owned by this bank, excluding its shared topology.
+    fn allocated_bytes(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|(_, buffer)| buffer)
+            .chain(std::iter::once(&self.edge_pos))
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -435,6 +445,21 @@ impl<T> Screener<T> {
             gates: gates.to_vec(),
             seed: 1,
         })
+    }
+
+    /// Device bytes retained by both banks, counting their shared topology once.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let cached = &self.banks[0].cached;
+        let topology = cached
+            .colors
+            .iter()
+            .chain([&cached.row, &cached.col])
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add);
+        self.banks
+            .iter()
+            .map(ScreenBank::allocated_bytes)
+            .fold(topology, usize::saturating_add)
     }
 
     /// Whether a model row fits this screener.

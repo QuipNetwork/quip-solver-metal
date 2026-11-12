@@ -1395,8 +1395,8 @@ fn reject_preparation(
 }
 
 /// Refuse a batch job whose buffers, together with the `reserved_bytes` the
-/// slot pools hold, exceed `usable_bytes`. The job's own bytes are its
-/// capacity footprint for the jobs the runner holds at once, as
+/// slot pools, screen banks, and free buffers hold, exceed `usable_bytes`.
+/// The job's bytes come from the capacity footprint for all concurrent jobs, as
 /// `capacity::footprint` counts them.
 fn admit_batch(
     job: &StreamJob,
@@ -1423,8 +1423,8 @@ fn admit_batch(
     Ok(())
 }
 
-/// Run one job on the batch path. `reserved_bytes` is the memory the slot
-/// pools hold; see [`admit_batch`].
+/// Run one job on the batch path. `reserved_bytes` covers the slot pools and
+/// screen banks. Add the free-list bytes before admission.
 fn run_fallback(
     device: &MetalDevice,
     job: StreamJob,
@@ -1438,7 +1438,7 @@ fn run_fallback(
     let result = (|| {
         admit_batch(
             &job,
-            reserved_bytes,
+            reserved_bytes.saturating_add(device.buffer_pool.allocated_bytes()),
             sampler::host_device_limits().usable_bytes(),
         )?;
         let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
@@ -1584,6 +1584,7 @@ enum UnitAdmission {
 fn admit_unit(
     prepared: Prepared,
     pools: &mut Option<[Pool; 2]>,
+    screener: Option<&Screener<Salt>>,
     turn: usize,
     controller: &mut Controller,
     device: &MetalDevice,
@@ -1626,10 +1627,11 @@ fn admit_unit(
                     data: Ok(None),
                 });
             }
-            let reserved = pools.as_ref().map_or(0, |ps| {
+            let screen_bytes = screener.map_or(0, Screener::allocated_bytes);
+            let reserved = pools.as_ref().map_or(screen_bytes, |ps| {
                 ps.iter()
                     .map(|p| p.slots.allocated_bytes())
-                    .fold(0, usize::saturating_add)
+                    .fold(screen_bytes, usize::saturating_add)
             });
             let started = Instant::now();
             let result = run_fallback(device, job, origin, reserved, out, gov, cancel);
@@ -1917,6 +1919,7 @@ pub(crate) fn run(
                 match admit_unit(
                     prepared,
                     &mut pools,
+                    screener.as_ref().map(|(_, screen)| screen),
                     0,
                     &mut controller,
                     device,
@@ -2117,6 +2120,7 @@ pub(crate) fn run(
             match admit_unit(
                 prepared,
                 &mut pools,
+                screener.as_ref().map(|(_, screen)| screen),
                 turn,
                 &mut controller,
                 device,

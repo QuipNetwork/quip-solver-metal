@@ -1380,6 +1380,16 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
+    /// Bytes still allocated in the free list, unavailable to other device users.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
+    }
+
     /// Smallest free buffer with `len <= length <= 2 * len`, else a new
     /// shared buffer, refusing as a capacity error when the device cannot
     /// allocate one.
