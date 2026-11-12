@@ -153,6 +153,29 @@ fn a_model_whose_schedule_overflows_f32_is_refused(kernel: Kernel) {
     );
 }
 
+/// Zero fields with a beta past half of `f32::MAX`: fast math can double beta
+/// first, and `inf * 0` would turn every heat-bath probability into NaN.
+fn a_schedule_past_half_f32_max_is_refused(kernel: Kernel) {
+    let Some(dev) = device() else {
+        return;
+    };
+    // One off-grid field makes the model Float32; the other spins have none.
+    let mut h = vec![0.0; 32];
+    h[0] = 0.0005;
+    let graph = IsingGraph::new(h, vec![], vec![]);
+    let params = SampleParams {
+        num_reads: 32,
+        num_sweeps: 64,
+        beta_range: Some((2e38, 3e38)),
+        ..Default::default()
+    };
+    let err = sample_ising(&dev, &graph, &params, kernel).unwrap_err();
+    assert!(
+        matches!(&err, SampleError::TooLarge(m) if m.contains("half of f32::MAX")),
+        "{err:?}"
+    );
+}
+
 fn chunked_and_unchunked_real_anneals_match(kernel: Kernel) {
     let Some(dev) = device() else {
         return;
@@ -192,6 +215,11 @@ mod sa {
     }
 
     #[test]
+    fn a_schedule_past_half_f32_max_is_refused() {
+        super::a_schedule_past_half_f32_max_is_refused(Kernel::Sa);
+    }
+
+    #[test]
     fn chunked_and_unchunked_real_anneals_match() {
         super::chunked_and_unchunked_real_anneals_match(Kernel::Sa);
     }
@@ -213,6 +241,11 @@ mod gibbs {
     #[test]
     fn a_model_whose_schedule_overflows_f32_is_refused() {
         super::a_model_whose_schedule_overflows_f32_is_refused(Kernel::Gibbs);
+    }
+
+    #[test]
+    fn a_schedule_past_half_f32_max_is_refused() {
+        super::a_schedule_past_half_f32_max_is_refused(Kernel::Gibbs);
     }
 
     #[test]

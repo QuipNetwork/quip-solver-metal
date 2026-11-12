@@ -1084,6 +1084,14 @@ fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleEr
             "beta schedule value at index {index} is outside the finite f32 range"
         )));
     }
+    // Metal's fast math may compute `2 * beta` before it multiplies the field,
+    // and a zero field then gives `inf * 0`. Bounding beta by half of
+    // `f32::MAX` keeps every order of the product free of NaN.
+    if let Some(index) = beta.iter().position(|b| b.abs() > f32::MAX / 2.0) {
+        return Err(SampleError::TooLarge(format!(
+            "beta schedule value at index {index} exceeds half of f32::MAX, so its double overflows f32"
+        )));
+    }
     let n = graph.num_nodes();
     let mut field: Vec<f64> = graph
         .h
@@ -2530,6 +2538,19 @@ mod tests {
         let message = too_large(check_float_schedule(&graph, &beta));
         assert!(message.contains("finite f32"), "{message}");
         too_large(check_float_schedule(&graph, &[1.0, f32::NAN]));
+    }
+
+    #[test]
+    fn a_beta_past_half_f32_max_is_refused() {
+        let graph = IsingGraph::new(vec![1.0; 2], vec![], vec![]);
+        let half = f32::MAX / 2.0;
+        check_float_schedule(&graph, &[half]).unwrap();
+        check_float_schedule(&graph, &[-half]).unwrap();
+        let above = f32::from_bits(half.to_bits() + 1);
+        for beta in [above, -above] {
+            let message = too_large(check_float_schedule(&graph, &[1.0, beta]));
+            assert!(message.contains("half of f32::MAX"), "{message}");
+        }
     }
 
     #[test]

@@ -189,7 +189,8 @@ inline int8_t gibbs_sample(float h_eff, float beta, thread RngState &rng_state) 
     // Compute probability of spin = +1
     // P(+1) = 1 / (1 + exp(2 * beta * h_eff))
 #ifdef QUIP_FLOAT
-    // The admitted field keeps 2 * h_eff finite; 2 * beta need not fit.
+    // The host admits only |beta| <= f32::MAX / 2 and fields whose double is
+    // finite, so no order of 2 * h_eff * beta meets inf * 0 under fast math.
     float prob_plus = 1.0f / (1.0f + exp((2.0f * h_eff) * beta));
 #else
     float prob_plus = 1.0f / (1.0f + exp(2.0f * beta * h_eff));
