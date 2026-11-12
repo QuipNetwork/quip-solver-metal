@@ -66,4 +66,10 @@ cargo test --test real_models --test sa_dense --test gibbs_dense --test msa_dens
 cargo test --features long-tests --test real_models --test sa_dense --test gibbs_dense --test msa_dense -- --test-threads=1
 ```
 
-The second command adds the later fixtures, which take minutes.
+The second command adds the later SA and Gibbs fixtures, which take minutes.
+The later MSA fixtures carry a plain `#[ignore]`, and `long-tests` does not run them.
+Run them with this command:
+
+```sh
+cargo test --release --test msa_dense every_later_portfolio_fixture_runs_dense -- --ignored --test-threads=1
+```
