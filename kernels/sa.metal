@@ -56,6 +56,24 @@ inline void set_spin_packed(int var, int8_t spin, thread int8_t* packed_state) {
     }
 }
 
+// "No node": the value that makes a sweep leave no node out.
+#define SA_NO_SIT_OUT 0xFFFFFFFFu
+
+// The node in [0, n) that one sweep leaves out, from one uniform draw.
+//
+// Flat moves are always accepted and a sweep visits the nodes in index order.
+// If every sweep visited every node, each sweep would shift every domain wall
+// of a zero-field chain one site the same way and no two walls would ever
+// meet. A wall that reaches the node left out stays where it is for that
+// sweep, and the wall behind it catches up. Same rule as quip-solver-cpu's
+// sampler_core.rs (QUI-1980). A model of fewer than two nodes leaves none out.
+inline uint sit_out_node(uint draw, int n) {
+    if (n < 2) {
+        return SA_NO_SIT_OUT;
+    }
+    return mulhi(draw, uint(n));
+}
+
 inline void flip_spin_packed(int var, thread int8_t* packed_state) {
     int byte_idx = var >> 3;  // var / 8
     int bit_idx = var & 7;    // var % 8
@@ -258,8 +276,18 @@ kernel void pure_simulated_annealing(
 #endif
 
         for (int sweep = 0; sweep < sweeps_per_beta_val; sweep++) {
+            // One draw per sweep picks the node that sits it out. The last
+            // sweep of the anneal leaves none out, so every node is settled
+            // at the coldest rung; the draw is made either way.
+            uint sit_out_draw = xorshift32(rng_state);
+            bool last_sweep = beta_idx == num_betas - 1 && sweep == sweeps_per_beta_val - 1;
+            uint skip = last_sweep ? SA_NO_SIT_OUT : sit_out_node(sit_out_draw, n);
+
             // Sequential variable ordering (matching D-Wave default)
             for (int var = 0; var < n; var++) {
+                if (uint(var) == skip) {
+                    continue;
+                }
                 delta_t de = delta_energy[var];
 
 #ifdef QUIP_WIDE
