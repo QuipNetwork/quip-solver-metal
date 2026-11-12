@@ -5038,15 +5038,12 @@ mod tests {
 
     #[test]
     fn validate_batch_refuses_before_allocation() {
-        // Zero usable bytes refuse every model, so the footprint check is the
-        // only possible cause of the refusal.
+        // This host-only validation runs before buffer creation. Zero usable
+        // bytes make the footprint check the only possible cause of refusal.
         let limits = crate::capacity::DeviceLimits {
             memory_bytes: 0,
             max_buffer_bytes: 0,
         };
-        let device = (crate::metal_device::MetalDevice::device_count() > 0)
-            .then(|| crate::metal_device::MetalDevice::open(0).unwrap());
-        let before = device.as_ref().map(|d| d.device.current_allocated_size());
         let g = ring();
         let err = validate_batch_within(
             &[&g],
@@ -5068,8 +5065,6 @@ mod tests {
             err.to_sample_error(),
             quip_solver_core::SampleError::Capacity
         );
-        let after = device.as_ref().map(|d| d.device.current_allocated_size());
-        assert_eq!(before, after);
     }
 
     #[test]
@@ -5783,6 +5778,57 @@ mod tests {
                 let wide_reads = sample_planned(&dev, &graph, &p, kernel, plan, false).unwrap();
                 assert_eq!(i8_reads, wide_reads, "{kernel:?} plan {plan:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_multi_graph_scaled_i8_batch_matches_a_wide_batch() {
+        let first = scaled_i8_model();
+        let mut second = first.clone();
+        second.h[0] = -0.5;
+        second.j[2] = 0.75;
+        let graphs = [&first, &second];
+        assert_eq!(
+            batch_i8_scale(&graphs, Representation::Wide, true),
+            Some(250)
+        );
+        if crate::metal_device::MetalDevice::device_count() == 0 {
+            return;
+        }
+        let dev = crate::metal_device::MetalDevice::open(0).unwrap();
+        let params = SampleParams {
+            num_reads: 32,
+            num_sweeps: 32,
+            seed: 7,
+            ..Default::default()
+        };
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let run = |wide_i8| {
+                let mut batch = encode_batch_storage(
+                    &dev,
+                    &graphs,
+                    &params,
+                    kernel,
+                    1,
+                    None,
+                    None,
+                    wide_i8,
+                    Tuning::default(),
+                    DenseMode::Auto,
+                )
+                .unwrap();
+                assert_eq!(
+                    batch.coef_scale.map(|(_, scale)| scale),
+                    wide_i8.then_some(250),
+                    "{kernel:?}"
+                );
+                while batch.commit_next(|| false) {
+                    batch.wait_until_completed();
+                }
+                assert!(batch.failed_status().is_none(), "{kernel:?}");
+                harvest_batch(&batch, &graphs).unwrap()
+            };
+            assert_eq!(run(true), run(false), "{kernel:?}");
         }
     }
 

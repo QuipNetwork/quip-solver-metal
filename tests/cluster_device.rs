@@ -11,6 +11,8 @@ use quip_solver_metal::capacity::DeviceLimits;
 use quip_solver_metal::cluster::device::{ClusterDevice, ClusterDeviceError, ClusterParams};
 use quip_solver_metal::cluster::{Model, Motifs, PreparedGraph, Weights};
 
+#[path = "support/cluster_fixture.rs"]
+mod cluster_fixture;
 #[path = "support/cluster_reference.rs"]
 mod reference;
 
@@ -37,36 +39,10 @@ fn device() -> ClusterDevice {
     ClusterDevice::open(0).unwrap()
 }
 
-// The corner-sharing fixture, with nontrivial gauges and residual edges.
 fn corner_sharing(weights: Weights) -> PreparedGraph {
-    let tiles = [[0, 1, 2, 3], [3, 4, 5, 6]];
-    let gauges = [[1, -1, 1, 1], [-1, 1, 1, -1]];
-    let mut edges = vec![(0, 4), (5, 7), (1, 5), (2, 6), (1, 4), (6, 7)];
-    let mut j = vec![-1000, -1000, 300, -200, 700, 500];
-    for (tile, gauge) in tiles.iter().zip(gauges) {
-        for a in 0..4 {
-            for b in a + 1..4 {
-                edges.push((tile[a], tile[b]));
-                j.push(1000 * i32::from(gauge[a] * gauge[b]));
-            }
-        }
-    }
-    PreparedGraph::new(
-        &Model {
-            h_milli: &[0; 8],
-            edges: &edges,
-            j_milli: &j,
-        },
-        &Motifs {
-            tiles: &tiles,
-            gauges: &gauges,
-            pairs: &[(0, 4), (5, 7)],
-        },
-        weights,
-        &limits(),
-        32,
-    )
-    .unwrap()
+    cluster_fixture::corner_sharing()
+        .prepare_with_anneals(weights, &limits(), 32)
+        .unwrap()
 }
 
 /// A canonical twisted-ice-dimer instance on the 4,577-node Advantage2 working
