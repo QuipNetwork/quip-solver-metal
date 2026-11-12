@@ -11,7 +11,7 @@
 //!
 //! - [`Storage::Threadgroup`]: spin state lives in threadgroup memory. Only
 //!   models up to the kernel node cap fit, and multi-spin also needs degree
-//!   at most [`MSA_UNIT_MAX_DEG`] on the unit lane, or [`MSA_SPARSE_MAX_DEG`]
+//!   at most `MSA_UNIT_MAX_DEG` on the unit lane, or [`MSA_SPARSE_MAX_DEG`]
 //!   on the weighted lanes. The sizes come from the buffers that
 //!   `sampler::encode_batch` allocates.
 //! - [`Storage::Spill`]: spin state past the threadgroup cap lives in device
@@ -372,9 +372,9 @@ pub enum CapacityError {
 
 /// Models whose buffers exist at once.
 ///
-/// SA and Gibbs return [`STREAM_IN_FLIGHT`] times [`batch_size_for_reads`]:
+/// SA and Gibbs return `STREAM_IN_FLIGHT` times `batch_size_for_reads`:
 /// the stream keeps that many batches in flight, and its cap on the problems
-/// of one batch never passes [`batch_size_for_reads`]
+/// of one batch never passes `batch_size_for_reads`
 /// (`streaming::form_and_commit` and `sampler::one_sweep_problem_cap`). The
 /// footprint of one model times this count therefore bounds the stream's
 /// batches in flight. MSA returns the resident runner's bound on
@@ -388,7 +388,7 @@ pub fn instances(kernel: Kernel, reads: usize) -> usize {
     }
 }
 
-/// Batches whose shared buffers exist at once: [`STREAM_IN_FLIGHT`] for the
+/// Batches whose shared buffers exist at once: `STREAM_IN_FLIGHT` for the
 /// SA and Gibbs streams, each with its own beta schedule and colour list,
 /// and 1 for the multi-spin batch path, which runs one batch at a time
 /// beside the resident slot pools (`resident::run_fallback`).
@@ -692,14 +692,14 @@ fn models_per_buffer(kernel: Kernel, reads: usize) -> usize {
 ///   `col_ind` bytes needed and the bytes `u32::MAX` entries occupy.
 /// - [`CapacityError::Degree`] when no tier admits the degree.
 /// - [`CapacityError::Index`] when one model passes a 32-bit index of the
-///   tier ([`check_indices`]). Of the per-tier checks this runs first; the
+///   tier (`check_indices`). Of the per-tier checks this runs first; the
 ///   node and `col_ind` bounds above run before any tier.
 /// - [`CapacityError::Memory`] when `total(instances, batches_in_flight)`
 ///   exceeds
 ///   `limits.usable_bytes()`.
 /// - [`CapacityError::Buffer`] when the largest buffer exceeds
 ///   `limits.max_buffer_bytes`. A per-model buffer counts for the
-///   [`models_per_buffer`] models it holds; a shared buffer counts once.
+///   `models_per_buffer` models it holds; a shared buffer counts once.
 pub fn footprint(
     kernel: Kernel,
     shape: &ModelShape,
@@ -1000,7 +1000,7 @@ const fn layouts(kernel: Kernel) -> &'static [(Precision, Precision)] {
 
 /// Whether the session admits one model of `nodes` nodes and `edges`
 /// couplers, spread as evenly as a simple graph allows, with
-/// [`ADVERTISED_BETAS`] betas: at every read count the miner accepts, on
+/// `ADVERTISED_BETAS` betas: at every read count the miner accepts, on
 /// every coefficient layout, under the capacity model, the 32-bit index
 /// guards, and the one-sweep limit (`sampler::session_admits_shape`).
 #[must_use]

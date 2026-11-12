@@ -51,6 +51,7 @@ test:
     - rustup component add clippy rustfmt
     - cargo fmt --check
     - cargo clippy --all-targets --all-features -- -D warnings
+    - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
     # The conformance and lease tests build the binaries themselves; building
     # them here, in the same profile, keeps that build out of the test times.
     - cargo build --bins

@@ -436,7 +436,7 @@ fn quantize_i8(v: f64) -> i8 {
 /// `graph` must share `topology`'s establishing edge list. `topology.edge_pos`
 /// is sized from that graph's `edges`, and this walks `edge_pos` positionally,
 /// so entry `k` is only meaningful when `graph.edges[k]` is the same edge.
-/// Callers ([`crate::sampler::encode_batch`]) guarantee this by batching on an
+/// Callers (`sampler::encode_batch`) guarantee this by batching on an
 /// identical `(n, edges)` key.
 ///
 /// # Panics

@@ -482,7 +482,7 @@ fn query_iokit_gpu_utilization() -> u32 {
 /// command-buffer budget ([`crate::streaming::stream_width`]); callers fall
 /// back to a conservative default when this returns `None`, so a miss costs
 /// concurrency tuning, never correctness. Never panics — same "return nothing
-/// on any error" contract as [`query_iokit_gpu_utilization`].
+/// on any error" contract as `query_iokit_gpu_utilization`.
 ///
 /// The core count is fixed hardware, and the registry query costs tens of
 /// microseconds, so the first answer is kept for the life of the process.

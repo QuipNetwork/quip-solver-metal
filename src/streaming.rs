@@ -34,7 +34,7 @@ const DEFAULT_GPU_CORES: usize = 10;
 /// Batches the stream keeps on the GPU at once ([`run_stream`]).
 pub(crate) const STREAM_IN_FLIGHT: usize = 2;
 
-/// Backend-facing read cap for [`crate::MetalSampler::max_reads`] (mirrors CUDA).
+/// Backend-facing read cap for `MetalSampler::max_reads` (mirrors CUDA).
 ///
 /// # Examples
 ///
@@ -210,7 +210,7 @@ pub fn declared_stream_width(kernel: Kernel) -> usize {
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
 ///
-/// Sized from [`nominal_reads`] because it is fixed at startup, before any job
+/// Sized from `nominal_reads` because it is fixed at startup, before any job
 /// reveals its read count. Two batches' worth, so the harness buffers the next
 /// batch while one dispatches.
 ///

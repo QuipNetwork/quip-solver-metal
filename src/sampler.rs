@@ -16,8 +16,8 @@
 //! The streaming loop batches problems to keep the GPU busy
 //! ([`crate::streaming`]).
 //!
-//! [`encode_batch`] builds one batch's buffers and encodes the dispatch without
-//! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
+//! `encode_batch` builds one batch's buffers and encodes the dispatch without
+//! committing; `harvest_batch` reads the bit-packed samples per problem. The
 //! synchronous [`sample_ising`] runs a single-problem batch and waits.
 
 use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
@@ -58,7 +58,7 @@ pub enum SampleError {
     #[error("Metal driver: {0}")]
     Driver(String),
     /// The job exceeds a fixed capacity of this backend (kernel node cap,
-    /// [`MAX_SWEEPS`]). Distinct from [`Self::Driver`] because it maps to a
+    /// `MAX_SWEEPS`). Distinct from [`Self::Driver`] because it maps to a
     /// different harness condition: `Capacity` tells the coordinator to route
     /// the job elsewhere, while [`Self::Driver`] and [`Self::Metal`] describe
     /// the device itself, not this one job's size.
@@ -675,7 +675,7 @@ pub(crate) fn msa_shared_spins(tg_bytes: usize, cap: Option<usize>) -> usize {
 /// the kernel's `popcount21` covers.
 pub(crate) const MSA_UNIT_MAX_DEG: usize = 20;
 /// Largest CSR degree the weighted multi-spin lanes (milli and Float32) walk,
-/// in row chunks of [`MSA_UNIT_MAX_DEG`]: CUDA's sparse `MSA_MAX_DEG`. No
+/// in row chunks of `MSA_UNIT_MAX_DEG`: CUDA's sparse `MSA_MAX_DEG`. No
 /// multi-spin kernel admits a denser model (`capacity::CapacityError::Degree`).
 pub const MSA_SPARSE_MAX_DEG: usize = 62;
 
@@ -3529,7 +3529,7 @@ pub(crate) fn audit_device_energies(
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem
-/// (synchronous single-problem batch; used by [`crate::MetalSampler::sample`]
+/// (synchronous single-problem batch; used by `MetalSampler::sample`
 /// and the golden-parity tests).
 ///
 /// A zero-node graph short-circuits to `num_reads` empty results without

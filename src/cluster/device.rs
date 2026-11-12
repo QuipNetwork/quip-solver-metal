@@ -6,7 +6,7 @@
 //! `kernels/cluster.metal`.
 //!
 //! Each call uploads the prepared arrays, runs the sweeps in command buffers
-//! that [`crate::sampler::cluster_plan`] sizes, then repeats single greedy
+//! that `sampler::cluster_plan` sizes, then repeats single greedy
 //! passes, one command buffer each, until no spin flips. `stop` is checked
 //! before every command buffer.
 

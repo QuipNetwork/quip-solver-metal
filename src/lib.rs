@@ -169,7 +169,7 @@ const FEATURES: &[&str] = &[
 
 /// SA's model limits. A model the int8 kernel cannot hold runs on the wide
 /// kernel, which keeps milli units in `int`, so the field bound is the wide
-/// path's. The degree bound is [`ADVERTISED_MAX_DEGREE`].
+/// path's. The degree bound is `ADVERTISED_MAX_DEGREE`.
 pub const METAL_SA_LIMITS: quip_solver_core::ModelLimits = quip_solver_core::ModelLimits {
     max_degree: Some(ADVERTISED_MAX_DEGREE),
     max_local_field_milli: Some(crate::representation::WIDE_MAX_FIELD_MILLI),
