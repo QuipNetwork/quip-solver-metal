@@ -290,8 +290,9 @@ crate builds in. CI fails any test that takes more than 30 seconds. The default
 run skips the tests that take more than ten seconds in a dev build, and CI does
 not run them. Run them with `--features long-tests` before a release.
 
-Two harnesses carry `#[ignore]` because they take minutes to hours of device
-time. `tests/msa_bench.rs` times one problem through both kernels at a job
+The measurement harnesses carry a plain `#[ignore]`, and `long-tests` does not
+run them. Each one takes minutes to hours of device time, or reports a timing
+instead of checking a property. Two examples follow. `tests/msa_bench.rs` times one problem through both kernels at a job
 shape the environment sets. `tests/probe_screen.rs` draws fresh nonces on the
 testnet's own instance distribution and runs each nonce through a list of
 read and sweep shapes. That measures what a short probe says about the full
