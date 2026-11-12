@@ -1846,11 +1846,15 @@ pub(crate) fn kernel_representation(
 /// a beta past the finite `f32` range, or a rounded local field whose delta
 /// `2 * field` overflows.
 ///
-/// The field rule is CUDA's `check_real_fields` (commit `4bc82bb`) in its
-/// order-independent form: the `f64` sum of the `f32` magnitudes of `h` and
-/// the row's couplings, widened by the rounding bound of `degree + 1` `f32`
-/// additions. The beta rule is CUDA's `build_planned_beta_schedule` (commit
-/// `7d97e41`).
+/// The field rule sums the `f32` magnitudes of `h` and the row's couplings in
+/// `f64`, then widens that sum for `degree + 1` rounded `f32` additions.
+/// CUDA's MSA precheck sums the original `f64` coefficients instead, which
+/// cannot bound the rounded field in Metal's Float32 MSA lane. CUDA's SA and
+/// Gibbs session checks also use separate limits and CSR-order sums. Keep
+/// this order-independent bound for all three Metal kernels, including the
+/// cached SA delta updated with `fma(±4, J, delta)`.
+/// The beta rule also keeps `2 * beta` finite in Gibbs and MSA; CUDA's
+/// `build_planned_beta_schedule` checks only that beta itself is finite.
 fn check_float_schedule(graph: &IsingGraph, beta: &[f32]) -> Result<(), SampleError> {
     if let Some(index) = beta.iter().position(|b| !b.is_finite()) {
         return Err(SampleError::TooLarge(format!(
@@ -5178,6 +5182,36 @@ mod tests {
             vec![(0, 1), (0, 2), (0, 3)],
         );
         too_large(check_float_schedule(&star, &[0.0]));
+    }
+
+    #[test]
+    fn float_field_boundary_keeps_delta_and_fma_finite() {
+        let half = f32::MAX / 2.0;
+        let mut low = 0_u32;
+        let mut high = half.to_bits();
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            let coupling = f32::from_bits(middle);
+            let graph = IsingGraph::new(vec![0.0; 2], vec![f64::from(coupling)], vec![(0, 1)]);
+            if check_float_schedule(&graph, &[0.0]).is_ok() {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+
+        let coupling = f32::from_bits(low);
+        let graph = IsingGraph::new(vec![0.0; 2], vec![f64::from(coupling)], vec![(0, 1)]);
+        check_float_schedule(&graph, &[0.0]).unwrap();
+        let delta = -2.0 * coupling;
+        let updated = 4.0_f32.mul_add(coupling, delta);
+        assert!((4.0 * coupling).is_infinite());
+        assert!(delta.is_finite());
+        assert!(updated.is_finite());
+
+        let above = f32::from_bits(low + 1);
+        let graph = IsingGraph::new(vec![0.0; 2], vec![f64::from(above)], vec![(0, 1)]);
+        too_large(check_float_schedule(&graph, &[0.0]));
     }
 
     /// A complete model on `n` nodes with every coupling `j`.
