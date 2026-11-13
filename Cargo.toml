@@ -36,7 +36,7 @@ path = "src/bin/quip_metal_otsuka.rs"
 # this one line covers all three.
 [dependencies]
 quip-solver-ane = { path = "crates/ane-miner" }
-quip-solver-core = "0.0.11"
+quip-solver-core = "0.0.14"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
@@ -62,7 +62,7 @@ objc = "0.2"
 long-tests = []
 
 [dev-dependencies]
-quip-solver-conformance = "0.0.11"
+quip-solver-conformance = "0.0.14"
 tonic = "=0.12.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "3.27.0"
