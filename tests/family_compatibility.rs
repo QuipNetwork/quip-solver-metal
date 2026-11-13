@@ -203,7 +203,11 @@ fn the_command_line_declares_the_default_generated_tier_with_each_kernel_limit()
         for key in ["solverId", "acceptedFamilies"] {
             assert!(caps.get(key).is_none(), "{name} lists {key}: {caps}");
         }
-        assert_eq!(caps["generatedFamilies"], registered_json(), "{name}: {caps}");
+        assert_eq!(
+            caps["generatedFamilies"],
+            registered_json(),
+            "{name}: {caps}"
+        );
         let family_generator = GeneratorAlgorithm::FamilyChacha8V1.as_str_name();
         assert!(
             caps["generators"]
