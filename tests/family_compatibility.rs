@@ -278,13 +278,20 @@ fn the_otsuka_command_line_declares_twisted_ice_dimer() {
     let bin = otsuka();
     let caps = command_line_capabilities(bin.path);
     assert_eq!(caps["solverId"], "quip-metal-otsuka/1", "{caps}");
-    for list in ["generatedFamilies", "acceptedFamilies"] {
-        assert_eq!(
-            caps[list],
-            json!([{"familyId": "quip/twisted-ice-dimer", "revisions": [1]}]),
-            "{list}: {caps}"
-        );
-    }
+    // The declared family comes first; the solver-core default session path
+    // then appends every other registered family it generates.
+    let dimer = json!({"familyId": "quip/twisted-ice-dimer", "revisions": [1]});
+    let mut generated = vec![dimer.clone()];
+    generated.extend(
+        registered_json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|family| family["familyId"] != dimer["familyId"])
+            .cloned(),
+    );
+    assert_eq!(caps["generatedFamilies"], Value::Array(generated), "{caps}");
+    assert_eq!(caps["acceptedFamilies"], json!([dimer]), "{caps}");
     let family_generator = GeneratorAlgorithm::FamilyChacha8V1.as_str_name();
     assert!(
         caps["generators"]
