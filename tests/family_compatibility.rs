@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2025 QUIP Protocol Contributors
 
-//! MT-1: Metal miners at the generic family tier, and the Otsuka miner.
+//! MT-1: Metal miners on the default family path, and the Otsuka miner.
 //!
-//! The SA, Gibbs and MSA binaries expand no family leases, so each declares
-//! the generic tier (FAM-56): no `solver_id`, no generated or accepted
-//! family, and its own kernel limits. A family lease is rejected without a
-//! fallback, and an explicit job that carries a `FamilyBinding` is solved as
-//! the plain model (FAM-69). `quip-metal-otsuka` lists
-//! `quip/twisted-ice-dimer` revision 1 in both family lists and passes the
-//! family gate for it.
+//! The SA, Gibbs and MSA binaries claim no family themselves: no `solver_id`,
+//! no accepted family, and their own kernel limits. The solver-core default
+//! session path generates every registered family for them, regenerating each
+//! lease salt's instance and handing the kernel the plain graph, so they list
+//! every registered family in `generated_families`. An explicit job that
+//! carries a `FamilyBinding` is solved as the plain model (FAM-69).
+//! `quip-metal-otsuka` lists `quip/twisted-ice-dimer` revision 1 in both
+//! family lists and passes the family gate for it.
 //!
 //! Metal GPU tests: need a real device (Apple Silicon). Run with
 //! `--test-threads=1`.
@@ -28,6 +29,7 @@ use quip_solver_conformance::solve::CaseOutcome;
 use quip_solver_core::ising_generators::descriptor::params_digest;
 use quip_solver_core::ising_generators::family::BaseTopology;
 use quip_solver_core::ising_generators::instance::Instance;
+use quip_solver_core::ising_generators::registry::CONTRACTS;
 use quip_solver_core::quip_proto::v1::{
     coord_msg, ising_problem, Backend, Cancel, Capabilities, CoefficientEncoding, EdgeList,
     FamilyBinding, FamilyDescriptor, GeneratorAlgorithm, IsingProblem, Job, JobKind,
@@ -179,22 +181,41 @@ fn socket(name: &str) -> String {
     )
 }
 
+/// The `generatedFamilies` JSON of the solver-core default session path:
+/// every registered family, every parameter set.
+fn registered_json() -> Value {
+    Value::Array(
+        CONTRACTS
+            .iter()
+            .map(|c| json!({"familyId": c.family_id, "revisions": [c.revision]}))
+            .collect(),
+    )
+}
+
+/// A production kernel claims no family itself. The solver-core default
+/// session path still generates every registered family for it, so it lists
+/// them and the family generator (FAM-58).
 #[test]
-fn the_command_line_declares_the_generic_tier_with_each_kernel_limit() {
+fn the_command_line_declares_the_default_generated_tier_with_each_kernel_limit() {
     for bin in bins() {
         let name = bin.name;
         let caps = command_line_capabilities(bin.path);
-        for key in ["solverId", "generatedFamilies", "acceptedFamilies"] {
+        for key in ["solverId", "acceptedFamilies"] {
             assert!(caps.get(key).is_none(), "{name} lists {key}: {caps}");
         }
+        assert_eq!(
+            caps["generatedFamilies"],
+            registered_json(),
+            "{name}: {caps}"
+        );
         let family_generator = GeneratorAlgorithm::FamilyChacha8V1.as_str_name();
         assert!(
-            !caps["generators"]
+            caps["generators"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|g| g == family_generator),
-            "{name} lists {family_generator} with no generated family (FAM-58): {caps}"
+            "{name} lists generated families without {family_generator} (FAM-58): {caps}"
         );
         let identity = bin.identity;
         assert_eq!(caps["backend"], "metal", "{name}: {caps}");
@@ -241,7 +262,11 @@ async fn the_session_advertises_what_the_command_line_prints() {
                 "{name} {source}"
             );
             assert!(session.solver_id.is_empty(), "{name} {source}");
-            assert!(session.generated_families.is_empty(), "{name} {source}");
+            assert_eq!(
+                session.generated_families.len(),
+                CONTRACTS.len(),
+                "{name} {source}"
+            );
             assert!(session.accepted_families.is_empty(), "{name} {source}");
             assert_eq!(session_json(session), caps, "{name} {source}");
         }
@@ -253,13 +278,20 @@ fn the_otsuka_command_line_declares_twisted_ice_dimer() {
     let bin = otsuka();
     let caps = command_line_capabilities(bin.path);
     assert_eq!(caps["solverId"], "quip-metal-otsuka/1", "{caps}");
-    for list in ["generatedFamilies", "acceptedFamilies"] {
-        assert_eq!(
-            caps[list],
-            json!([{"familyId": "quip/twisted-ice-dimer", "revisions": [1]}]),
-            "{list}: {caps}"
-        );
-    }
+    // The declared family comes first; the solver-core default session path
+    // then appends every other registered family it generates.
+    let dimer = json!({"familyId": "quip/twisted-ice-dimer", "revisions": [1]});
+    let mut generated = vec![dimer.clone()];
+    generated.extend(
+        registered_json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|family| family["familyId"] != dimer["familyId"])
+            .cloned(),
+    );
+    assert_eq!(caps["generatedFamilies"], Value::Array(generated), "{caps}");
+    assert_eq!(caps["acceptedFamilies"], json!([dimer]), "{caps}");
     let family_generator = GeneratorAlgorithm::FamilyChacha8V1.as_str_name();
     assert!(
         caps["generators"]
@@ -333,18 +365,21 @@ async fn the_otsuka_binary_passes_the_family_gate_for_twisted_ice_dimer() {
     }
 }
 
-/// The SC-7 cases a generic binary must pass, not skip. The rest of the gate
-/// covers generated and accepted revisions, which these binaries do not list.
-const GENERIC_TIER_CASES: [&str; 5] = [
+/// The session SC-7 cases a production binary must pass, not skip.
+const SESSION_CASES: [&str; 5] = [
     "hello-protocol-version-2",
     "generators-list-family-iff-generated",
-    "no-generated-families-rejects-family-lease",
+    "unknown-family",
     "credit-ledger-balanced",
     "clean-exit",
 ];
 
+/// The skip the gate gives a revision whose reference lattices exceed the
+/// kernel's own advertised limits.
+const TOO_SMALL: &str = "the advertised limits are too small for this revision";
+
 #[tokio::test]
-async fn the_family_gate_rejects_family_leases_without_fallback() {
+async fn the_family_gate_passes_registered_families_on_the_default_path() {
     for bin in bins() {
         let name = bin.name;
         let report = drive_miner_family(bin.path, &[], &socket(name)).await;
@@ -360,7 +395,7 @@ async fn the_family_gate_rejects_family_leases_without_fallback() {
             report.exit_code,
             report.stderr
         );
-        for wanted in GENERIC_TIER_CASES {
+        for wanted in SESSION_CASES {
             let case = report
                 .cases
                 .iter()
@@ -368,6 +403,20 @@ async fn the_family_gate_rejects_family_leases_without_fallback() {
                 .unwrap_or_else(|| panic!("{name}: the gate ran no {wanted} case"));
             assert_eq!(case.outcome, CaseOutcome::Passed, "{name} {wanted}");
         }
+        for contract in CONTRACTS {
+            let subject = format!("{}@{}", contract.family_id, contract.revision);
+            let outcome = report.outcome("supported-revision", Some(&subject));
+            let served = matches!(outcome, Some(CaseOutcome::Passed))
+                || matches!(outcome, Some(CaseOutcome::Skipped(why)) if why.starts_with(TOO_SMALL));
+            assert!(served, "{name} {subject}: {outcome:?}");
+        }
+        // The z22 twisted-ice-dimer reference lattice fits every kernel.
+        assert_eq!(
+            report.outcome("supported-revision", Some("quip/twisted-ice-dimer@1")),
+            Some(&CaseOutcome::Passed),
+            "{name}: {}",
+            report.summary()
+        );
     }
 }
 
