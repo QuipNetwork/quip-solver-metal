@@ -37,7 +37,7 @@ cargo build --release
 ```
 
 The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
-from crates.io at version 0.0.14, published from
+from crates.io at version 0.0.15, published from
 [quip-solver-core](https://gitlab.com/quip.network/quip-solver-core). It
 speaks protocol version 2, so the coordinator must also speak version 2.
 
