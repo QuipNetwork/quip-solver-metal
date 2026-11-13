@@ -89,6 +89,32 @@ impl UtilGovernor {
         Self { knobs, handle }
     }
 
+    /// A governor with a fixed sample and no poll thread: whole-device
+    /// utilization `utilization` and our own share `self_utilization`, both in
+    /// percent. For tests of throttle decisions.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_sample_for_test(
+        utilization_ceiling: u32,
+        yielding: bool,
+        utilization: u32,
+        self_utilization: u32,
+    ) -> Self {
+        let knobs = Arc::new(Knobs {
+            ceiling: AtomicU32::new(utilization_ceiling.clamp(1, 100)),
+            yielding: AtomicBool::new(yielding),
+            last_util: AtomicU32::new(utilization),
+            busy_us: AtomicU64::new(0),
+            self_util: AtomicU32::new(self_utilization),
+            external_util: AtomicU32::new(utilization.saturating_sub(self_utilization)),
+            stop: AtomicBool::new(false),
+        });
+        Self {
+            knobs,
+            handle: None,
+        }
+    }
+
     /// Override the ceiling and yielding flag at runtime (config over CLI).
     pub fn reconfigure(&self, utilization_ceiling: u32, yielding: bool) {
         self.knobs
@@ -189,6 +215,19 @@ impl UtilGovernor {
         // `ceiling` is clamped to 1..=100 on the way in, so the product bottoms
         // out at 0.005 (ceiling 1, fully yielded) and never reaches 0.
         ceiling / 100.0 * headroom
+    }
+
+    /// True when yielding and the load of other processes
+    /// ([`external_utilization`](Self::external_utilization)) exceeds the
+    /// ceiling. The cluster anneal of `quip-metal-otsuka` stops on this
+    /// signal, as the CUDA governor's `should_throttle` does, so it never
+    /// yields to its own load. The caller must report its GPU time through
+    /// [`record_gpu_busy_us`](Self::record_gpu_busy_us).
+    #[must_use]
+    pub fn should_yield_to_others(&self) -> bool {
+        self.knobs.yielding.load(Ordering::Relaxed)
+            && self.knobs.external_util.load(Ordering::Relaxed)
+                > self.knobs.ceiling.load(Ordering::Relaxed)
     }
 
     /// True when yielding and the last util sample exceeds the ceiling.
@@ -443,7 +482,7 @@ fn query_iokit_gpu_utilization() -> u32 {
 /// command-buffer budget ([`crate::streaming::stream_width`]); callers fall
 /// back to a conservative default when this returns `None`, so a miss costs
 /// concurrency tuning, never correctness. Never panics — same "return nothing
-/// on any error" contract as [`query_iokit_gpu_utilization`].
+/// on any error" contract as `query_iokit_gpu_utilization`.
 ///
 /// The core count is fixed hardware, and the registry query costs tens of
 /// microseconds, so the first answer is kept for the life of the process.
@@ -536,6 +575,20 @@ unsafe fn read_device_utilization(props: CFDictionaryRef) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The foreign-load decision ignores our own share of the device, and it
+    /// is off while not yielding.
+    #[test]
+    fn yielding_to_others_counts_only_foreign_load() {
+        // Total 100 over the ceiling of 80, but 90 of it is ours.
+        let own = UtilGovernor::with_sample_for_test(80, true, 100, 90);
+        assert!(own.should_throttle());
+        assert!(!own.should_yield_to_others());
+        let foreign = UtilGovernor::with_sample_for_test(80, true, 100, 10);
+        assert!(foreign.should_yield_to_others());
+        let off = UtilGovernor::with_sample_for_test(80, false, 100, 10);
+        assert!(!off.should_yield_to_others());
+    }
 
     /// Live sensor read must never panic and must report a valid percentage.
     /// Exercises the real IOKit path (this crate is macOS-only).

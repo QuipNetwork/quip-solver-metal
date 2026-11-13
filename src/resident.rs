@@ -519,12 +519,16 @@ impl Pool {
     }
 }
 
+/// Bounds every resident job. The node count is not bounded here: a job past
+/// the unit kernel's nodes takes the batch path, whose spill build the
+/// capacity footprint bounds ([`admit_batch`]). The edge bound is the one the
+/// backend identity advertises (`crate::advertised_edges`).
 fn validate(job: &StreamJob) -> Result<(), SampleError> {
-    if job.graph.num_nodes() > sampler::kernel_max_nodes(Kernel::Msa)
+    if job.graph.edges.len() > crate::advertised_edges(Kernel::Msa)
         || job.params.num_sweeps > sampler::MAX_SWEEPS
     {
         return Err(SampleError::TooLarge(
-            "resident job exceeds node or sweep limit".into(),
+            "resident job exceeds edge or sweep limit".into(),
         ));
     }
     if job.graph.j.len() != job.graph.edges.len() {
@@ -755,12 +759,17 @@ impl Preparer {
             return Ok(None);
         }
         validate(job)?;
-        // Slots run the unit kernel only. Weighted models, and refusals,
-        // take the batch path, which classifies them again.
-        let unit = crate::representation::classify_msa(&job.graph)
-            == Ok(crate::representation::Representation::Int8);
+        // Slots run the unit kernel only. Weighted models, models past the
+        // unit kernel's nodes, and refusals take the batch path, which
+        // classifies them again.
+        let unit = job.graph.num_nodes() <= sampler::kernel_max_nodes(Kernel::Msa)
+            && crate::representation::classify_msa(&job.graph)
+                == Ok(crate::representation::Representation::Binary);
         if job.params.num_sweeps == 0 || !unit || !sampler::device_energy_exact(&job.graph) {
-            sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+            // One problem: the batch path runs this job alone, on the tier
+            // the capacity model routes it to, and checks its one-sweep
+            // limit again in `encode_batch`.
+            sampler::admit_one(&job.graph, &job.params, Kernel::Msa)?;
             return Ok(None);
         }
         let lookup = |cached: Option<&Arc<PreparedTopology>>| {
@@ -784,10 +793,21 @@ impl Preparer {
                     Some(hit) => hit,
                     None => {
                         // Degree depends only on nodes and ordered edges. The cache is
-                        // established only after validate_batch, and coefficient filling
+                        // established only after admit_one, and coefficient filling
                         // checks exact topology equality on every hit. Recounting degree
                         // would allocate and walk the same 41,515 edges on every job.
-                        sampler::validate_batch(&[&job.graph], &job.params, Kernel::Msa)?;
+                        // This checks the one-sweep limit for one problem, while a
+                        // slot pool runs up to `batch_size_for_reads` jobs at once.
+                        // That is safe only because the unit lane (6,016 nodes or
+                        // fewer, degree 20 or less) estimates a full pool at 1.7 ms
+                        // or less. A larger lane needs the pool's real problems.
+                        let rep = sampler::admit_one(&job.graph, &job.params, Kernel::Msa)?;
+                        // A unit model denser than the unit kernel's rows runs on the
+                        // weighted lane, which only the batch path has. Its topology is
+                        // never cached, so a cache hit is always a unit-lane topology.
+                        if rep != crate::representation::Representation::Binary {
+                            return Ok(None);
+                        }
                         // This cache contains no Metal objects. Coloring does not
                         // change the CSR positions used for coefficient order.
                         let topology = SelfFeedingTopology::build(&job.graph);
@@ -1374,16 +1394,53 @@ fn reject_preparation(
     reject_tail(pending, jobs, salts, out, error, cancel);
 }
 
+/// Refuse a batch job whose buffers, together with the `reserved_bytes` the
+/// slot pools, screen banks, and free buffers hold, exceed `usable_bytes`.
+/// The job's bytes come from the capacity footprint for all concurrent jobs, as
+/// `capacity::footprint` counts them.
+fn admit_batch(
+    job: &StreamJob,
+    reserved_bytes: usize,
+    usable_bytes: usize,
+) -> Result<(), SampleError> {
+    let footprint = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)?;
+    let needed = footprint
+        .total(
+            crate::capacity::instances(Kernel::Msa, job.params.num_reads),
+            crate::capacity::batches_in_flight(Kernel::Msa),
+        )
+        .saturating_add(reserved_bytes);
+    if needed > usable_bytes {
+        let error = crate::capacity::CapacityError::Memory {
+            needed,
+            usable: usable_bytes,
+        };
+        return Err(SampleError::TooLarge(format!(
+            "Msa batch job of {} nodes beside the slot pools: {error}",
+            job.graph.num_nodes()
+        )));
+    }
+    Ok(())
+}
+
+/// Run one job on the batch path. `reserved_bytes` covers the slot pools and
+/// screen banks. Add the free-list bytes before admission.
 fn run_fallback(
     device: &MetalDevice,
     job: StreamJob,
     origin: Origin,
+    reserved_bytes: usize,
     out: &Sender<StreamResult>,
     gov: &dyn GpuGovernor,
     cancel: &CancelToken,
 ) -> Result<(), SampleError> {
     let mut device_access_time_us = 0;
     let result = (|| {
+        admit_batch(
+            &job,
+            reserved_bytes.saturating_add(device.buffer_pool.allocated_bytes()),
+            sampler::host_device_limits().usable_bytes(),
+        )?;
         let mut batch = sampler::encode_batch(device, &[&job.graph], &job.params, Kernel::Msa, 1)?;
         for _ in 0..batch.chunk_count() {
             if out.is_closed() || abandoned(cancel, &job, &origin) {
@@ -1527,6 +1584,7 @@ enum UnitAdmission {
 fn admit_unit(
     prepared: Prepared,
     pools: &mut Option<[Pool; 2]>,
+    screener: Option<&Screener<Salt>>,
     turn: usize,
     controller: &mut Controller,
     device: &MetalDevice,
@@ -1569,8 +1627,14 @@ fn admit_unit(
                     data: Ok(None),
                 });
             }
+            let screen_bytes = screener.map_or(0, Screener::allocated_bytes);
+            let reserved = pools.as_ref().map_or(screen_bytes, |ps| {
+                ps.iter()
+                    .map(|p| p.slots.allocated_bytes())
+                    .fold(screen_bytes, usize::saturating_add)
+            });
             let started = Instant::now();
-            let result = run_fallback(device, job, origin, out, gov, cancel);
+            let result = run_fallback(device, job, origin, reserved, out, gov, cancel);
             // Fallback time belongs to the governor, not cascade load.
             *window += started.elapsed();
             if let Err(error) = result {
@@ -1855,6 +1919,7 @@ pub(crate) fn run(
                 match admit_unit(
                     prepared,
                     &mut pools,
+                    screener.as_ref().map(|(_, screen)| screen),
                     0,
                     &mut controller,
                     device,
@@ -2055,6 +2120,7 @@ pub(crate) fn run(
             match admit_unit(
                 prepared,
                 &mut pools,
+                screener.as_ref().map(|(_, screen)| screen),
                 turn,
                 &mut controller,
                 device,
@@ -3093,6 +3159,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "a benchmark that prints preparation times and asserts none: run with --release --ignored --nocapture"]
     #[expect(
         clippy::print_stderr,
         reason = "host preparation cost informs the fixed worker budget"
@@ -3826,7 +3893,24 @@ mod tests {
         let settings = CascadeSettings::default();
         let mut input = job(0, 32);
         preparer.prepare(&mut input, settings, true).unwrap();
-        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        // A unit model past the unit kernel's degree takes the batch path's
+        // weighted lane, and past the weighted lane's degree its dense-matrix
+        // build. With a repeated coupler no tier admits it: capacity.
+        for leaves in [
+            sampler::MSA_UNIT_MAX_DEG + 1,
+            sampler::MSA_SPARSE_MAX_DEG + 1,
+        ] {
+            input.graph.edges = (1..=leaves).map(|v| (0, v)).collect();
+            input.graph.j = vec![1.0; input.graph.edges.len()];
+            assert!(preparer
+                .prepare(&mut input, settings, true)
+                .unwrap()
+                .is_none());
+        }
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG)
+            .map(|v| (0, v))
+            .chain(std::iter::once((0, 1)))
+            .collect();
         input.graph.j = vec![1.0; input.graph.edges.len()];
         assert!(matches!(
             preparer.prepare(&mut input, settings, true),
@@ -4217,20 +4301,36 @@ mod tests {
             .unwrap()
             .is_none());
         input.params.num_sweeps = 64;
-        input.graph.edges = (1..=sampler::MSA_MAX_DEG + 1).map(|v| (0, v)).collect();
+        // Past the weighted lane's degree, the batch path runs a star on
+        // dense-matrix storage. A repeated coupler leaves it no tier.
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG + 1)
+            .map(|v| (0, v))
+            .collect();
         input.graph.j = vec![0.5; input.graph.edges.len()];
+        assert!(preparer
+            .prepare(&mut input, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
+        input.graph.edges = (1..=sampler::MSA_SPARSE_MAX_DEG)
+            .map(|v| (0, v))
+            .chain(std::iter::once((0, 1)))
+            .collect();
         assert!(matches!(
             preparer.prepare(&mut input, CascadeSettings::default(), true),
             Err(SampleError::TooLarge(_))
         ));
-        input
-            .graph
-            .h
-            .resize(sampler::kernel_max_nodes(Kernel::Msa) + 1, 0.0);
-        assert!(matches!(
-            preparer.prepare(&mut input, CascadeSettings::default(), true),
-            Err(SampleError::TooLarge(_))
-        ));
+        // A weighted model past the unit kernel's nodes, within the degree
+        // budget, takes the batch path's spill build.
+        let n = sampler::kernel_max_nodes(Kernel::Msa) + 1;
+        input.graph = IsingGraph::new(
+            vec![0.5; n],
+            vec![0.5; n],
+            (0..n).map(|i| (i, (i + 1) % n)).collect(),
+        );
+        assert!(preparer
+            .prepare(&mut input, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -4372,6 +4472,124 @@ mod tests {
         invalid.graph.j.pop();
         invalid.graph.j.push(-1.0);
         validate(&invalid).unwrap();
+    }
+
+    /// A unit ring of `n` nodes, for the node-count routing tests.
+    fn unit_ring(n: usize) -> StreamJob {
+        StreamJob {
+            job_id: b"ring".to_vec(),
+            graph: IsingGraph::new(
+                vec![1.0; n],
+                vec![-1.0; n],
+                (0..n).map(|i| (i, (i + 1) % n)).collect(),
+            ),
+            params: SampleParams {
+                num_reads: 32,
+                num_sweeps: 32,
+                ..Default::default()
+            },
+            watermark: None,
+        }
+    }
+
+    #[test]
+    fn a_unit_job_past_the_unit_kernel_nodes_takes_the_batch_path() {
+        let mut large = unit_ring(sampler::kernel_max_nodes(Kernel::Msa) + 1);
+        validate(&large).unwrap();
+        let mut preparer = Preparer::default();
+        assert!(preparer
+            .prepare(&mut large, CascadeSettings::default(), true)
+            .unwrap()
+            .is_none());
+        let mut fits = unit_ring(sampler::kernel_max_nodes(Kernel::Msa));
+        assert!(preparer
+            .prepare(&mut fits, CascadeSettings::default(), true)
+            .unwrap()
+            .is_some());
+    }
+
+    /// A job of `edges` couplers on two nodes: `validate` reads only the
+    /// counts, so the repeated pair keeps the test small.
+    fn edge_count_job(edges: usize) -> StreamJob {
+        StreamJob {
+            graph: IsingGraph::new(vec![0.0; 2], vec![1.0; edges], vec![(0, 1); edges]),
+            ..unit_ring(2)
+        }
+    }
+
+    /// The resident gate refuses one coupler past the advertised
+    /// `max_edges` as a non-fatal capacity reject, and admits the limit.
+    #[test]
+    fn validate_refuses_one_edge_past_the_advertised_limit() {
+        let limit = crate::advertised_edges(Kernel::Msa);
+        let identity = crate::metal_msa_identity(sampler::host_device_limits(), None).unwrap();
+        assert_eq!(limit, identity.max_edges as usize);
+        assert_eq!(
+            validate(&edge_count_job(limit + 1))
+                .unwrap_err()
+                .to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        validate(&edge_count_job(limit)).unwrap();
+    }
+
+    #[test]
+    fn admit_batch_counts_the_slot_pools_against_usable_memory() {
+        let job = unit_ring(20_000);
+        let needed = sampler::model_footprint(&job.graph, &job.params, Kernel::Msa)
+            .unwrap()
+            .total(crate::capacity::instances(Kernel::Msa, 32), 1);
+        admit_batch(&job, 0, needed).unwrap();
+        admit_batch(&job, 1_000, needed + 1_000).unwrap();
+        let refused = admit_batch(&job, 1_000, needed + 999).unwrap_err();
+        assert!(
+            matches!(&refused, SampleError::TooLarge(message) if message.contains("bytes usable")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_sample_error(),
+            quip_solver_core::SampleError::Capacity
+        );
+        assert!(matches!(
+            admit_batch(&job, usize::MAX, usize::MAX - 1),
+            Err(SampleError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn fallback_passes_reserved_slot_memory_to_admission() {
+        if MetalDevice::device_count() == 0 {
+            return;
+        }
+        struct Governor;
+        impl GpuGovernor for Governor {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let device = MetalDevice::open(0).unwrap();
+        let (out, mut replies) = tokio::sync::mpsc::channel(1);
+        let input = job(0, 1);
+        run_fallback(
+            &device,
+            input,
+            Origin::Stream,
+            usize::MAX,
+            &out,
+            &Governor,
+            &CancelToken::default(),
+        )
+        .unwrap();
+        let reply = replies.try_recv().unwrap();
+        assert!(matches!(
+            reply.outcome,
+            StreamOutcome::Completed(Err(quip_solver_core::SampleError::Capacity))
+        ));
+        assert_eq!(reply.device_access_time_us, 0);
     }
 
     #[test]

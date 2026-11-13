@@ -2,8 +2,8 @@
 
 Metal Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-metal-sa`), multi-spin coded SA
-(`quip-metal-msa`) and heat-bath Gibbs (`quip-metal-gibbs`), shipped as
-separate binaries.
+(`quip-metal-msa`), heat-bath Gibbs (`quip-metal-gibbs`) and the Otsuka
+cluster anneal (`quip-metal-otsuka`), shipped as separate binaries.
 
 **macOS arm64 only (Apple Silicon).** Metal and IOKit exist on no other
 platform, so this crate does not build anywhere else and offers no stub or CPU
@@ -13,8 +13,8 @@ Build and run on Apple Silicon.
 Energies match consensus `quip_solver_core::quip_protocol::scoring::energy_milli`.
 The multi-spin kernel computes each read's energy on the device in integer
 milli units when every coefficient is a whole number in `i8` range, and the
-host rescores 1 job in 1,000 to check it. Other kernels, and graphs with
-other coefficients, are scored on the host.
+host rescores 1 job in 1,000 to check it. The host scores the reads of the
+other kernels, and of graphs with other coefficients.
 
 ## Binaries
 
@@ -23,10 +23,12 @@ other coefficients, are scored on the host.
 | `quip-metal-sa` | simulated annealing (Metropolis) |
 | `quip-metal-msa` | multi-spin coded simulated annealing (32 replicas per word) |
 | `quip-metal-gibbs` | heat-bath Gibbs |
+| `quip-metal-otsuka` | Otsuka cluster anneal on `quip/twisted-ice-dimer` revision 1 jobs, simulated annealing on every other job |
 
-Prebuilt `arm64` binaries are attached to each
+Each
 [Release](https://gitlab.com/quip.network/quip-solver-metal/-/releases)
-(built best-effort on a macOS CI runner. See [`.gitlab-ci.yml`](.gitlab-ci.yml)).
+has prebuilt `arm64` binaries. A macOS CI runner builds them best-effort
+(see [`.gitlab-ci.yml`](.gitlab-ci.yml)).
 
 ## Build
 
@@ -35,14 +37,60 @@ cargo build --release
 ```
 
 The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) comes
-from crates.io at version 0.0.2-rc3, published from
+from crates.io at version 0.0.11, published from
 [quip-solver-core](https://gitlab.com/quip.network/quip-solver-core). It
 speaks protocol version 2, so the coordinator must also speak version 2.
 
 The miners accept `ISING_GENERATE` salt leases. The session draws each salt's
-problem from the lease, runs it through the same stream as a plain job, and
-sends a `Result` only for a salt whose reads meet the target. Each lease ends
+problem from the lease and runs it through the same stream as a plain job.
+It sends a `Result` only for a salt whose reads meet the target. Each lease ends
 with one `LeaseDone` summary and a credit refund.
+
+The SA, Gibbs and MSA binaries declare the generic problem-family tier. Each
+advertises no `solver_id` and no generated or accepted family, because these
+sessions do not expand family leases. The session rejects a family lease with
+`FamilyUnsupported` and runs no fallback. For an explicit job with a
+`FamilyBinding`, the miner solves the plain model and the coordinator decides
+acceptance.
+`tests/family_compatibility.rs` checks the declaration, each kernel's limits,
+and both job paths.
+
+## Otsuka binary (`quip-metal-otsuka`)
+
+`quip-metal-otsuka` has the `solver_id` `quip-metal-otsuka/1`. It
+lists `quip/twisted-ice-dimer` revision 1 in its generated and accepted
+families. The session expands family leases of that revision and checks
+the `FamilyBinding` of explicit jobs.
+
+- A checked twisted-ice-dimer job runs on the Otsuka cluster kernel
+  (`kernels/cluster.metal`). Each read is one anneal, and a job has at most 256
+  reads. The schedule follows the job, as in the CUDA miner: the job's
+  `num_sweeps`, `sweeps_per_beta`, beta range, and beta schedule give the
+  beta ladder, and each command buffer runs inside one rung at that rung's
+  beta. Every sweep has 2 rounds and a single-spin sweep. The job seed seeds
+  the anneal. The host scores each read on the original model.
+- Each other job runs on the Metal SA engine of `quip-metal-sa`. For the
+  same seed, a plain job returns the same reads on both binaries.
+- The cluster kernel and Metal SA never share the GPU. Each plans its
+  command buffers against the 500 ms ceiling as if it owns the GPU. A family
+  job waits until every plain job ahead of it answers, and no plain job starts
+  while a family job runs. With one sweep per beta, the ladder runs one
+  command buffer per sweep. One family job at 256 reads and 2,048 sweeps on
+  the 4,577-node Advantage2 instance took 4.05 to 4.28 s in three runs on an
+  Apple M4 Max: 2,050 command buffers, about 2 ms each, of which about
+  1.8 ms is GPU time (`a_production_family_job_time` in
+  `tests/cluster_device.rs`).
+- A family job that does not fit the cluster layout, the memory budget, or the
+  single-buffer limit gets a `Capacity` reject with one refund, and the
+  session goes on. The miner refuses the job before it allocates a buffer.
+- When the GPU load of other processes passes the `--utilization` ceiling
+  with `--yielding` on, a family job stops before its next command buffer,
+  and the miner rejects it as busy. The load of the family job itself does
+  not count, because the job reports its GPU time to the governor.
+
+`tests/cluster_session.rs` checks the routing, the cancellation, the
+refusals, and the job order. `tests/family_compatibility.rs` checks that
+the binary passes the family gate for twisted-ice-dimer revision 1.
 
 ## Running
 
@@ -68,6 +116,84 @@ quip-coordinator drive --miner ./quip-metal-sa \
 quip-metal-sa --capabilities   # capabilities JSON
 quip-metal-sa --check          # probe the backend is runnable
 ```
+
+## Advertised limits
+
+Each binary derives `maxNodes` and `maxEdges` at startup from the unified
+memory of the host and from the one-sweep limit of its kernels. The session
+admission applies the same capacity model and the same one-sweep rule, so
+`--capabilities` prints the limits that the session enforces.
+
+- `maxEdges` is the coupler count of the largest complete model that the
+  session admits.
+- `maxNodes` is the largest node count that the session admits for a model
+  with `maxEdges` couplers. The reference degree of that model is
+  `2 * maxEdges / maxNodes`.
+- Both corners hold at every read count from 32 to 256, at 64 betas, and on
+  every coefficient layout that the kernel runs.
+- The SA, Gibbs and MSA binaries advertise `maxDegree` 62, the sparse degree
+  limit of the weighted multi-spin kernel (`sampler::MSA_SPARSE_MAX_DEG`).
+- `quip-metal-otsuka` advertises `maxDegree` 128. Its plain jobs run on SA.
+  The SA one-sweep limit refuses some models with the SA `maxEdges` and a
+  mean degree between 62 and 128. For that reason, the Otsuka `maxEdges` is
+  the coupler count of the largest regular degree-128 model that the session
+  admits. Its `maxNodes` is the largest node count that the session admits
+  for a model with that many couplers.
+- `--max-nodes N` lowers `maxNodes`. A value of 0 or past the limit is a
+  configuration error (exit code 64), and the binary opens nothing.
+
+On the calibration host, an Apple M4 Max with a 40-core GPU and 128 GB of
+memory, the limits are:
+
+| Binary | `maxNodes` | `maxEdges` | Reference degree | `maxDegree` |
+|---|---:|---:|---:|---:|
+| `quip-metal-sa` | 41,647 | 998,991 | 48.0 | 62 |
+| `quip-metal-gibbs` | 5,684,919 | 1,398,628 | 0.49 | 62 |
+| `quip-metal-msa` | 13,724,198 | 11,992,753 | 1.75 | 62 |
+| `quip-metal-otsuka` | 60,743 | 952,896 | 31.4 | 128 |
+
+The session admits every model inside `maxNodes`, `maxEdges` and
+`maxDegree`. The test `every_shape_in_the_advertised_box_is_admitted`
+checks a grid over that box for all four binaries. For the SA, Gibbs, and MSA
+binaries, the harness refuses a model with a node past degree 62, which
+removes two kinds of refusal from inside the box:
+
+- A model past degree 62 runs only on dense-matrix storage. The one-sweep
+  limit holds a dense model to 1,414 nodes on SA, 1,673 on Gibbs and 4,898
+  on MSA, so the session refused a larger model past that degree.
+- The SA CSR one-sweep estimate refuses high mean degrees well below the
+  dense size: it refuses 7,025 nodes at a mean degree of 284.
+
+The memory model can still refuse a job at a corner while the multi-spin
+slot pools hold memory. That refusal is a non-fatal `Capacity` reject with
+one refund.
+
+The complete models that set `maxEdges` pass degree 62. They run only
+through the library API (`sample_ising`), not through a session.
+
+This table gives the largest admitted node count at a fixed regular degree.
+The capacity model computed it in 1 percent steps for an Apple M4 Max with a
+40-core GPU and 128 GB:
+
+| Binary | Degree 4 | Degree 20 | Degree 62 | Degree 200 |
+|---|---:|---:|---:|---:|
+| `quip-metal-sa` | 101,532 | 88,572 | 32,906 | 9,322 |
+| `quip-metal-gibbs` | 5,684,919 | 978,887 | 358,494 | 91,959 |
+| `quip-metal-msa` | 13,724,198 | 6,932,120 | 1,433,223 | 4,898 (dense) |
+
+The degree-200 column passes `maxDegree`, so it applies to the library API
+only. The Gibbs and MSA node limits extrapolate from the degree-4 points of
+the sweep-time tables. No measurement exists at 5,684,919 or 13,724,198
+nodes.
+
+The sweep-time tables come from that one GPU
+(`docs/perf/2026-11-metal-capacity.md`). On another chip, the limits scale
+only with the GPU core count. The scaling is conservative for a GPU with
+fewer cores, but not for a GPU whose cores are slower. The planner plans
+each chunk against 500 ms (`TARGET_DISPATCH_MS`), and the one-sweep limit
+keeps a measured chunk below 400 ms. The `TARGET_DISPATCH_MS` comment in
+`src/sampler.rs` records the macOS GPU watchdog and that MLX measured watchdog
+kills at about 1.2 s per operation with a display attached.
 
 ## Engine selection
 
@@ -112,10 +238,10 @@ annealing in `quip-solver-cuda`'s `quip-cuda-msa` and `quip-solver-cpu`'s
 annealing for Ising spin glasses*, Comput. Phys. Commun. 192, 2015). 32
 replicas share one 32-bit word per spin. The Metropolis test is an integer
 comparison against an inline geometric threshold draw. The kernel drives
-spins one colour class at a time, using the Advantage2 four-colouring by
-default and falling back to the greedy colouring the Gibbs kernel uses when
+spins one color class at a time, using the Advantage2 four-coloring by
+default and falling back to the greedy coloring the Gibbs kernel uses when
 the graph is not Advantage2. Set `QUIP_METAL_MSA_FOUR_COLOR` to `0`, `false`,
-or `off` (case-insensitive) to force the greedy colouring. One threadgroup
+or `off` (case-insensitive) to force the greedy coloring. One threadgroup
 anneals one 32-replica word of one problem in
 threadgroup memory. A 128-read job dispatches four threadgroups per problem.
 
@@ -152,17 +278,33 @@ See `tests/msa_bench.rs` for the commands to repeat each run.
 ## Tests
 
 ```sh
-cargo test --release
+cargo test -- --test-threads=1                       # the default run, as CI runs it (dev profile)
+cargo test --features long-tests -- --test-threads=1 # adds the tests that take more than ten seconds
 ```
 
-Conformance/golden and handshake tests drive the binary in isolation via
-`quip-solver-conformance`'s scripted driver and check energies against
-`conformance/golden_vectors.json`. The whole suite runs on a Mac with a Metal
-device; CI runs it on a macOS runner, which is the only configuration this
-crate builds in.
+To run the CI deadline check, build both binary profiles, then run the tests
+with the deadline variables:
 
-Two harnesses carry `#[ignore]` because they take minutes to hours of device
-time. `tests/msa_bench.rs` times one problem through both kernels at a job
+```sh
+cargo build --bins
+cargo build --release --bins
+RUSTC_BOOTSTRAP=1 \
+RUST_TEST_TIME_UNIT=10000,30000 \
+RUST_TEST_TIME_INTEGRATION=10000,30000 \
+RUST_TEST_TIME_DOCTEST=10000,30000 \
+cargo test -- --test-threads=1 -Z unstable-options --ensure-time
+```
+
+Conformance and handshake tests use the scripted driver from
+`quip-solver-conformance`. They check energies against
+`conformance/golden_vectors.json`. These tests need a Mac with a Metal device.
+CI uses a macOS runner and fails any test that takes more than 30 seconds.
+The default run skips tests that take more than ten seconds in a dev build.
+Run those tests with `--features long-tests` before a release.
+
+The measurement tests carry a plain `#[ignore]`, and `long-tests` does not
+run them. Each one takes minutes to hours of device time, or reports a timing
+instead of checking a property. Two examples follow. `tests/msa_bench.rs` times one problem through both kernels at a job
 shape the environment sets. `tests/probe_screen.rs` draws fresh nonces on the
 testnet's own instance distribution and runs each nonce through a list of
 read and sweep shapes. That measures what a short probe says about the full

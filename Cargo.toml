@@ -1,11 +1,11 @@
 [package]
 name = "quip-solver-metal"
-version = "0.4.1"
+version = "0.4.2-rc2"
 edition = "2021"
 # MSRV contract for consumers. `rust-toolchain.toml` pins the *build* toolchain
 # (1.97.1); this is the oldest compiler the crate is supported on.
 rust-version = "1.97"
-description = "Metal Ising miners: simulated annealing, multi-spin coded SA and heat-bath Gibbs (v0.3, Apple Silicon)"
+description = "Metal Ising miners: simulated annealing, multi-spin coded SA, heat-bath Gibbs and Otsuka cluster annealing (v0.3, Apple Silicon)"
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/quip.network/quip-solver-metal"
 
@@ -25,6 +25,10 @@ path = "src/bin/quip_metal_gibbs.rs"
 name = "quip-metal-msa"
 path = "src/bin/quip_metal_msa.rs"
 
+[[bin]]
+name = "quip-metal-otsuka"
+path = "src/bin/quip_metal_otsuka.rs"
+
 # The solver contract (quip-proto, quip-protocol, quip-solver-core) is
 # published to crates.io, from quip.network/quip-solver-core. The other miner
 # repositories consume the same published versions, so all backends resolve
@@ -32,7 +36,7 @@ path = "src/bin/quip_metal_msa.rs"
 # this one line covers all three.
 [dependencies]
 quip-solver-ane = { path = "crates/ane-miner" }
-quip-solver-core = "0.0.3"
+quip-solver-core = "0.0.11"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
@@ -45,18 +49,23 @@ io-kit-sys = "0.5"
 core-foundation-sys = "0.8"
 # Config parsing for apply_config (utilization/yielding schema).
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 # Parallel host scoring of a batch's samples; objc for the GPUStartTime/EndTime
 # command-buffer timestamps (no accessor in metal-rs 0.33).
 rayon = "1.10"
 objc = "0.2"
 
+# Opt-in coverage that takes more than ten seconds in a debug build. A plain
+# `cargo test` marks these tests `#[ignore]`; `--features long-tests` runs them.
+[features]
+long-tests = []
+
 [dev-dependencies]
-quip-solver-conformance = "0.0.3"
+quip-solver-conformance = "0.0.11"
 tonic = "=0.12.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "3.27.0"
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
 # Property tests in the unit tests of `src/streaming.rs` and `src/sampler.rs`.
 proptest = "1.11"

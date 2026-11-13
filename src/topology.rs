@@ -15,6 +15,51 @@
 
 use quip_solver_core::IsingGraph;
 
+#[cfg(test)]
+thread_local! {
+    static PAIR_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_pair_scan_count() {
+    PAIR_SCAN_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn pair_scan_count() -> usize {
+    PAIR_SCAN_COUNT.get()
+}
+
+/// Whether `graph` can use an `N * N` dense coupling matrix: no self-loop,
+/// and no pair of nodes coupled twice, in either orientation. A dense matrix
+/// holds one coefficient per pair, so a repeat would lose a term that CSR
+/// keeps.
+///
+/// The scan allocates one bit per matrix cell. Callers run it only when
+/// dense storage is already the cheaper choice, so the bitset stays small
+/// beside the CSR it replaces.
+pub(crate) fn dense_candidate(graph: &IsingGraph) -> bool {
+    #[cfg(test)]
+    PAIR_SCAN_COUNT.set(PAIR_SCAN_COUNT.get() + 1);
+    let n = graph.num_nodes();
+    let Some(cells) = n.checked_mul(n) else {
+        return false;
+    };
+    let mut seen = vec![0u8; cells.div_ceil(8)];
+    for &(u, v) in graph.edges.iter() {
+        if u == v || u >= n || v >= n {
+            return false;
+        }
+        let pair = u.min(v) * n + u.max(v);
+        let (byte, bit) = (pair / 8, 1u8 << (pair % 8));
+        if seen[byte] & bit != 0 {
+            return false;
+        }
+        seen[byte] |= bit;
+    }
+    true
+}
+
 /// Chromatic color-block partition of a CSR graph's dense node indices.
 ///
 /// `nodes` is grouped by color; `starts`/`counts` index into it per color.
@@ -232,6 +277,71 @@ impl SelfFeedingTopology {
         topology
     }
 
+    /// The colouring of [`Self::build_with_advantage2_coloring`] (when
+    /// `four_color` is set) or [`Self::build`], without the CSR arrays, for
+    /// the dense-matrix multi-spin kernel. `row_ptr`, `col_ind`, and
+    /// `edge_pos` are empty and `nnz` is 0. The greedy colouring depends on
+    /// each node's neighbour set and degree only, so a transient CSR in any
+    /// column order yields the colouring `build` gives.
+    pub(crate) fn colors_only(graph: &IsingGraph, four_color: bool) -> Self {
+        let n = graph.h.len();
+        if let Some(colors) = four_color.then(|| advantage2_color(graph)).flatten() {
+            return Self::without_csr(n, colors);
+        }
+        let mut row_ptr = vec![0i32; n + 1];
+        for &(u, v) in graph.edges.iter() {
+            if u >= n || v >= n {
+                continue;
+            }
+            row_ptr[u + 1] += 1;
+            if u != v {
+                row_ptr[v + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            row_ptr[i + 1] += row_ptr[i];
+        }
+        let mut next = row_ptr.clone();
+        let mut col_ind = vec![0i32; row_ptr[n] as usize];
+        for &(u, v) in graph.edges.iter() {
+            if u >= n || v >= n {
+                continue;
+            }
+            col_ind[next[u] as usize] = v as i32;
+            next[u] += 1;
+            if u != v {
+                col_ind[next[v] as usize] = u as i32;
+                next[v] += 1;
+            }
+        }
+        Self::without_csr(n, greedy_color(n, &row_ptr, &col_ind))
+    }
+
+    /// No CSR and no colours, for the dense-matrix SA kernel, which reads
+    /// neither. `colors.num_colors` is 0 and every array is empty.
+    pub(crate) fn bare(n: usize) -> Self {
+        Self::without_csr(
+            n,
+            ColorBlocks {
+                starts: Vec::new(),
+                counts: Vec::new(),
+                nodes: Vec::new(),
+                num_colors: 0,
+            },
+        )
+    }
+
+    fn without_csr(n: usize, colors: ColorBlocks) -> Self {
+        Self {
+            n,
+            nnz: 0,
+            row_ptr: Vec::new(),
+            col_ind: Vec::new(),
+            edge_pos: Vec::new(),
+            colors,
+        }
+    }
+
     /// Build CSR + coloring from a graph. `graph.edges` fixes the canonical
     /// edge order used by `edge_pos` (and thus by [`fill_h_j`] for this and
     /// every later job sharing this topology).
@@ -326,7 +436,7 @@ fn quantize_i8(v: f64) -> i8 {
 /// `graph` must share `topology`'s establishing edge list. `topology.edge_pos`
 /// is sized from that graph's `edges`, and this walks `edge_pos` positionally,
 /// so entry `k` is only meaningful when `graph.edges[k]` is the same edge.
-/// Callers ([`crate::sampler::encode_batch`]) guarantee this by batching on an
+/// Callers (`sampler::encode_batch`) guarantee this by batching on an
 /// identical `(n, edges)` key.
 ///
 /// # Panics
@@ -381,6 +491,32 @@ pub(crate) fn fill_h_j_wide(
         }
     }
     let h = graph.h.iter().map(|&v| to_milli(v).unwrap_or(0)).collect();
+    (j_csr, h)
+}
+
+/// [`fill_h_j`] for the Float32 kernels: each `f64` coefficient rounded to
+/// the nearest `f32`.
+///
+/// The caller has classified `graph`, which refuses any value past `f32::MAX`.
+pub(crate) fn fill_h_j_float(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut j_csr = vec![0_f32; topology.nnz];
+    for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
+        let Some(&(u, v)) = graph.edges.get(k) else {
+            continue;
+        };
+        if u >= topology.n || v >= topology.n {
+            continue;
+        }
+        let val = graph.j.get(k).copied().unwrap_or(0.0) as f32;
+        j_csr[pos_ij as usize] = val;
+        if u != v {
+            j_csr[pos_ji as usize] = val;
+        }
+    }
+    let h = graph.h.iter().map(|&v| v as f32).collect();
     (j_csr, h)
 }
 
@@ -449,6 +585,33 @@ fn fill_h_j_inspecting_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dense-matrix kernel keeps the sparse kernels' update order, so its
+    /// colouring must be the one the CSR build gives.
+    #[test]
+    fn colors_only_matches_the_csr_build() {
+        let n = 50;
+        let complete: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let circulant: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| (1..=10).map(move |d| (i, (i + d) % n)))
+            .collect();
+        // Edges in a scrambled order, so the transient CSR differs in order.
+        let mut scrambled = circulant.clone();
+        scrambled.reverse();
+        for edges in [complete, circulant, scrambled] {
+            let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+            let only = SelfFeedingTopology::colors_only(&graph, false);
+            assert_eq!(only.colors, SelfFeedingTopology::build(&graph).colors);
+            assert_eq!((only.n, only.nnz), (n, 0));
+            assert!(only.col_ind.is_empty() && only.edge_pos.is_empty());
+            assert_eq!(
+                SelfFeedingTopology::colors_only(&graph, true).colors,
+                SelfFeedingTopology::build_with_advantage2_coloring(&graph).colors
+            );
+        }
+    }
 
     #[test]
     fn matching_coefficients_require_exact_topology() {

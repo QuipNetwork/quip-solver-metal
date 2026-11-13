@@ -6,6 +6,10 @@
 //! one fixed order and accepts every flat move only shifts the ring's domain
 //! walls in step, so its reads keep the energy of their random start.
 
+use quip_solver_metal::capacity::Storage;
+use quip_solver_metal::metal_device::MetalDevice;
+use quip_solver_metal::sampler::{sample_ising, sample_ising_tuned, Kernel, Tuning};
+use quip_solver_metal::{IsingGraph, SampleParams};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -245,4 +249,209 @@ fn quip_metal_msa_visits_every_node_in_a_one_sweep_anneal() {
         &two_fields_one_sweep(),
     ));
     assert_eq!(got, vec![-2000; READS]);
+}
+
+/// Coupling of the Float32 ring: off the milli grid, so the classifier
+/// selects the Float32 build. The binaries refuse such a model, so the case
+/// calls the library.
+const FLOAT_J: f64 = 1.0005;
+
+/// Assert `kernel`'s Float32 build reaches the ground state of the zero-field
+/// ring, every bond satisfied at `-16 * FLOAT_J`.
+fn assert_float_build_anneals_the_zero_field_ring(kernel: Kernel) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![FLOAT_J; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 1000,
+        sweeps_per_beta: 1,
+        seed: 7,
+        ..Default::default()
+    };
+    let reads = sample_ising(&dev, &graph, &params, kernel).unwrap();
+    assert_eq!(reads.len(), READS, "{kernel:?}");
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "{kernel:?} Float32: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn float_sa_anneals_the_zero_field_ring() {
+    assert_float_build_anneals_the_zero_field_ring(Kernel::Sa);
+}
+
+#[test]
+fn float_msa_anneals_the_zero_field_ring() {
+    assert_float_build_anneals_the_zero_field_ring(Kernel::Msa);
+}
+
+/// Assert the QUIP_MSA_SPILL build reaches the ground state of the zero-field
+/// ring with coupling `j`, with `shared_spins_cap` words in threadgroup memory
+/// and the rest spilled, and that sweep windows of one sweep return the same
+/// reads. 1.5 takes the milli lane and `FLOAT_J` the Float32 lane.
+fn assert_spill_build_anneals_the_zero_field_ring(j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 256,
+        sweeps_per_beta: 4,
+        seed: 7,
+        ..Default::default()
+    };
+    let run = |planning_rate| {
+        let tuning = Tuning {
+            shared_spins_cap: Some(NODES / 4),
+            planning_rate,
+            ..Tuning::default()
+        };
+        sample_ising_tuned(&dev, &graph, &params, Kernel::Msa, tuning).unwrap()
+    };
+    // One command buffer, then one sweep per command buffer.
+    let whole = run(Some(1e18));
+    assert_eq!(whole.plan.len(), 1, "j {j}");
+    let windows = run(Some(1.0));
+    assert_eq!(windows.plan.len(), params.num_sweeps, "j {j}");
+    assert_eq!(
+        windows.reads, whole.reads,
+        "j {j}: windows change the reads"
+    );
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = whole
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "spill j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn msa_spill_build_anneals_the_zero_field_ring() {
+    assert_spill_build_anneals_the_zero_field_ring(1.5);
+}
+
+#[test]
+fn msa_float_spill_build_anneals_the_zero_field_ring() {
+    assert_spill_build_anneals_the_zero_field_ring(FLOAT_J);
+}
+
+/// Assert the QUIP_SA_GLOBAL build reaches the ground state of the zero-field
+/// ring with coupling `j`, and that sweep windows of one sweep return the same
+/// reads. 1 takes the int8 build, 1000 the wide build and `FLOAT_J` the
+/// Float32 build.
+fn assert_sa_global_build_anneals_the_zero_field_ring(j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 256,
+        sweeps_per_beta: 4,
+        seed: 7,
+        ..Default::default()
+    };
+    let run = |planning_rate| {
+        let tuning = Tuning {
+            sa_global: true,
+            planning_rate,
+            ..Tuning::default()
+        };
+        sample_ising_tuned(&dev, &graph, &params, Kernel::Sa, tuning).unwrap()
+    };
+    // One command buffer, then one sweep per command buffer.
+    let whole = run(Some(1e18));
+    assert_eq!(whole.plan.len(), 1, "j {j}");
+    let windows = run(Some(1.0));
+    assert_eq!(windows.plan.len(), params.num_sweeps, "j {j}");
+    assert_eq!(
+        windows.reads, whole.reads,
+        "j {j}: windows change the reads"
+    );
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = whole
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "SA global j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn sa_global_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_sa_global_build_anneals_the_zero_field_ring(j);
+    }
+}
+
+/// Assert `kernel`'s dense-matrix build reaches the ground state of the
+/// zero-field ring with coupling `j`. A zero-field complete bipartite model
+/// anneals without the node left out, so it cannot show the rule; the ring,
+/// forced onto the matrix, does.
+fn assert_dense_build_anneals_the_zero_field_ring(kernel: Kernel, j: f64) {
+    if MetalDevice::device_count() == 0 {
+        return;
+    }
+    let dev = MetalDevice::open(0).unwrap();
+    let edges: Vec<(usize, usize)> = (0..NODES).map(|i| (i, (i + 1) % NODES)).collect();
+    let graph = IsingGraph::new(vec![0.0; NODES], vec![j; NODES], edges.clone());
+    let params = SampleParams {
+        num_reads: READS,
+        num_sweeps: 1000,
+        sweeps_per_beta: 1,
+        seed: 7,
+        ..Default::default()
+    };
+    let tuning = Tuning {
+        force_dense: true,
+        ..Tuning::default()
+    };
+    let out = sample_ising_tuned(&dev, &graph, &params, kernel, tuning).unwrap();
+    assert_eq!(out.storage, Storage::Dense, "{kernel:?} j {j}");
+    let satisfied = |spins: &[i8]| edges.iter().filter(|&&(u, v)| spins[u] != spins[v]).count();
+    let at_ground = out
+        .reads
+        .iter()
+        .filter(|r| satisfied(&r.spins) == NODES)
+        .count();
+    assert!(
+        at_ground >= MIN_GROUND_READS,
+        "dense {kernel:?} j {j}: {at_ground}/{READS} reads at the ground state"
+    );
+}
+
+#[test]
+fn sa_dense_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_dense_build_anneals_the_zero_field_ring(Kernel::Sa, j);
+    }
+}
+
+#[test]
+fn msa_dense_build_anneals_the_zero_field_ring() {
+    for j in [1.0, 1000.0, FLOAT_J] {
+        assert_dense_build_anneals_the_zero_field_ring(Kernel::Msa, j);
+    }
 }

@@ -224,9 +224,14 @@ and returns each job's credit after its committed chunk finishes.
   `num_problems * num_reads`. Persistent: `num_streams * N * 4` bytes of
   state, `num_streams * 256 * 16` bytes of RNG.
 - **Validation.** `MSA_MAX_NODES = 6016` (compile-time asserted against the
-  32 KB cap), CSR degree at most 20 (`TooLarge`, so the coordinator routes
-  the job elsewhere), and `N * 4 + static <= max_threadgroup_memory_length`
-  on the opened device.
+  32 KB cap) is the threadgroup limit, not a refusal. A model with more
+  nodes spills its spin words past threadgroup memory. The weighted lanes
+  (milli and Float32) walk each row in chunks of 20 neighbours, up to 62
+  neighbours (`MSA_SPARSE_MAX_DEG`). The unit kernel admits 20. A denser
+  complete model goes to dense storage. A model that fits no tier returns
+  `TooLarge`, so the coordinator routes the job elsewhere. On the
+  threadgroup tier, `N * 4 + static <= max_threadgroup_memory_length` on
+  the opened device.
 - **Chunk rate.** `MSA_OCCUPANCY_CURVE` records word-updates/s at each
   occupancy. It shares interpolation with the simulated annealing kernel.
   The curve scales toward zero below its first point. It stays flat for
@@ -253,8 +258,12 @@ and returns each job's credit after its committed chunk finishes.
   Rates were 13.64, 14.23, 12.16, 11.57, and 10.85 jobs/s at T=1, 2, 4, 6,
   and 8. T=1 is the smallest within 10% of the peak at T=2.
   `batch_size_for_reads(Kernel::Msa, reads)` divides the budget by `words`.
-- **Identity.** `METAL_MSA_IDENTITY`: backend `metal`, algorithm `msa`,
-  `max_nodes = MSA_MAX_NODES`, features `streaming` and `governor`. Adapt
+- **Identity.** `metal_msa_identity(limits, cap)`: `Backend::Metal`,
+  `Algorithm::Msa`, features `streaming` and `governor`. `max_nodes` is
+  `capacity::advertised_nodes` and `max_edges` is
+  `capacity::advertised_couplers`. Both come from the unified memory of the
+  host and the one-sweep limit, as the README section "Advertised limits"
+  describes. The degree bound is `sampler::MSA_SPARSE_MAX_DEG` (62). Adapt
   envelope `4096..14336` sweeps, with `64` reads fixed at two words.
   On the same fixture and machine, the 2026-09-15 reference reached 1.02
   jobs/s at 2048 sweeps and 256 reads, using its production T=6.

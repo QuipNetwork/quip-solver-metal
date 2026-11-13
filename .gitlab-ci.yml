@@ -33,16 +33,30 @@ cache:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
 
-# Lint, format and the full test suite, including the tests that need a real
-# GPU. The runner is a Mac with Metal, so nothing is skipped.
+# Lint, format and the fast test suite, including the tests that need a real
+# GPU. The runner is a Mac with Metal, so no device test is skipped. Tests that
+# take more than ten seconds sit behind the `long-tests` feature. The deadline
+# is ten seconds as a warning and thirty seconds as a failure for every test.
 test:
   extends: .macos
   stage: test
+  timeout: 30m
+  variables:
+    # libtest's --ensure-time is unstable and requires RUSTC_BOOTSTRAP.
+    RUSTC_BOOTSTRAP: "1"
+    RUST_TEST_TIME_UNIT: "10000,30000"
+    RUST_TEST_TIME_INTEGRATION: "10000,30000"
+    RUST_TEST_TIME_DOCTEST: "10000,30000"
   script:
     - rustup component add clippy rustfmt
     - cargo fmt --check
     - cargo clippy --all-targets --all-features -- -D warnings
-    - cargo test
+    - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    # The conformance and lease tests build the binaries themselves; building
+    # them here, in the same profile, keeps that build out of the test times.
+    - cargo build --bins
+    - cargo build --release --bins
+    - cargo test -- --test-threads=1 -Z unstable-options --ensure-time
 
 .build:
   stage: build
@@ -62,6 +76,7 @@ build-macos-arm64:
     - cp target/release/quip-metal-sa dist/quip-metal-sa-darwin-arm64
     - cp target/release/quip-metal-gibbs dist/quip-metal-gibbs-darwin-arm64
     - cp target/release/quip-metal-msa dist/quip-metal-msa-darwin-arm64
+    - cp target/release/quip-metal-otsuka dist/quip-metal-otsuka-darwin-arm64
 
 # On a tag: upload the built binaries to the generic package registry, then cut
 # a Release linking them as downloadable assets. `build-macos-arm64` is not
@@ -98,4 +113,5 @@ release:
       release-cli create --name "quip-solver-metal ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
         --assets-link "{\"name\":\"quip-metal-sa-darwin-arm64\",\"url\":\"${base}/quip-metal-sa-darwin-arm64\"}" \
         --assets-link "{\"name\":\"quip-metal-gibbs-darwin-arm64\",\"url\":\"${base}/quip-metal-gibbs-darwin-arm64\"}" \
-        --assets-link "{\"name\":\"quip-metal-msa-darwin-arm64\",\"url\":\"${base}/quip-metal-msa-darwin-arm64\"}"
+        --assets-link "{\"name\":\"quip-metal-msa-darwin-arm64\",\"url\":\"${base}/quip-metal-msa-darwin-arm64\"}" \
+        --assets-link "{\"name\":\"quip-metal-otsuka-darwin-arm64\",\"url\":\"${base}/quip-metal-otsuka-darwin-arm64\"}"

@@ -18,7 +18,7 @@
 //! `Sampler::sample_stream`; every Metal object stays on that thread.
 
 use crate::metal_device::MetalDevice;
-use crate::sampler::{self, kernel_max_nodes, Kernel};
+use crate::sampler::{self, Kernel};
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleError, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
@@ -31,7 +31,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 /// correctness.
 const DEFAULT_GPU_CORES: usize = 10;
 
-/// Backend-facing read cap for [`crate::MetalSampler::max_reads`] (mirrors CUDA).
+/// Batches the stream keeps on the GPU at once ([`run_stream`]).
+pub(crate) const STREAM_IN_FLIGHT: usize = 2;
+
+/// Backend-facing read cap for `MetalSampler::max_reads` (mirrors CUDA).
 ///
 /// # Examples
 ///
@@ -207,7 +210,7 @@ pub fn declared_stream_width(kernel: Kernel) -> usize {
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight.
 ///
-/// Sized from [`nominal_reads`] because it is fixed at startup, before any job
+/// Sized from `nominal_reads` because it is fixed at startup, before any job
 /// reveals its read count. Two batches' worth, so the harness buffers the next
 /// batch while one dispatches.
 ///
@@ -259,11 +262,7 @@ fn representation(
     job: &StreamJob,
     kernel: Kernel,
 ) -> Option<crate::representation::Representation> {
-    if kernel == Kernel::Msa {
-        crate::representation::classify_msa(&job.graph).ok()
-    } else {
-        crate::representation::classify(&job.graph).ok()
-    }
+    crate::sampler::kernel_representation(&job.graph, kernel).ok()
 }
 
 impl<'a> BatchKey<'a> {
@@ -353,6 +352,10 @@ struct StreamCtx<'a> {
     /// Reseed watermark: job watermarks at or below it were abandoned by the
     /// coordinator and must not consume GPU time.
     cancel: &'a CancelToken,
+    /// The job in `pending` fails beside a second batch in flight but may
+    /// pass alone, so it waits for the GPU to empty and runs as the only
+    /// batch.
+    solo_next: bool,
 }
 
 impl StreamCtx<'_> {
@@ -457,10 +460,6 @@ fn next_seed(ctx: &mut StreamCtx<'_>, seed: Seed) -> Option<StreamJob> {
             answer_empty(ctx.out, job);
             continue;
         }
-        if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) {
-            send_reject(ctx.out, job, SampleError::Capacity);
-            continue;
-        }
         return Some(job);
     }
 }
@@ -490,9 +489,6 @@ fn fill_batch(
         match ctx.jobs.try_recv() {
             Ok(job) if ctx.cancel.is_cancelled(job.watermark) => send_cancelled(ctx.out, job),
             Ok(job) if job.graph.num_nodes() == 0 => answer_empty(ctx.out, job),
-            Ok(job) if job.graph.num_nodes() > kernel_max_nodes(ctx.kernel) => {
-                send_reject(ctx.out, job, SampleError::Capacity)
-            }
             Ok(job) if key.matches(&job, ctx.kernel) => {
                 matches.push(job);
                 last_arrival = Instant::now();
@@ -517,6 +513,8 @@ fn fill_batch(
 struct InFlight {
     encoded: sampler::EncodedBatch,
     jobs: Vec<StreamJob>,
+    /// The batch runs alone: the stream forms no second batch beside it.
+    solo: bool,
 }
 
 impl InFlight {
@@ -550,6 +548,7 @@ pub fn run_stream(
         kernel,
         gov,
         cancel,
+        solo_next: false,
     };
 
     // Each batch owns at most one committed chunk. Alternate batches so host
@@ -561,7 +560,7 @@ pub fn run_stream(
     while let Some(mut current) = inflight.pop_front() {
         // Never wait for another seed while a batch holds coordinator credits.
         // During throttling, drain both batches before the next yield gate.
-        if inflight.is_empty() && !ctx.gov.should_throttle() {
+        if inflight.is_empty() && !current.solo && !ctx.gov.should_throttle() {
             if let Some(next) = form_and_commit(device, &mut ctx, Seed::NonBlocking) {
                 inflight.push_back(next);
             }
@@ -600,6 +599,10 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         if ctx.out.is_closed() {
             return None;
         }
+        // A job that must run alone waits until no batch is in flight.
+        if seed == Seed::NonBlocking && ctx.solo_next {
+            return None;
+        }
         // Yield before taking a seed, not after: once a job is dequeued it is ours
         // to answer, and holding it through a pause would stall the coordinator's
         // credit for no benefit.
@@ -608,6 +611,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
             return None;
         }
         let seed_job = next_seed(ctx, seed)?;
+        ctx.solo_next = false;
         // Batch size follows the seed's read count: chromatic Gibbs spends
         // `num_reads` threadgroups per problem, so the same threadgroup budget is a
         // different number of problems at 64 reads than at 256.
@@ -618,6 +622,27 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         // whole duration of the dispatch rather than only in the gaps.
         let nominal = batch_size_for_reads(ctx.kernel, seed_job.params.num_reads);
         let cap = scale_budget(nominal, ctx.gov.budget_scale());
+        // Fewer problems when one sweep of the whole batch, beside the other
+        // batch in flight, would pass the chunk limit. The rest of the queue
+        // waits for the next batches.
+        let (cap, in_flight) = match sampler::one_sweep_problem_cap(
+            &seed_job.graph,
+            &seed_job.params,
+            ctx.kernel,
+            STREAM_IN_FLIGHT,
+            cap,
+        ) {
+            Some(cap) => (cap, STREAM_IN_FLIGHT),
+            // The seed fails beside a second batch. It waits for the batch in
+            // flight to finish, then runs alone, and the admission refuses it
+            // only if it fails alone, as `sample_ising` does.
+            None if seed == Seed::NonBlocking => {
+                *ctx.pending = Some(seed_job);
+                ctx.solo_next = true;
+                return None;
+            }
+            None => (1, 1),
+        };
         // Keep `seed_job` live while `key` borrows its edge list; collect further
         // matches into a side vec, then assemble the full batch.
         let mut matches = Vec::with_capacity(cap.saturating_sub(1));
@@ -655,7 +680,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
         }
         let encoded = {
             let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel, 2)
+            sampler::encode_batch(device, &graphs, &batch[0].params, ctx.kernel, in_flight)
         };
         match encoded {
             Ok(enc) => {
@@ -666,15 +691,16 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
                 let mut inflight = InFlight {
                     encoded: enc,
                     jobs: batch,
+                    solo: in_flight == 1,
                 };
                 inflight.commit_next(ctx.cancel);
                 return Some(inflight);
             }
             Err(e) => {
                 // Every job in a batch shares the encode inputs that can be
-                // refused for size (`num_sweeps` is part of the batch key, and `N`
-                // is pre-filtered by `next_seed`), so a capacity refusal applies to
-                // all of them alike — reject the batch with the condition the
+                // refused for size (the batch key holds the topology and
+                // `num_sweeps`), so a capacity refusal applies to all of them
+                // alike — reject the batch with the condition the
                 // failure actually carries rather than a blanket `DeviceFault`.
                 let err = e.to_sample_error();
                 tracing::error!(error = %e, ?err, "metal batch encode failed");
@@ -694,7 +720,7 @@ fn form_and_commit(device: &MetalDevice, ctx: &mut StreamCtx<'_>, seed: Seed) ->
 /// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
 /// batch's overlap with host work on either side.
 fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>, cancel: &CancelToken) -> u64 {
-    let InFlight { encoded, jobs } = inflight;
+    let InFlight { encoded, jobs, .. } = inflight;
 
     encoded.wait_until_completed();
     let device_access_time_us = encoded.gpu_time_us();
@@ -859,6 +885,7 @@ mod tests {
                 let mut inflight = InFlight {
                     encoded,
                     jobs: vec![first, second],
+                    solo: false,
                 };
                 let cancel = CancelToken::default();
                 if committed {
@@ -943,6 +970,130 @@ mod tests {
             );
             assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
         }
+    }
+
+    /// A queue of jobs that pass alone but not in one full batch runs in
+    /// several capped batches, and no job is rejected: 240 SA jobs of 4,593
+    /// nodes, mean degree 150 and 256 reads. Run:
+    /// `cargo test --release --lib a_queue_past_one_sweep -- --ignored`.
+    #[test]
+    #[ignore = "seconds of device time and host scoring; see the doc comment"]
+    fn a_queue_past_one_sweep_runs_in_several_batches() {
+        struct CountBatches(std::cell::Cell<usize>);
+        impl GpuGovernor for CountBatches {
+            fn should_throttle(&self) -> bool {
+                false
+            }
+            fn budget_scale(&self) -> f64 {
+                self.0.set(self.0.get() + 1);
+                1.0
+            }
+            fn record_gpu_busy_us(&self, _: u64) {}
+        }
+        let n = sampler::kernel_max_nodes(Kernel::Sa);
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=75).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j: Vec<f64> = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let graph = IsingGraph::new(vec![0.0; n], j, edges);
+        let jobs = 240;
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(jobs);
+        for index in 0..jobs {
+            let id = format!("job-{index}");
+            job_tx
+                .blocking_send(job(id.as_bytes(), graph.clone(), 256, 2, 1))
+                .unwrap();
+        }
+        drop(job_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(jobs);
+        let gov = CountBatches(std::cell::Cell::new(0));
+        let device = MetalDevice::open(0).unwrap();
+        run_stream(
+            &device,
+            Kernel::Sa,
+            job_rx,
+            &out_tx,
+            &gov,
+            &CancelToken::default(),
+        );
+        let mut completed = 0;
+        while let Ok(result) = out_rx.try_recv() {
+            let StreamOutcome::Completed(Ok(samples)) = result.outcome else {
+                panic!(
+                    "{:?} was not completed",
+                    String::from_utf8_lossy(&result.job_id)
+                );
+            };
+            assert_eq!(samples.len(), 256);
+            completed += 1;
+        }
+        assert_eq!(completed, jobs);
+        // One `budget_scale` call per formed batch. The cap depends on the
+        // host's core count, so the count comes from the same function.
+        let params = params(256, 2, 1);
+        let nominal = batch_size_for_reads(Kernel::Sa, 256);
+        let cap =
+            sampler::one_sweep_problem_cap(&graph, &params, Kernel::Sa, STREAM_IN_FLIGHT, nominal)
+                .unwrap();
+        assert!(cap < jobs, "{cap}");
+        assert_eq!(gov.0.get(), jobs.div_ceil(cap), "cap {cap}");
+        // The stream exposes no per-chunk timings, only each job's share of
+        // its batch's GPU time, so this test cannot check the longest chunk.
+        // `the_stream_cap_splits_a_batch_whose_jobs_pass_alone` checks that a
+        // batch at the cap passes the one-sweep admission.
+    }
+
+    /// A Gibbs job that fails beside a second batch in flight but passes
+    /// alone (4,800 nodes, mean degree 1,200, 256 reads) waits for the batch
+    /// in flight, runs as the only batch, and completes. The job after it
+    /// streams as before.
+    #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
+    fn a_job_that_passes_only_alone_runs_as_the_only_batch() {
+        let n = sampler::kernel_max_nodes(Kernel::Gibbs);
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| (1..=600).map(move |k| (u, (u + k) % n)))
+            .collect();
+        let j: Vec<f64> = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let dense = IsingGraph::new(vec![0.0; n], j, edges);
+        let small = IsingGraph::new(vec![1.0; 1024], vec![], vec![]);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(3);
+        job_tx
+            .blocking_send(job(b"before", small.clone(), 64, 64, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"alone", dense, 256, 4, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"after", small, 64, 32, 1))
+            .unwrap();
+        drop(job_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(3);
+        let device = MetalDevice::open(0).unwrap();
+        run_stream(
+            &device,
+            Kernel::Gibbs,
+            job_rx,
+            &out_tx,
+            &NoGovernor,
+            &CancelToken::default(),
+        );
+        for (id, reads) in [(&b"before"[..], 64), (b"alone", 256), (b"after", 64)] {
+            let result = out_rx.try_recv().unwrap();
+            assert_eq!(result.job_id, id);
+            let StreamOutcome::Completed(Ok(samples)) = result.outcome else {
+                panic!("{} was not completed", String::from_utf8_lossy(id));
+            };
+            assert_eq!(samples.len(), reads);
+        }
+        assert!(matches!(out_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -1059,6 +1210,33 @@ mod tests {
             assert!(!BatchKey::from_job(&int8, kernel).matches(&wide, kernel));
             assert!(BatchKey::from_job(&int8, kernel)
                 .matches(&job(b"same", ring(1.0), 16, 64, 1), kernel));
+        }
+    }
+
+    #[test]
+    fn batch_key_refuses_float32_coefficients_outside_the_device_range() {
+        let valid = job(
+            b"valid",
+            IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]),
+            16,
+            64,
+            1,
+        );
+        let invalid = job(
+            b"invalid",
+            IsingGraph::new(
+                vec![f64::from(f32::MAX) * 2.0, 0.0],
+                vec![1.0],
+                vec![(0, 1)],
+            ),
+            16,
+            64,
+            1,
+        );
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert!(representation(&valid, kernel).is_some(), "{kernel:?}");
+            assert!(representation(&invalid, kernel).is_none(), "{kernel:?}");
+            assert!(!BatchKey::from_job(&valid, kernel).matches(&invalid, kernel));
         }
     }
 
@@ -1259,6 +1437,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         // Empty job is answered inline; channel then closes → None.
         assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
@@ -1279,42 +1458,49 @@ mod tests {
         assert_eq!(r.device_access_time_us, 0);
     }
 
+    /// The stream refuses a model only when the capacity model or the
+    /// one-sweep limit refuses it: a complete Int32 SA model of 1,415 nodes
+    /// runs only on dense-matrix storage, where one sweep is estimated past
+    /// 400 ms. The ring after it still completes.
     #[test]
-    fn next_seed_rejects_too_large() {
-        let n = kernel_max_nodes(Kernel::Sa) + 1;
-        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(4);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
-        let huge = job(
-            b"huge",
-            IsingGraph::new(vec![0.0; n], vec![], vec![]),
-            1,
-            64,
-            1,
-        );
-        job_tx.blocking_send(huge).unwrap();
+    fn run_stream_rejects_a_model_the_capacity_model_refuses() {
+        let device = MetalDevice::open(0).unwrap();
+        let n = 1_415;
+        let edges: Vec<(usize, usize)> = (0..n)
+            .flat_map(|u| ((u + 1)..n).map(move |v| (u, v)))
+            .collect();
+        let j = (0..edges.len())
+            .map(|k| if k % 2 == 0 { 1.3 } else { -0.127 })
+            .collect();
+        let complete = IsingGraph::new(vec![0.0; n], j, edges);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        job_tx
+            .blocking_send(job(b"huge", complete, 64, 32, 1))
+            .unwrap();
+        job_tx
+            .blocking_send(job(b"ring", ring4(), 64, 32, 1))
+            .unwrap();
         drop(job_tx);
-
-        let mut pending = None;
-        let mut ctx = StreamCtx {
-            jobs: &mut job_rx,
-            out: &out_tx,
-            pending: &mut pending,
-            kernel: Kernel::Sa,
-            gov: &NoGovernor,
-            cancel: &CancelToken::default(),
-        };
-        assert!(next_seed(&mut ctx, Seed::Blocking).is_none());
-
-        let Some(r) = out_rx.blocking_recv() else {
-            assert_eq!("got", "TooLarge reject on out channel");
-            return;
-        };
-        assert_eq!(r.job_id, b"huge");
-        let is_too_large = matches!(
-            r.outcome,
-            StreamOutcome::Completed(Err(SampleError::Capacity))
+        run_stream(
+            &device,
+            Kernel::Sa,
+            job_rx,
+            &out_tx,
+            &NoGovernor,
+            &CancelToken::default(),
         );
-        assert!(is_too_large, "expected Capacity, got unexpected reject/ok");
+        drop(out_tx);
+        let rejected = out_rx.blocking_recv().expect("huge rejection");
+        assert_eq!(rejected.job_id, b"huge");
+        assert!(matches!(
+            rejected.outcome,
+            StreamOutcome::Completed(Err(SampleError::Capacity))
+        ));
+        let completed = out_rx.blocking_recv().expect("ring result after rejection");
+        assert_eq!(completed.job_id, b"ring");
+        assert!(matches!(completed.outcome, StreamOutcome::Completed(Ok(_))));
+        assert!(out_rx.blocking_recv().is_none());
     }
 
     #[test]
@@ -1322,10 +1508,16 @@ mod tests {
         let device = MetalDevice::open(0).unwrap();
         let (job_tx, job_rx) = tokio::sync::mpsc::channel(2);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        // Past the weighted lane's 62 neighbours, and a repeated coupler
+        // keeps it off dense-matrix storage, so capacity on MSA.
+        let leaves = crate::sampler::MSA_SPARSE_MAX_DEG;
         let star = IsingGraph::new(
-            vec![0.0; 22],
-            vec![1.0; 21],
-            (1..=21).map(|leaf| (0, leaf)).collect(),
+            vec![0.0; leaves + 1],
+            vec![1.0; leaves + 1],
+            (1..=leaves)
+                .map(|leaf| (0, leaf))
+                .chain(std::iter::once((0, 1)))
+                .collect(),
         );
         job_tx.blocking_send(job(b"star", star, 64, 32, 1)).unwrap();
         job_tx
@@ -1370,6 +1562,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         assert!(next_seed(&mut ctx, Seed::NonBlocking).is_none());
     }
@@ -1390,6 +1583,7 @@ mod tests {
             kernel: Kernel::Sa,
             gov: &NoGovernor,
             cancel: &CancelToken::default(),
+            solo_next: false,
         };
         let Some(got) = next_seed(&mut ctx, Seed::Blocking) else {
             assert_eq!("got", "in-range seed job");

@@ -1,0 +1,866 @@
+[
+  {
+    "file": "family-b-draw000-factor.qmodel",
+    "n": 44,
+    "energy": -0.001102230746388432,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.4980662099987967
+  },
+  {
+    "file": "family-b-draw001-factor.qmodel",
+    "n": 44,
+    "energy": -0.001459821202372207,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.5345732269925065
+  },
+  {
+    "file": "family-b-draw002-factor.qmodel",
+    "n": 44,
+    "energy": -0.0007551027461879807,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.1681548680062406
+  },
+  {
+    "file": "family-b-draw003-factor.qmodel",
+    "n": 44,
+    "energy": -0.00042158772896432186,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.0191617579985177
+  },
+  {
+    "file": "family-b-draw004-factor.qmodel",
+    "n": 44,
+    "energy": -0.00048616627614008444,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.686973775998922
+  },
+  {
+    "file": "family-b-draw005-factor.qmodel",
+    "n": 44,
+    "energy": -0.0006581956352350266,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5372125379944919
+  },
+  {
+    "file": "family-b-draw006-factor.qmodel",
+    "n": 44,
+    "energy": -0.0004783764765387949,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.9754961010039551
+  },
+  {
+    "file": "family-b-draw007-factor.qmodel",
+    "n": 44,
+    "energy": -0.0007989260748207526,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.356576296995627
+  },
+  {
+    "file": "family-b-draw008-factor.qmodel",
+    "n": 44,
+    "energy": -0.0010904768312378515,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 5.455831381987082
+  },
+  {
+    "file": "family-b-draw009-factor.qmodel",
+    "n": 44,
+    "energy": -0.0010238919679312975,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 5.689299750010832
+  },
+  {
+    "file": "family-b-draw010-factor.qmodel",
+    "n": 44,
+    "energy": -0.0009322952587912896,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.9345702869904926
+  },
+  {
+    "file": "family-b-draw011-factor.qmodel",
+    "n": 44,
+    "energy": -0.00013175272076131623,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.1557111229922157
+  },
+  {
+    "file": "family-b-draw012-factor.qmodel",
+    "n": 56,
+    "energy": -0.0013312282522445452,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 32.848957189009525
+  },
+  {
+    "file": "family-b-draw013-factor.qmodel",
+    "n": 56,
+    "energy": -0.0006393446556463509,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 13.477809938005521
+  },
+  {
+    "file": "family-b-draw014-factor.qmodel",
+    "n": 56,
+    "energy": -0.000448411619470473,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 15.908473897987278
+  },
+  {
+    "file": "family-b-draw015-factor.qmodel",
+    "n": 56,
+    "energy": -0.0009383654408614813,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 16.975342521007406
+  },
+  {
+    "file": "family-b-draw016-factor.qmodel",
+    "n": 56,
+    "energy": -0.00027762351703695113,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 18.916774994999287
+  },
+  {
+    "file": "family-b-draw017-factor.qmodel",
+    "n": 56,
+    "energy": -0.0003466984730321414,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.954204161011148
+  },
+  {
+    "file": "family-b-draw018-factor.qmodel",
+    "n": 56,
+    "energy": -0.0006768924290684169,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 14.866710126996622
+  },
+  {
+    "file": "family-b-draw019-factor.qmodel",
+    "n": 56,
+    "energy": -0.0006600068096422789,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 9.907669235995854
+  },
+  {
+    "file": "family-b-draw020-factor.qmodel",
+    "n": 56,
+    "energy": -0.00042418688768426177,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 27.302432893993682
+  },
+  {
+    "file": "family-b-draw021-factor.qmodel",
+    "n": 56,
+    "energy": -0.0003150900908186877,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 6.202937291993294
+  },
+  {
+    "file": "family-b-draw022-factor.qmodel",
+    "n": 56,
+    "energy": -0.00040130985221053394,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 6.536915794000379
+  },
+  {
+    "file": "family-b-draw023-factor.qmodel",
+    "n": 56,
+    "energy": -0.0004935962712270664,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 9.650919966006768
+  },
+  {
+    "file": "family-b2-draw000-factor.qmodel",
+    "n": 44,
+    "energy": -0.00039721478821445406,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.5319007969956147
+  },
+  {
+    "file": "family-b2-draw001-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005317918891632836,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.8521284400048899
+  },
+  {
+    "file": "family-b2-draw002-factor.qmodel",
+    "n": 44,
+    "energy": -0.0012740769051607804,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.2007383430027403
+  },
+  {
+    "file": "family-b2-draw003-factor.qmodel",
+    "n": 44,
+    "energy": -0.0016889962057348587,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 5.478231330998824
+  },
+  {
+    "file": "family-b2-draw004-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005277352913771708,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.3162382950104075
+  },
+  {
+    "file": "family-b2-draw005-factor.qmodel",
+    "n": 44,
+    "energy": -0.00033906460251308357,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5796836840017932
+  },
+  {
+    "file": "family-b2-draw006-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005372538110887293,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5005329949926818
+  },
+  {
+    "file": "family-b2-draw007-factor.qmodel",
+    "n": 44,
+    "energy": -0.0006166884772712839,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.2574705059960252
+  },
+  {
+    "file": "family-b2-draw008-factor.qmodel",
+    "n": 44,
+    "energy": -0.00071068604353871,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.7388590040063718
+  },
+  {
+    "file": "family-b2-draw009-factor.qmodel",
+    "n": 44,
+    "energy": -0.0011403661405286376,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 8.447228981007356
+  },
+  {
+    "file": "family-b2-draw010-factor.qmodel",
+    "n": 44,
+    "energy": -0.00029246139087691416,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.0701578320004046
+  },
+  {
+    "file": "family-b2-draw011-factor.qmodel",
+    "n": 44,
+    "energy": -0.000547988621828279,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.870316587999696
+  },
+  {
+    "file": "family-b2-draw012-factor.qmodel",
+    "n": 44,
+    "energy": -0.0006729142185579664,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.0823604949982837
+  },
+  {
+    "file": "family-b2-draw013-factor.qmodel",
+    "n": 44,
+    "energy": -0.00031147398615394235,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.6533037530025467
+  },
+  {
+    "file": "family-b2-draw014-factor.qmodel",
+    "n": 44,
+    "energy": -0.001080065188432256,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.343361223000102
+  },
+  {
+    "file": "family-b2-draw015-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005831843855428147,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.130645009005093
+  },
+  {
+    "file": "family-b2-draw016-factor.qmodel",
+    "n": 44,
+    "energy": -0.00037276469118576995,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 6.710063442005776
+  },
+  {
+    "file": "family-b2-draw017-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005437494097512713,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.973840617996757
+  },
+  {
+    "file": "family-b2-draw018-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005598389065284723,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.4296914409933379
+  },
+  {
+    "file": "family-b2-draw019-factor.qmodel",
+    "n": 44,
+    "energy": -0.0003593103736846069,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5933519209938822
+  },
+  {
+    "file": "family-b2-draw020-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005153701461090419,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.762663065994275
+  },
+  {
+    "file": "family-b2-draw021-factor.qmodel",
+    "n": 44,
+    "energy": -0.0004314862486851074,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.0164696860010736
+  },
+  {
+    "file": "family-b2-draw022-factor.qmodel",
+    "n": 44,
+    "energy": -0.00024557172162006767,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 5.507771213000524
+  },
+  {
+    "file": "family-b2-draw023-factor.qmodel",
+    "n": 44,
+    "energy": -0.0011988559110150327,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.3279037570027867
+  },
+  {
+    "file": "family-b2-draw024-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005169043293230419,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.3762992480042158
+  },
+  {
+    "file": "family-b2-draw025-factor.qmodel",
+    "n": 44,
+    "energy": -0.0004945432908629444,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5974968280061148
+  },
+  {
+    "file": "family-b2-draw026-factor.qmodel",
+    "n": 44,
+    "energy": -0.0008852629578116663,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.496348389002378
+  },
+  {
+    "file": "family-b2-draw027-factor.qmodel",
+    "n": 44,
+    "energy": -0.00047448296590966397,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.2745180369965965
+  },
+  {
+    "file": "family-b2-draw028-factor.qmodel",
+    "n": 44,
+    "energy": -0.0007717438312968948,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.1011238009959925
+  },
+  {
+    "file": "family-b2-draw029-factor.qmodel",
+    "n": 44,
+    "energy": -0.0014757555246575425,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.9127850489894627
+  },
+  {
+    "file": "family-b2-draw030-factor.qmodel",
+    "n": 44,
+    "energy": -0.0009278492145893017,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.2129432700021425
+  },
+  {
+    "file": "family-b2-draw031-factor.qmodel",
+    "n": 44,
+    "energy": -0.0008012504764215512,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5185524200060172
+  },
+  {
+    "file": "family-b2-draw032-factor.qmodel",
+    "n": 44,
+    "energy": -0.000595373664068613,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.246957467010361
+  },
+  {
+    "file": "family-b2-draw033-factor.qmodel",
+    "n": 44,
+    "energy": -0.000496197986506816,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9537353769992478
+  },
+  {
+    "file": "family-b2-draw034-factor.qmodel",
+    "n": 44,
+    "energy": -0.000462102242403108,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.515378016993054
+  },
+  {
+    "file": "family-b2-draw035-factor.qmodel",
+    "n": 44,
+    "energy": -0.0012282574356036655,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9024613590008812
+  },
+  {
+    "file": "family-b2-draw036-factor.qmodel",
+    "n": 44,
+    "energy": -0.001138881527935225,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.742621063996921
+  },
+  {
+    "file": "family-b2-draw037-factor.qmodel",
+    "n": 44,
+    "energy": -0.001142125010690862,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.246035725998809
+  },
+  {
+    "file": "family-b2-draw038-factor.qmodel",
+    "n": 44,
+    "energy": -0.0010164215074834869,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9216674579947721
+  },
+  {
+    "file": "family-b2-draw039-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005922749566881793,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.437249319991679
+  },
+  {
+    "file": "family-b2-draw040-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005731644700015864,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5892064479994588
+  },
+  {
+    "file": "family-b2-draw041-factor.qmodel",
+    "n": 44,
+    "energy": -0.00035205083076385947,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.003685982999741
+  },
+  {
+    "file": "family-b2-draw042-factor.qmodel",
+    "n": 44,
+    "energy": -0.0002895692912734476,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.505838330995175
+  },
+  {
+    "file": "family-b2-draw043-factor.qmodel",
+    "n": 44,
+    "energy": -0.0005388624657119445,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.0404812689957907
+  },
+  {
+    "file": "family-b2-draw044-factor.qmodel",
+    "n": 44,
+    "energy": -0.001403007526946832,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.247601905008196
+  },
+  {
+    "file": "family-b2-draw045-factor.qmodel",
+    "n": 44,
+    "energy": -0.000670453076182763,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5154272499930812
+  },
+  {
+    "file": "family-b2-draw046-factor.qmodel",
+    "n": 44,
+    "energy": -0.0006806252630606803,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.33047178099513985
+  },
+  {
+    "file": "family-b2-draw047-factor.qmodel",
+    "n": 44,
+    "energy": -0.00042000430964521244,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5419754200120224
+  },
+  {
+    "file": "family-b2-draw048-factor.qmodel",
+    "n": 32,
+    "energy": -0.0006409331984139687,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.682135273003951
+  },
+  {
+    "file": "family-b2-draw049-factor.qmodel",
+    "n": 32,
+    "energy": -0.0011036021062938164,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.1905919150012778
+  },
+  {
+    "file": "family-b2-draw050-factor.qmodel",
+    "n": 32,
+    "energy": -3.9552946880141776e-05,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.7611531709990231
+  },
+  {
+    "file": "family-b2-draw051-factor.qmodel",
+    "n": 32,
+    "energy": -0.0010252100522742693,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.11954685399541631
+  },
+  {
+    "file": "family-b2-draw052-factor.qmodel",
+    "n": 32,
+    "energy": -0.000753181485156295,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5320480800000951
+  },
+  {
+    "file": "family-b2-draw053-factor.qmodel",
+    "n": 32,
+    "energy": -0.00020231385720618055,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9823087419936201
+  },
+  {
+    "file": "family-b2-draw054-factor.qmodel",
+    "n": 32,
+    "energy": -0.0005873043908611974,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.1245055670005968
+  },
+  {
+    "file": "family-b2-draw055-factor.qmodel",
+    "n": 32,
+    "energy": -0.00029682727332711636,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.48704459601140115
+  },
+  {
+    "file": "family-b2-draw056-factor.qmodel",
+    "n": 32,
+    "energy": -0.00024484556206872727,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.5369055199989816
+  },
+  {
+    "file": "family-b2-draw057-factor.qmodel",
+    "n": 32,
+    "energy": -0.0011401971580638304,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.947094367002137
+  },
+  {
+    "file": "family-b2-draw058-factor.qmodel",
+    "n": 32,
+    "energy": -0.0003011781733079821,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.18265144199540373
+  },
+  {
+    "file": "family-b2-draw059-factor.qmodel",
+    "n": 32,
+    "energy": -0.00010384672630342109,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.8835845549911028
+  },
+  {
+    "file": "family-b2-draw060-factor.qmodel",
+    "n": 36,
+    "energy": -0.0009493030096516752,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.0597017359978054
+  },
+  {
+    "file": "family-b2-draw061-factor.qmodel",
+    "n": 36,
+    "energy": -0.0006330209085058623,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.23837826799717732
+  },
+  {
+    "file": "family-b2-draw062-factor.qmodel",
+    "n": 36,
+    "energy": -0.00045977722490663783,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 4.016858791001141
+  },
+  {
+    "file": "family-b2-draw063-factor.qmodel",
+    "n": 36,
+    "energy": -0.0012932159759817552,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.7402971879928373
+  },
+  {
+    "file": "family-b2-draw064-factor.qmodel",
+    "n": 36,
+    "energy": -0.00044233992103057134,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.204810932991677
+  },
+  {
+    "file": "family-b2-draw065-factor.qmodel",
+    "n": 36,
+    "energy": -0.00012721168299982942,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.105444544009515
+  },
+  {
+    "file": "family-b2-draw066-factor.qmodel",
+    "n": 36,
+    "energy": -0.0011595255096215286,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.4179054819978774
+  },
+  {
+    "file": "family-b2-draw067-factor.qmodel",
+    "n": 36,
+    "energy": -0.000793050640367418,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.6381271779973758
+  },
+  {
+    "file": "family-b2-draw068-factor.qmodel",
+    "n": 36,
+    "energy": -0.0007464745359157249,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.18608623900217935
+  },
+  {
+    "file": "family-b2-draw069-factor.qmodel",
+    "n": 36,
+    "energy": -0.0006269257494384057,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.20425949899072293
+  },
+  {
+    "file": "family-b2-draw070-factor.qmodel",
+    "n": 36,
+    "energy": -0.0006761803128444289,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.16703581500041764
+  },
+  {
+    "file": "family-b2-draw071-factor.qmodel",
+    "n": 36,
+    "energy": -0.0007122301525727194,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.16445638101140503
+  },
+  {
+    "file": "family-b2-draw072-factor.qmodel",
+    "n": 40,
+    "energy": -0.0012499488954980883,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.2090595409972593
+  },
+  {
+    "file": "family-b2-draw073-factor.qmodel",
+    "n": 40,
+    "energy": -0.0008979501361441498,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.5919967439986067
+  },
+  {
+    "file": "family-b2-draw074-factor.qmodel",
+    "n": 40,
+    "energy": -0.0006477940351061494,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.1848760170105379
+  },
+  {
+    "file": "family-b2-draw075-factor.qmodel",
+    "n": 40,
+    "energy": -0.00043321852465038273,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.8404977199970745
+  },
+  {
+    "file": "family-b2-draw076-factor.qmodel",
+    "n": 40,
+    "energy": -0.0004562757000049055,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.8371630320034456
+  },
+  {
+    "file": "family-b2-draw077-factor.qmodel",
+    "n": 40,
+    "energy": -0.0006395065576666991,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 1.4431764079927234
+  },
+  {
+    "file": "family-b2-draw078-factor.qmodel",
+    "n": 40,
+    "energy": -0.0009119740438992967,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.721612366993213
+  },
+  {
+    "file": "family-b2-draw079-factor.qmodel",
+    "n": 40,
+    "energy": -0.00018477442574678114,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.4441734430001816
+  },
+  {
+    "file": "family-b2-draw080-factor.qmodel",
+    "n": 40,
+    "energy": -0.0009682824777048379,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9360917409940157
+  },
+  {
+    "file": "family-b2-draw081-factor.qmodel",
+    "n": 40,
+    "energy": -0.0008779561520486391,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 0.9950875409995206
+  },
+  {
+    "file": "family-b2-draw082-factor.qmodel",
+    "n": 40,
+    "energy": -0.0005457010021203556,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 2.582926827002666
+  },
+  {
+    "file": "family-b2-draw083-factor.qmodel",
+    "n": 40,
+    "energy": -0.002225608316465709,
+    "gap": 0.0,
+    "status": "optimal",
+    "seconds": 3.2836824980040547
+  }
+]

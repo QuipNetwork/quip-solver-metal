@@ -559,6 +559,10 @@ mod tests {
     /// The prefilter keeps exactly the salts that pass stage F on the host,
     /// and reports every salt once, in order, across chunks and lanes.
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     fn prefilter_keeps_the_salts_stage_f_passes() {
         if crate::metal_device::MetalDevice::device_count() == 0 {
             return;

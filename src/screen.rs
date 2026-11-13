@@ -136,7 +136,7 @@ impl ScreenBank {
                 "screen spin words exceed threadgroup memory".into(),
             ));
         }
-        let cached = device.topology_cache.get_or_build(device, graph, true);
+        let cached = device.topology_cache.get_or_build(device, graph, true)?;
         let nnz = cached.topo.nnz;
         let edges = cached.topo.edge_pos.len();
         let row_words = if draw.is_some() {
@@ -166,14 +166,14 @@ impl ScreenBank {
         ];
         let buffers: Vec<_> = sizes
             .into_iter()
-            .map(|(index, bytes)| (index, device.buffer_pool.take(&device.device, bytes)))
-            .collect();
+            .map(|(index, bytes)| Ok((index, device.buffer_pool.take(&device.device, bytes)?)))
+            .collect::<Result<_, SampleError>>()?;
         let pairs: Vec<[u32; 2]> = cached.topo.edge_pos.iter().map(|&(a, b)| [a, b]).collect();
-        let edge_pos = device.device.new_buffer_with_data(
+        let edge_pos = sampler::checked_buffer(device.device.new_buffer_with_data(
             pairs.as_ptr().cast(),
             (std::mem::size_of_val(pairs.as_slice()) as u64).max(8),
             metal::MTLResourceOptions::StorageModeShared,
-        );
+        ))?;
         let threads = MSA_THREADS
             .min(device.msa_screen.max_total_threads_per_threadgroup() as usize)
             .max(1);
@@ -197,6 +197,16 @@ impl ScreenBank {
             offset += schedule.len();
         }
         Ok(bank)
+    }
+
+    /// Bytes owned by this bank, excluding its shared topology.
+    fn allocated_bytes(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|(_, buffer)| buffer)
+            .chain(std::iter::once(&self.edge_pos))
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -435,6 +445,21 @@ impl<T> Screener<T> {
             gates: gates.to_vec(),
             seed: 1,
         })
+    }
+
+    /// Device bytes retained by both banks, counting their shared topology once.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let cached = &self.banks[0].cached;
+        let topology = cached
+            .colors
+            .iter()
+            .chain([&cached.row, &cached.col])
+            .map(|buffer| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add);
+        self.banks
+            .iter()
+            .map(ScreenBank::allocated_bytes)
+            .fold(topology, usize::saturating_add)
     }
 
     /// Whether a model row fits this screener.
@@ -732,7 +757,10 @@ mod tests {
             quip_solver_core::BetaSchedule::Geometric,
         )
         .0;
-        let cached = device.topology_cache.get_or_build(&device, &topology, true);
+        let cached = device
+            .topology_cache
+            .get_or_build(&device, &topology, true)
+            .unwrap();
         for allowed_j in [vec![-1i8, 1], vec![1, -1], vec![-1, 1, 1]] {
             let draw = Draw {
                 first_word: n as u32,

@@ -117,6 +117,18 @@ impl CombinedSampler {
         }
     }
 
+    /// The IOKit governor of the Metal engine. Opens the engine when no job
+    /// has opened it yet, because the governor starts with it. Once the
+    /// engine is open this only reads it. The error is the cached open
+    /// failure.
+    pub(crate) fn governor(&self) -> Result<&crate::iokit_gov::UtilGovernor, SampleError> {
+        match self.metal.get() {
+            Some(Ok(metal)) => Ok(&metal.gov),
+            Some(Err(error)) => Err(SampleError::DeviceFault(error.clone())),
+            None => self.metal().map(|metal| &metal.gov),
+        }
+    }
+
     pub(crate) fn check(&self) -> Result<(), OpenError> {
         let cfg = settings(&self.settings);
         if cfg.enable_metal {
@@ -285,6 +297,8 @@ struct EdgeFacts {
     /// No self-loop and no repeated undirected edge. Only meaningful in bounds.
     simple: bool,
     /// No node has more than 20 in-bounds incident edges; a self-loop counts once.
+    /// The ANE's degree bound. Metal admits a denser MSA model through the
+    /// capacity model instead.
     degree_ok: bool,
 }
 
@@ -350,15 +364,29 @@ fn eligibility(
         return [false, false];
     }
     let n = graph.h.len();
+    // An MSA model past the unit kernel's nodes runs on the batch path's
+    // spill build, which the resident runner bounds by its capacity
+    // footprint. Metal takes such a model only when the ANE cannot.
+    let spill = kernel == Kernel::Msa && n > crate::sampler::kernel_max_nodes(kernel);
+    // Every kernel runs a model past its frame on a spill build that the
+    // capacity footprint bounds.
     let mut metal = cfg.enable_metal
-        && n <= crate::sampler::kernel_max_nodes(kernel)
-        && graph.edges.len() <= crate::DEFAULT_MAX_EDGES as usize
+        && n <= crate::capacity::MAX_NODES
+        && graph.edges.len() <= crate::advertised_edges(kernel)
         && params.num_sweeps <= crate::sampler::MAX_SWEEPS;
-    metal &= if kernel == Kernel::Msa {
-        crate::representation::classify_msa(graph).is_ok()
-    } else {
-        crate::representation::classify(graph).is_ok()
-    };
+    metal &= crate::sampler::kernel_representation(graph, kernel).is_ok_and(|rep| {
+        if !metal || rep != crate::representation::Representation::Float32 {
+            return true;
+        }
+        let (beta, _) = crate::sampler::build_beta_schedule(
+            graph,
+            params.num_sweeps,
+            params.sweeps_per_beta,
+            params.beta_range,
+            params.schedule,
+        );
+        crate::sampler::check_float_schedule(graph, &beta).is_ok()
+    });
     let mut ane = cfg.enable_ane
         && kernel == Kernel::Msa
         && n <= 16_384
@@ -381,8 +409,14 @@ fn eligibility(
         return [metal, false];
     }
     let facts = edge_facts.get(n, &graph.edges);
-    if kernel == Kernel::Msa {
-        metal &= facts.degree_ok;
+    // A model past the unit lane's degree or nodes runs on the batch path:
+    // Metal takes it when the capacity model admits it, on the tier it
+    // routes to (dense-matrix storage included), within the one-sweep limit.
+    // A unit-lane model skips the check, which costs about 350 µs on
+    // Advantage2; the resident runner still refuses it as `Capacity` if it
+    // does not fit.
+    if metal && (!facts.degree_ok || spill) {
+        metal = crate::sampler::admit_one(graph, params, kernel).is_ok();
     }
     ane &= facts.in_bounds && facts.simple;
     if ane && facts.degree_ok {
@@ -409,7 +443,7 @@ fn eligibility(
             }
         }
     }
-    [metal, ane]
+    [metal && !(spill && ane), ane]
 }
 
 trait StreamEngine: Sync {
@@ -1279,6 +1313,33 @@ mod tests {
         }
     }
 
+    /// Each kernel's Metal gate refuses one coupler past the advertised
+    /// `max_edges`, and SA and Gibbs admit the limit. The couplers repeat one
+    /// pair, which the edge count gate reads only by count.
+    #[test]
+    fn the_metal_gate_refuses_one_edge_past_the_advertised_limit() {
+        let mut j = job(0);
+        let cfg = config(true, false);
+        let mut facts = EdgeFactsCache::default();
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            let limit = crate::advertised_edges(kernel);
+            j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0; limit + 1], vec![(0, 1); limit + 1]);
+            assert_eq!(
+                eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                [false, false],
+                "{kernel:?}"
+            );
+            if kernel != Kernel::Msa {
+                j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0; limit], vec![(0, 1); limit]);
+                assert_eq!(
+                    eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                    [true, false],
+                    "{kernel:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn admission_checks_each_engines_limits_without_dense_preparation() {
         let mut j = job(0);
@@ -1293,11 +1354,11 @@ mod tests {
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [true, false]
         );
-        // Off the milli grid: neither engine represents it.
+        // Off the milli grid: only the Metal float lane represents it.
         j.graph.j[0] = 0.0005;
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
         j.graph.j[0] = 1.0;
         j.params.num_reads = 129;
@@ -1306,34 +1367,111 @@ mod tests {
             [true, false]
         );
         j.params.num_reads = 128;
+        // Past the unit kernel's nodes, Metal takes the batch path's spill
+        // build, but only a model the ANE cannot take.
         j.graph = IsingGraph::new(vec![0.0; crate::sampler::MSA_MAX_NODES + 1], vec![], vec![]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
             [false, true]
         );
+        assert_eq!(
+            eligibility(
+                Kernel::Msa,
+                &j.graph,
+                &j.params,
+                config(true, false),
+                &mut facts
+            ),
+            [true, false]
+        );
         j.graph = IsingGraph::new(vec![0.0; 16_385], vec![], vec![]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
+        j.graph = IsingGraph::new(vec![0.5; 20_000], vec![], vec![]);
+        assert_eq!(
+            eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [true, false]
+        );
+        // Past the kernel's frame, SA and Gibbs run the batch path's spill
+        // build, which the capacity footprint bounds.
+        for kernel in [Kernel::Sa, Kernel::Gibbs] {
+            let n = crate::sampler::kernel_max_nodes(kernel) + 1;
+            j.graph = IsingGraph::new(vec![0.0; n], vec![], vec![]);
+            assert_eq!(
+                eligibility(kernel, &j.graph, &j.params, cfg, &mut facts),
+                [true, false],
+                "{kernel:?}"
+            );
+        }
         j.graph = IsingGraph::new(
             vec![0.0; 22],
             vec![1.0; 21],
             (1..22).map(|v| (0, v)).collect(),
         );
+        // Degree 21 is past the ANE's 20; Metal runs it on the weighted lane.
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, false]
+            [true, false]
         );
         j.graph.j.fill(0.0);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
-            [false, true]
+            [true, true]
         );
         // An endpoint past the nodes: no MSA path represents it.
         j.graph = IsingGraph::new(vec![0.0; 2], vec![1.0], vec![(0, 2)]);
         assert_eq!(
             eligibility(Kernel::Msa, &j.graph, &j.params, cfg, &mut facts),
+            [false, false]
+        );
+    }
+
+    /// A plain MSA job past the unit lane's degree 20 is Metal-eligible when
+    /// the capacity model admits it: degree 40 and 62 on the weighted lanes,
+    /// and degree 63 on dense-matrix storage. A degree-63 model with a
+    /// repeated coupler has no tier, and neither engine takes it.
+    #[test]
+    fn high_degree_msa_jobs_are_metal_eligible_by_the_capacity_model() {
+        let star = |leaves: usize| {
+            IsingGraph::new(
+                vec![0.0; leaves + 1],
+                vec![1.0; leaves],
+                (1..=leaves).map(|v| (0, v)).collect(),
+            )
+        };
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        for leaves in [40, 62, 63] {
+            for cfg in [config(true, true), config(true, false)] {
+                assert_eq!(
+                    eligibility(Kernel::Msa, &star(leaves), &params, cfg, &mut facts),
+                    [true, false],
+                    "degree {leaves}"
+                );
+            }
+        }
+        let repeated = IsingGraph::new(
+            vec![0.0; 64],
+            vec![1.0; 63],
+            (1..63)
+                .map(|v| (0, v))
+                .chain(std::iter::once((0, 1)))
+                .collect(),
+        );
+        assert_eq!(
+            eligibility(
+                Kernel::Msa,
+                &repeated,
+                &params,
+                config(true, true),
+                &mut facts
+            ),
             [false, false]
         );
     }
@@ -1348,15 +1486,57 @@ mod tests {
         };
         let mut facts = EdgeFactsCache::default();
         let off_step = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
+        let non_finite = IsingGraph::new(vec![f64::NAN, 0.0], vec![1.0], vec![(0, 1)]);
         assert_eq!(
-            eligibility(Kernel::Sa, &off_step, &params, cfg, &mut facts),
+            eligibility(Kernel::Msa, &non_finite, &params, cfg, &mut facts),
             [false, false]
         );
+        // Every kernel runs an off-step model on its Float32 build.
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert_eq!(
+                eligibility(kernel, &off_step, &params, cfg, &mut facts),
+                [true, false],
+                "{kernel:?}"
+            );
+        }
+        let unsafe_schedule = SampleParams {
+            beta_range: Some((2e38, 3e38)),
+            ..params.clone()
+        };
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert_eq!(
+                eligibility(kernel, &off_step, &unsafe_schedule, cfg, &mut facts),
+                [false, false],
+                "{kernel:?} must refuse a Float32 schedule whose double overflows"
+            );
+        }
         let pm1 = IsingGraph::new(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
         assert_eq!(
             eligibility(Kernel::Sa, &pm1, &params, cfg, &mut facts),
             [true, false]
         );
+    }
+
+    #[test]
+    fn the_metal_engine_refuses_float32_coefficients_outside_the_device_range() {
+        let graph = IsingGraph::new(
+            vec![f64::from(f32::MAX) * 2.0, 0.0],
+            vec![1.0],
+            vec![(0, 1)],
+        );
+        let params = SampleParams {
+            num_reads: 64,
+            num_sweeps: 64,
+            ..Default::default()
+        };
+        let mut facts = EdgeFactsCache::default();
+        for kernel in [Kernel::Sa, Kernel::Gibbs, Kernel::Msa] {
+            assert_eq!(
+                eligibility(kernel, &graph, &params, config(true, false), &mut facts),
+                [false, false],
+                "{kernel:?}"
+            );
+        }
     }
 
     #[test]

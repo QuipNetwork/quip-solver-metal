@@ -313,7 +313,20 @@ impl SlotPool {
             num_sweeps: 1,
             ..Default::default()
         };
-        sampler::validate_batch(&[graph], &params, Kernel::Msa)?;
+        // This checks the one-sweep limit for one problem, while the pool
+        // runs up to `capacity` slots at once. That is safe only because the
+        // unit lane (6,016 nodes or fewer, degree 20 or less) estimates a full
+        // pool at 1.7 ms or less. A larger lane needs the pool's real problems.
+        sampler::validate_batch_on_device(device, &[graph], &params, Kernel::Msa)?;
+        // The batch path spills a larger model; the slot kernel keeps every
+        // spin word in threadgroup memory, up to the advertised nodes.
+        let max_nodes = sampler::kernel_max_nodes(Kernel::Msa);
+        if graph.num_nodes() > max_nodes {
+            return Err(SampleError::TooLarge(format!(
+                "slot pool of {} nodes exceeds the unit kernel's {max_nodes}",
+                graph.num_nodes()
+            )));
+        }
         if graph.num_nodes() == 0 || num_reads == 0 || capacity == 0 || sched_stride == 0 {
             return Err(SampleError::TooLarge(
                 "slot pool dimensions must be nonzero".into(),
@@ -326,7 +339,7 @@ impl SlotPool {
                 "slot pool needs {need} B of threadgroup memory"
             )));
         }
-        let cached = device.topology_cache.get_or_build(device, graph, true);
+        let cached = device.topology_cache.get_or_build(device, graph, true)?;
         let words = num_reads.div_ceil(sampler::MSA_LANES);
         let threads = MSA_THREADS
             .min(device.msa_slots.max_total_threads_per_threadgroup() as usize)
@@ -354,8 +367,8 @@ impl SlotPool {
         ];
         let buffers = sizes
             .into_iter()
-            .map(|(index, bytes)| (index, device.buffer_pool.take(&device.device, bytes)))
-            .collect();
+            .map(|(index, bytes)| Ok((index, device.buffer_pool.take(&device.device, bytes)?)))
+            .collect::<Result<_, SampleError>>()?;
         Ok(Self {
             decode,
             cached,
@@ -409,6 +422,13 @@ impl SlotPool {
 
     pub(crate) fn capacity(&self) -> usize {
         self.slots.len()
+    }
+    /// Bytes of the device buffers this pool rents.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.buffers
+            .iter()
+            .map(|(_, buffer)| usize::try_from(buffer.length()).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add)
     }
     /// The span of the last retired step command, once.
     pub(crate) fn take_span(&mut self) -> Option<StepSpan> {
@@ -1528,6 +1548,28 @@ mod tests {
         pool.reads_many(&[4], 33).unwrap_err();
     }
 
+    #[test]
+    fn a_slot_pool_refuses_more_nodes_than_the_unit_kernel_runs() {
+        let Some(device) = device() else { return };
+        let ring = |n: usize| {
+            IsingGraph::new(
+                vec![1.0; n],
+                vec![-1.0; n],
+                (0..n).map(|i| (i, (i + 1) % n)).collect(),
+            )
+        };
+        let max = sampler::kernel_max_nodes(Kernel::Msa);
+        let pool = SlotPool::new(&device, &ring(max), READS, 1, 32).unwrap();
+        assert!(pool.allocated_bytes() > 0);
+        let Err(error) = SlotPool::new(&device, &ring(max + 1), READS, 1, 32) else {
+            panic!("a slot pool admitted {} nodes", max + 1);
+        };
+        assert!(
+            matches!(&error, SampleError::TooLarge(message) if message.contains("unit kernel")),
+            "{error:?}"
+        );
+    }
+
     fn device() -> Option<MetalDevice> {
         if MetalDevice::device_count() == 0 {
             #[expect(clippy::print_stderr, reason = "device tests report a sandbox skip")]
@@ -1898,6 +1940,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
     fn observe_points_write_output_without_becoming_checkpoints() {
         let Some(device) = device() else {
             return;
@@ -2002,7 +2048,22 @@ mod tests {
     }
 
     #[test]
-    fn observe_points_do_not_change_the_final_energies_or_spins() {
+    fn one_observe_point_does_not_change_the_final_energies_or_spins() {
+        observe_points_do_not_change_the_final_energies_or_spins(1);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "long-tests"),
+        ignore = "over 10 s in a debug build: run with --features long-tests"
+    )]
+    fn two_observe_points_do_not_change_the_final_energies_or_spins() {
+        observe_points_do_not_change_the_final_energies_or_spins(2);
+    }
+
+    /// `boundaries` is the number of `OBSERVE_INTERVAL` boundaries the anneal
+    /// crosses before its checkpoint.
+    fn observe_points_do_not_change_the_final_energies_or_spins(boundaries: usize) {
         let Some(device) = device() else {
             return;
         };
@@ -2010,7 +2071,7 @@ mod tests {
         // they only add output write-backs at extra step boundaries, which
         // the kernel already tolerates (every step resumes spins and RNG
         // from device memory regardless of where the previous one stopped).
-        let checkpoint = 2 * OBSERVE_INTERVAL + 17;
+        let checkpoint = boundaries * OBSERVE_INTERVAL + 17;
         let graph = advantage2_system1(11);
         let schedule: Arc<[f32]> = build_beta_schedule(
             &graph,

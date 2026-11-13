@@ -24,12 +24,35 @@ using namespace metal;
 //   persistent spin and RNG buffers.
 // - Geometric thresholds are drawn inline from a 32-bit RNG per word update.
 //
-// The host checks CSR degree <= MSA_MAX_DEG. The unit entries read each J and
-// h by sign, and the host sends them unit models only (J and h in {-1, 0, 1}).
+// The host checks CSR degree <= MSA_UNIT_MAX_DEG for the unit entries and
+// <= MSA_SPARSE_MAX_DEG for `msa_anneal_weighted`. The unit entries read each
+// J and h by sign, and the host sends them unit models only (J and h in
+// {-1, 0, 1}) of degree at most MSA_UNIT_MAX_DEG; a denser unit model takes
+// the weighted entry.
 // `msa_anneal_weighted` reads milli `int` coefficients and accepts each flip
 // against a host-built integer threshold row (`wide_tables::metropolis_rows`),
 // so it holds any model whose local fields fit `WIDE_MAX_FIELD_MILLI`; the
-// host scores its energies.
+// host scores its energies. A row of at most MSA_ROW_CHUNK neighbours takes
+// the one-chunk code. In the QUIP_MSA_DENSE build, which the host selects for
+// a model with a denser row, such a row takes `weighted_accept_dense`, which
+// walks it with `weighted_lane_fields` (after quip-solver-cuda 1ac73d5).
+// The QUIP_FLOAT build of `msa_anneal_weighted` (the float lane, after
+// quip-solver-cuda's QUIP_MSA_COEF_F32 lane) reads `float` coefficients,
+// sums each lane's local field in `float`, and walks every CSR row with
+// `weighted_lane_fields`. Each lane draws its
+// own uniform: one xoshiro128** draw per word update, as in the int lane,
+// hashed with the lane index. A lane flips where its energy change `de` is
+// at most zero or `beta * de < -log(u)`, the log form of `u < exp(-beta de)`,
+// so no `exp` sees an infinite argument. It has no threshold rows, and the
+// host scores its energies. Only the batch path sends it models; the slot
+// entry runs unit models only.
+// The QUIP_MSA_SPILL build of `msa_anneal_weighted` (after quip-solver-cuda
+// ffb9cc6) keeps spin words [0, shared_spins) in threadgroup memory and the
+// rest in the threadgroup's slice of `persistent_state` (`SplitSpins`); the
+// host selects it, with the dense-row code, for a model of more nodes than
+// threadgroup memory holds. `msa_anneal_weighted` also runs a window of
+// sweeps of a rung (buffers 28 and 29), so the host can split a rung that
+// would pass the dispatch budget.
 // The batch entry writes each read's energy on the last chunk;
 // slot steps write it at flagged checkpoints, in milli units to final_energies.
 // The value equals energy_milli whenever every
@@ -40,7 +63,14 @@ using namespace metal;
 #define MSA_PLANES     6
 #define MSA_MAX_COUNT  63
 #define MSA_MAX_FIELD  63
-#define MSA_MAX_DEG    20
+// Largest CSR degree of the unit entries: one unrolled prefetch of 20
+// neighbours, plus a field as the 21st `popcount21` input.
+#define MSA_UNIT_MAX_DEG   20
+// Largest CSR degree of `msa_anneal_weighted` (CUDA's MSA_MAX_DEG). The host
+// enforces it; the kernel walks any row in chunks of MSA_ROW_CHUNK.
+#define MSA_SPARSE_MAX_DEG 62
+// Neighbours the weighted row walk prefetches per chunk.
+#define MSA_ROW_CHUNK      MSA_UNIT_MAX_DEG
 // Threshold entries per rung for the weighted entry. Must equal
 // `wide_tables::WIDE_ROW`.
 #define WIDE_ROW       2048
@@ -216,23 +246,135 @@ struct ScreenCouplings {
     }
 };
 
+#ifdef QUIP_FLOAT
+// One model per word with `float` couplings and fields (the float lane).
+struct WeightedCouplings {
+    device const float* j;
+    device const float* h;
+    inline float field(int var) const { return h[var]; }
+    inline float coupling(int p) const { return j[p]; }
+};
+typedef float weighted_coef_t;
+typedef float weighted_field_t;
+#else
 // One model per word with milli `int` couplings and fields, plus the
 // batch's Metropolis threshold rows: one row of WIDE_ROW milli thresholds
 // per rung, accepting an uphill change `de` when `de <= entry`.
+#ifdef QUIP_WIDE_I8
+// The QUIP_WIDE_I8 build holds `h` and `J` as `int8_t` and multiplies by the
+// model's integer `scale` (buffer 26) on every read, so the fields and the
+// threshold test stay in milli `int` and the reads equal the plain build's.
+struct WeightedCouplings {
+    device const int8_t* j;
+    device const int8_t* h;
+    device const int* rows;
+    int scale;
+    inline int field(int var) const { return int(h[var]) * scale; }
+    inline int coupling(int p) const { return int(j[p]) * scale; }
+};
+typedef int8_t weighted_coef_t;
+typedef int weighted_field_t;
+#else
 struct WeightedCouplings {
     device const int* j;
     device const int* h;
     device const int* rows;
+    inline int field(int var) const { return h[var]; }
+    inline int coupling(int p) const { return j[p]; }
 };
+typedef int weighted_coef_t;
+typedef int weighted_field_t;
+#endif
+#endif
+
+// ==============================================================================
+// Spin stores
+// ==============================================================================
+// Where a threadgroup's spin words live. `TgSpins` keeps every word in
+// threadgroup memory (every unit entry, and the weighted entry when the
+// model fits). `SplitSpins` keeps words [0, k) in threadgroup memory and
+// words [k, N) in this threadgroup's slice of `persistent_state`, which the
+// kernel already holds for every node, so a spilled word needs no copy at a
+// chunk boundary. Placement changes neither the RNG stream nor the update
+// order, so a spilled run returns the reads of an all-threadgroup run.
+
+struct TgSpins {
+    threadgroup uint* tg;
+    inline uint get(int var) const { return tg[var]; }
+    inline void set(int var, uint word) const { tg[var] = word; }
+    // Words that live in threadgroup memory: every word.
+    inline int shared(int n) const { return n; }
+    inline void barrier() const { threadgroup_barrier(mem_flags::mem_threadgroup); }
+};
+
+struct SplitSpins {
+    threadgroup uint* tg;
+    device uint* spill;  // this threadgroup's persistent slice, indexed by node
+    int k;
+    inline uint get(int var) const { return (var < k) ? tg[var] : spill[var]; }
+    inline void set(int var, uint word) const {
+        if (var < k) {
+            tg[var] = word;
+        } else {
+            spill[var] = word;
+        }
+    }
+    inline int shared(int n) const { return min(k, n); }
+    // A spilled word another thread of this threadgroup wrote must be visible
+    // after the barrier, so the barrier orders device memory too.
+    inline void barrier() const {
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+};
+
+// The weighted row walk, shared by the float lane and the int lane's dense
+// rows: `field[lane]` becomes each lane's local field, `h` and then the CSR
+// slots [pstart, pend) in order, MSA_ROW_CHUNK slots per chunk. Each chunk
+// prefetches its couplings and neighbour words once, then adds them to the
+// 32 lane fields, which stay in registers. Slots past `pend` read node 0
+// with a zero coupling.
+template <typename Spins>
+inline void weighted_lane_fields(
+    thread weighted_field_t* field,
+    WeightedCouplings couplings,
+    device const int* my_csr_col_ind,
+    Spins state,
+    int var, int pstart, int pend
+) {
+    weighted_field_t h = couplings.field(var);
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        field[lane] = h;
+    }
+    for (int base = pstart; base < pend; base += MSA_ROW_CHUNK) {
+        weighted_field_t jj[MSA_ROW_CHUNK];
+        uint sw[MSA_ROW_CHUNK];
+        #pragma unroll
+        for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
+            int p = base + q;
+            bool ok = p < pend;
+            jj[q] = ok ? couplings.coupling(p) : weighted_field_t(0);
+            sw[q] = state.get(ok ? my_csr_col_ind[p] : 0);
+        }
+        for (int lane = 0; lane < MSA_LANES; ++lane) {
+            weighted_field_t f = field[lane];
+            #pragma unroll
+            for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
+                // Spin bit 1 is -1. Missing neighbours have J = 0.
+                f += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
+            }
+            field[lane] = f;
+        }
+    }
+}
 
 // Per-lane energy in milli of the spin words in `state` for the nodes this
 // thread owns (var = tid, tid + gsz, ...). h*spin*1000 per node plus one
 // directed CSR half-edge J*si*sj*500 per slot; a self-loop is stored once,
 // so it uses 1000.
-template <typename Couplings>
+template <typename Couplings, typename Spins>
 inline void lane_energies(
     thread int* ener,
-    threadgroup const uint* state,
+    Spins state,
     device const int* row_ptr,
     device const int* col_ind,
     Couplings couplings,
@@ -242,7 +384,7 @@ inline void lane_energies(
         ener[r] = 0;
     }
     for (uint var = tid; var < uint(n); var += gsz) {
-        int bi = int(state[var]);
+        int bi = int(state.get(int(var)));
         int pstart = row_ptr[var];
         int pend = row_ptr[var + 1];
         int h = couplings.field(int(var));
@@ -250,11 +392,11 @@ inline void lane_energies(
             int spin = ((bi >> r) & 1) ? -1 : 1;
             ener[r] += h * spin * 1000;
         }
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
             int p = pstart + q;
             if (p < pend && couplings.bond(p).nonzero) {
                 int nb = col_ind[p];
-                int nbword = int(state[nb]);
+                int nbword = int(state.get(nb));
                 int coeff = (nb == int(var)) ? 1000 : 500;
                 for (int r = 0; r < MSA_LANES; ++r) {
                     int spin = ((bi >> r) & 1) ? -1 : 1;
@@ -271,9 +413,10 @@ inline void lane_energies(
 // Count satisfied bonds bit-sliced: popcount21 gives each node's per-lane
 // count, and a 16-plane ripple add sums them, about 80 operations a node
 // instead of a loop over 32 lanes per slot.
+template <typename Spins>
 inline void lane_energies(
     thread int* ener,
-    threadgroup const uint* state,
+    Spins state,
     device const int* row_ptr,
     device const int* col_ind,
     ScreenCouplings couplings,
@@ -285,15 +428,15 @@ inline void lane_energies(
     }
     int slots = 0;
     for (uint var = tid; var < uint(n); var += gsz) {
-        uint bi = state[var];
+        uint bi = state.get(var);
         int pstart = row_ptr[var];
         int pend = row_ptr[var + 1];
-        uint x[MSA_MAX_DEG + 1];
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        uint x[MSA_UNIT_MAX_DEG + 1];
+        for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
             int p = pstart + q;
-            x[q] = (p < pend) ? (couplings.bond(p).neg ^ bi ^ state[col_ind[p]]) : 0u;
+            x[q] = (p < pend) ? (couplings.bond(p).neg ^ bi ^ state.get(col_ind[p])) : 0u;
         }
-        x[MSA_MAX_DEG] = 0u;
+        x[MSA_UNIT_MAX_DEG] = 0u;
         slots += pend - pstart;
         uint planes[MSA_PLANES];
         popcount21(x, planes);
@@ -316,9 +459,10 @@ inline void lane_energies(
 
 // Weighted energies can pass `int` range (fields reach WIDE_MAX_FIELD_MILLI
 // per node), so the host scores every weighted read and never reads these.
+template <typename Spins>
 inline void lane_energies(
     thread int* ener,
-    threadgroup const uint* state,
+    Spins state,
     device const int* row_ptr,
     device const int* col_ind,
     WeightedCouplings couplings,
@@ -331,12 +475,12 @@ inline void lane_energies(
 
 // Lanes of `var`'s word that flip this update. The unit overload counts
 // satisfied bonds bit-sliced and compares the count with a geometric draw.
-template <typename Couplings>
+template <typename Couplings, typename Spins>
 inline uint flip_mask(
     Couplings couplings,
     device const int* my_csr_row_ptr,
     device const int* my_csr_col_ind,
-    threadgroup const uint* state,
+    Spins state,
     int var, int beta_idx, float two_beta,
     thread RngState& rng
 ) {
@@ -347,11 +491,11 @@ inline uint flip_mask(
     // Prefetch every neighbour index and coupling before
     // touching threadgroup memory. Slots past the degree read
     // node 0 with a zero coupling and contribute nothing.
-    int nb[MSA_MAX_DEG];
-    uint neg[MSA_MAX_DEG];
-    bool nz[MSA_MAX_DEG];
+    int nb[MSA_UNIT_MAX_DEG];
+    uint neg[MSA_UNIT_MAX_DEG];
+    bool nz[MSA_UNIT_MAX_DEG];
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+    for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
         int p = pstart + q;
         bool ok = p < pend;
         Bond bond = ok ? couplings.bond(p) : Bond{0u, false};
@@ -360,19 +504,19 @@ inline uint flip_mask(
         nz[q] = bond.nonzero;
     }
 
-    uint bi = state[var];
-    uint x[MSA_MAX_DEG + 1];
+    uint bi = state.get(var);
+    uint x[MSA_UNIT_MAX_DEG + 1];
     int d = 0;
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-        uint sj = state[nb[q]];
+    for (int q = 0; q < MSA_UNIT_MAX_DEG; ++q) {
+        uint sj = state.get(nb[q]);
         // Set on the replicas where bond q is satisfied.
         uint l = neg[q] ^ bi ^ sj;
         x[q] = nz[q] ? l : 0u;
         d += int(nz[q]);
     }
     // A field is one more bond to a spin pinned at +1.
-    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
+    x[MSA_UNIT_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0u;
     d += (h != 0);
 
     uint planes[MSA_PLANES];
@@ -384,33 +528,123 @@ inline uint flip_mask(
     return (limit >= d) ? 0xFFFFFFFFu : le_constant(planes, limit);
 }
 
-// The weighted overload sums each lane's local field in milli and flips where
-// the energy change `de = -2 s field` is at most one threshold drawn from the
-// rung's row, shared by the word's 32 lanes as the unit draw is. Every entry
-// is non-negative, so a downhill or level move always flips. The host bounds
-// each field by WIDE_MAX_FIELD_MILLI, so `2 * field` stays inside `int`.
+#ifdef QUIP_FLOAT
+// The float lane's uniform for `lane`: a splitmix32 finaliser of the word
+// update's draw and the lane, so the 32 lanes draw independently (CUDA
+// 66d4b30: shared draws let real-valued replicas collapse into one minimum)
+// while the RNG stream advances once per word update. 23 bits keep
+// `k + 0.5f` exact, so u lies in (0, 1) (CUDA 02b5ac7).
+inline float lane_uniform(uint draw, int lane) {
+    uint z = (draw ^ uint(lane)) + 0x9e3779b9u;
+    z = (z ^ (z >> 16)) * 0x85ebca6bu;
+    z = (z ^ (z >> 13)) * 0xc2b2ae35u;
+    z ^= z >> 16;
+    return (float(z >> 9) + 0.5f) * 1.1920929e-7f;
+}
+
+// The float lane: each lane's local field sums `h` and then the CSR row in
+// order, in `float`. With `uphill = -s * field` for spin s, a lane flips
+// where `uphill <= 0` (`de = 2 * uphill <= 0`) or
+// `two_beta * uphill < -log(u)`, which is
+// `beta * de < -log(u)` with one product of two finite values. The host
+// refuses a beta past half of f32::MAX, so `two_beta` is finite, and a
+// field whose `2 * field` overflows, so the product is never `inf * 0`.
+// The product may round to infinity, and an infinite product only rejects
+// (or, for a negative beta, accepts) the flip, as `exp` would.
+template <typename Spins>
 inline uint flip_mask(
     WeightedCouplings couplings,
     device const int* my_csr_row_ptr,
     device const int* my_csr_col_ind,
-    threadgroup const uint* state,
+    Spins state,
     int var, int beta_idx, float two_beta,
     thread RngState& rng
 ) {
     int pstart = my_csr_row_ptr[var];
     int pend = my_csr_row_ptr[var + 1];
-    int h = couplings.h[var];
+    float field[MSA_LANES];
+    weighted_lane_fields(field, couplings, my_csr_col_ind, state, var, pstart, pend);
+    uint bi = state.get(var);
+    uint draw = xoshiro128starstar(rng);
 
-    int jj[MSA_MAX_DEG];
-    uint sw[MSA_MAX_DEG];
+    uint accept = 0u;
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        // -s * field, with s = -1 where bit 1 is set: de = -2 s field.
+        float uphill = ((bi >> uint(lane)) & 1u) ? field[lane] : -field[lane];
+        bool ok = uphill <= 0.0f;
+        if (!ok) {
+            ok = two_beta * uphill < -log(lane_uniform(draw, lane));
+        }
+        accept |= uint(ok) << uint(lane);
+    }
+    return accept;
+}
+#else
+// `flip_mask` for a row denser than MSA_ROW_CHUNK: the same fields, draw, and
+// threshold test as the one-chunk code. Integer sums are exact in any order,
+// so the chunking does not change the result. Only the QUIP_MSA_DENSE build
+// calls it, which the host selects for a model with a row denser than
+// MSA_ROW_CHUNK, so the default build (every Advantage2 model) compiles the
+// one-chunk code alone and keeps its registers and rate. The dense build may
+// therefore hold all 32 lane fields in registers and load each neighbour word
+// once; CUDA 1ac73d5's 8-lane groups, which reload the row for each group,
+// measured 1.4 to 1.7 times the GPU time here.
+template <typename Spins>
+inline uint weighted_accept_dense(
+    WeightedCouplings couplings,
+    device const int* my_csr_col_ind,
+    Spins state,
+    int var, int pstart, int pend, int beta_idx,
+    thread RngState& rng
+) {
+    uint bi = state.get(var);
+    uint draw = xoshiro128starstar(rng) & uint(WIDE_ROW - 1);
+    int threshold = couplings.rows[uint(beta_idx) * uint(WIDE_ROW) + draw];
+
+    int field[MSA_LANES];
+    weighted_lane_fields(field, couplings, my_csr_col_ind, state, var, pstart, pend);
+    uint accept = 0u;
+    for (int lane = 0; lane < MSA_LANES; ++lane) {
+        int de = ((bi >> uint(lane)) & 1u) ? 2 * field[lane] : -2 * field[lane];
+        accept |= uint(de <= threshold) << uint(lane);
+    }
+    return accept;
+}
+
+// The weighted overload sums each lane's local field in milli and flips where
+// the energy change `de = -2 s field` is at most one threshold drawn from the
+// rung's row, shared by the word's 32 lanes as the unit draw is. Every entry
+// is non-negative, so a downhill or level move always flips. The host bounds
+// each field by WIDE_MAX_FIELD_MILLI, so `2 * field` stays inside `int`.
+template <typename Spins>
+inline uint flip_mask(
+    WeightedCouplings couplings,
+    device const int* my_csr_row_ptr,
+    device const int* my_csr_col_ind,
+    Spins state,
+    int var, int beta_idx, float two_beta,
+    thread RngState& rng
+) {
+    int pstart = my_csr_row_ptr[var];
+    int pend = my_csr_row_ptr[var + 1];
+#ifdef QUIP_MSA_DENSE
+    if (pend - pstart > MSA_ROW_CHUNK) {
+        return weighted_accept_dense(couplings, my_csr_col_ind, state,
+                                     var, pstart, pend, beta_idx, rng);
+    }
+#endif
+    int h = couplings.field(var);
+
+    int jj[MSA_ROW_CHUNK];
+    uint sw[MSA_ROW_CHUNK];
     #pragma unroll
-    for (int q = 0; q < MSA_MAX_DEG; ++q) {
+    for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
         int p = pstart + q;
         bool ok = p < pend;
-        jj[q] = ok ? couplings.j[p] : 0;
-        sw[q] = state[ok ? my_csr_col_ind[p] : 0];
+        jj[q] = ok ? couplings.coupling(p) : 0;
+        sw[q] = state.get(ok ? my_csr_col_ind[p] : 0);
     }
-    uint bi = state[var];
+    uint bi = state.get(var);
 
     uint draw = xoshiro128starstar(rng) & uint(WIDE_ROW - 1);
     int threshold = couplings.rows[uint(beta_idx) * uint(WIDE_ROW) + draw];
@@ -419,7 +653,7 @@ inline uint flip_mask(
     for (int lane = 0; lane < MSA_LANES; ++lane) {
         int field = h;
         #pragma unroll
-        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+        for (int q = 0; q < MSA_ROW_CHUNK; ++q) {
             // Spin bit 1 is -1. Missing neighbours have J = 0.
             field += ((sw[q] >> uint(lane)) & 1u) ? -jj[q] : jj[q];
         }
@@ -428,6 +662,7 @@ inline uint flip_mask(
     }
     return accept;
 }
+#endif
 
 // ==============================================================================
 // Kernel
@@ -437,9 +672,10 @@ inline uint flip_mask(
 // closes every class so no thread reads a neighbour mid-update. Buffer
 // indices 0..15 match every other kernel in this crate, 16..18 and 20 match
 // the Gibbs colour-block bindings, 19 carries `words`, and 21..24 match the
-// Gibbs chunk bindings.
+// Gibbs chunk bindings. The weighted entry adds 27..29: `shared_spins` and
+// the sweep window.
 
-template <typename Couplings>
+template <typename Couplings, typename Spins>
 static inline void msa_body(
     device const int* my_csr_row_ptr,
     device const int* my_csr_col_ind,
@@ -454,11 +690,11 @@ static inline void msa_body(
     device const int* color_block_starts,
     device const int* color_block_counts,
     device const int* color_node_indices,
-    int N, int num_reads, int num_colors, int sweeps_per_beta,
+    int N, int num_reads, int num_colors, int sweeps_per_beta, int sweep_start, int sweep_end,
     int beta_start, int beta_end, uint init_seed,
     // The anneal these rungs belong to: the seed its words share, its first
     // rung and its last. They place a sweep within the anneal however the
-    // host splits the anneal into dispatches.
+    // host splits the anneal into dispatches and sweep windows.
     uint word_seed, int first_beta, int last_beta,
     bool fresh, bool persist,
     bool write_output, bool write_samples,
@@ -467,7 +703,7 @@ static inline void msa_body(
     device ulong* diag_accept_counts,
     device int* diag_energy_partials,
 #endif
-    threadgroup uint* state,
+    Spins state,
     threadgroup atomic_int* lane_total
 ) {
 #ifdef QUIP_MSA_DIAGNOSTICS
@@ -486,29 +722,31 @@ static inline void msa_body(
         // A new anneal: seed per (threadgroup, thread) and draw random words.
         rng = seed_rng(init_seed);
         for (uint var = tid; var < uint(n); var += gsz) {
-            state[var] = xoshiro128starstar(rng);
+            state.set(int(var), xoshiro128starstar(rng));
         }
     } else {
         // Continuation chunk: threadgroup memory does not survive dispatches,
-        // so rebuild the words and the RNG stream from device memory.
+        // so rebuild the threadgroup words and the RNG stream from device
+        // memory. Spilled words already live there.
         rng.s0 = src_rng[0];
         rng.s1 = src_rng[1];
         rng.s2 = src_rng[2];
         rng.s3 = src_rng[3];
-        for (uint var = tid; var < uint(n); var += gsz) {
-            state[var] = src_state[var];
+        for (uint var = tid; var < uint(state.shared(n)); var += gsz) {
+            state.set(int(var), src_state[var]);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    state.barrier();
 
     for (int beta_idx = beta_start; beta_idx < beta_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
         float two_beta = 2.0f * beta;
 
-        for (int sweep = 0; sweep < sweeps_per_beta; sweep++) {
+        for (int sweep = sweep_start; sweep < sweep_end; sweep++) {
             // The last sweep of the anneal leaves no node out, so every node
-            // is settled at the coldest rung.
+            // is settled at the coldest rung. `sweep` counts from the start
+            // of the rung, whatever window this dispatch runs.
             bool last_sweep = beta_idx == last_beta && sweep == sweeps_per_beta - 1;
             uint skip = last_sweep ? MSA_NO_SIT_OUT
                                    : sit_out_node(word_seed, beta_idx - first_beta, sweep, n);
@@ -523,26 +761,27 @@ static inline void msa_body(
                     }
                     uint accept = flip_mask(couplings, my_csr_row_ptr, my_csr_col_ind,
                                             state, var, beta_idx, two_beta, rng);
-                    state[var] ^= accept;
+                    state.set(var, state.get(var) ^ accept);
 #ifdef QUIP_MSA_DIAGNOSTICS
                     accept_count += ulong(popcount(accept));
 #endif
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                state.barrier();
             }
         }
     }
 
     // Persist for the next chunk (the host decides whether one follows).
     // The barrier closing the last colour class already synchronised
-    // `state`, and each thread writes a disjoint stride.
+    // `state`, and each thread writes a disjoint stride. Spilled words are
+    // already in `dst_state`, so only the threadgroup words are copied.
     if (persist) {
         dst_rng[0] = rng.s0;
         dst_rng[1] = rng.s1;
         dst_rng[2] = rng.s2;
         dst_rng[3] = rng.s3;
-        for (uint var = tid; var < uint(n); var += gsz) {
-            dst_state[var] = state[var];
+        for (uint var = tid; var < uint(state.shared(n)); var += gsz) {
+            dst_state[var] = state.get(int(var));
         }
     }
 
@@ -606,7 +845,7 @@ static inline void msa_body(
         for (int bit = 0; bit < 8; ++bit) {
             int var = base + bit;
             if (var < n) {
-                byte |= ((state[var] >> uint(lane)) & 1u) << uint(bit);
+                byte |= ((state.get(var) >> uint(lane)) & 1u) << uint(bit);
             }
         }
         uint out = uint(read) * uint(packed_size) + uint(b);
@@ -682,23 +921,25 @@ kernel void msa_anneal(
              &final_energies[problem_id * uint(num_reads)],
              &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
-             word_seed, 0, num_betas - 1, beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
+             N, num_reads, num_colors, sweeps_per_beta, 0, sweeps_per_beta, beta_start, beta_end,
+             init_seed, word_seed, 0, num_betas - 1, beta_start == 0, true, beta_end >= num_betas,
+             true, w, tid, gsz,
 #ifdef QUIP_MSA_DIAGNOSTICS
              &diag_accept_counts[tg * gsz + tid],
              &diag_energy_partials[(tg * gsz + tid) * MSA_LANES],
 #endif
-             state, lane_total);
+             TgSpins{state}, lane_total);
 }
 
 #ifndef QUIP_MSA_DIAGNOSTICS
 // `msa_anneal` for weighted models: buffers 2 and 15 hold milli `int`
 // coefficients and buffer 25 the Metropolis rows, [num_betas * WIDE_ROW].
+// The QUIP_FLOAT build reads `float` coefficients and binds no buffer 25.
 // Energies are left to the host.
 kernel void msa_anneal_weighted(
     device const int* csr_row_ptr [[buffer(0)]],
     device const int* csr_col_ind [[buffer(1)]],
-    device const int* csr_J_vals [[buffer(2)]],
+    device const weighted_coef_t* csr_J_vals [[buffer(2)]],
     device const int* row_ptr_offsets [[buffer(3)]], // unused: the CSR structure is shared
     device const int* col_ind_offsets [[buffer(4)]],
 
@@ -716,7 +957,7 @@ kernel void msa_anneal_weighted(
     constant int& num_problems [[buffer(13)]],
     constant int& num_reads [[buffer(14)]],
 
-    device const int* csr_h_vals [[buffer(15)]],
+    device const weighted_coef_t* csr_h_vals [[buffer(15)]],
 
     device const int* color_block_starts [[buffer(16)]],
     device const int* color_block_counts [[buffer(17)]],
@@ -729,8 +970,16 @@ kernel void msa_anneal_weighted(
     constant int& beta_count [[buffer(22)]],
     device uint* persistent_state [[buffer(23)]],
     device uint* persistent_rng [[buffer(24)]],
+#ifndef QUIP_FLOAT
     device const int* wide_rows [[buffer(25)]],
-    threadgroup uint* state [[threadgroup(0)]],
+#endif
+#ifdef QUIP_WIDE_I8
+    constant int& coef_scale [[buffer(26)]],
+#endif
+    constant int& shared_spins [[buffer(27)]],             // K, read by the QUIP_MSA_SPILL build
+    constant int& sweep_start [[buffer(28)]],              // first sweep of each rung this chunk
+    constant int& sweep_count [[buffer(29)]],              // sweeps of each rung this chunk
+    threadgroup uint* state [[threadgroup(0)]],            // [N], or [K] when spilled; sized by the host
 
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
     uint3 thread_pos_in_group [[thread_position_in_threadgroup]],
@@ -748,17 +997,39 @@ kernel void msa_anneal_weighted(
     int beta_end = min(beta_start + beta_count, num_betas);
     uint word_seed = (base_seed ? base_seed : 1u) ^ (tg * 2654435761u);
     uint init_seed = word_seed ^ (tid * 2246822519u);
+#ifdef QUIP_FLOAT
+    WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
+                                &csr_h_vals[problem_id * uint(N)]};
+#elif defined(QUIP_WIDE_I8)
+    WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
+                                &csr_h_vals[problem_id * uint(N)], wide_rows, coef_scale};
+#else
     WeightedCouplings couplings{&csr_J_vals[col_ind_offsets[problem_id]],
                                 &csr_h_vals[problem_id * uint(N)], wide_rows};
-    msa_body(csr_row_ptr, csr_col_ind, couplings, beta_schedule,
-             &persistent_state[tg * uint(N)], &persistent_state[tg * uint(N)],
+#endif
+    // A window [sweep_start, sweep_end) of every rung in [beta_start,
+    // beta_end): the host sends either whole rungs or one rung's window.
+    int sweep_end = min(sweep_start + sweep_count, sweeps_per_beta);
+    bool fresh = beta_start == 0 && sweep_start == 0;
+    bool last = beta_end >= num_betas && sweep_end >= sweeps_per_beta;
+    device uint* my_state = &persistent_state[tg * uint(N)];
+    // The QUIP_MSA_SPILL build keeps words [shared_spins, N) in device
+    // memory; every other build keeps all N in threadgroup memory. A runtime
+    // choice between the two cost about 0.4% of the Advantage2 rate
+    // (docs/perf/2026-11-12-msa-spill.md), so the host picks the build.
+#ifdef QUIP_MSA_SPILL
+    SplitSpins spins{state, my_state, shared_spins};
+#else
+    TgSpins spins{state};
+#endif
+    msa_body(csr_row_ptr, csr_col_ind, couplings, beta_schedule, my_state, my_state,
              &persistent_rng[(tg * gsz + tid) * 4], &persistent_rng[(tg * gsz + tid) * 4],
              &final_energies[problem_id * uint(num_reads)],
              &final_samples[problem_id * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, num_reads, num_colors, sweeps_per_beta, beta_start, beta_end, init_seed,
-             word_seed, 0, num_betas - 1, beta_start == 0, true, beta_end >= num_betas, true, w, tid, gsz,
-             state, lane_total);
+             N, num_reads, num_colors, sweeps_per_beta, sweep_start, sweep_end, beta_start,
+             beta_end, init_seed, word_seed, 0, num_betas - 1, fresh, true, last, true, w, tid,
+             gsz, spins, lane_total);
 }
 
 struct SlotStep {
@@ -836,9 +1107,9 @@ kernel void msa_anneal_slots(
              &final_energies[st.slot * uint(num_reads)],
              &final_samples[st.slot * uint(num_reads) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, num_reads, num_colors, 1, st.beta_start, beta_end, init_seed,
+             N, num_reads, num_colors, 1, 0, 1, st.beta_start, beta_end, init_seed,
              word_seed, st.anneal_start, st.anneal_end - 1, fresh, true,
-             write_output, write_output, w, tid, gsz, state, lane_total);
+             write_output, write_output, w, tid, gsz, TgSpins{state}, lane_total);
 }
 
 // ==============================================================================
@@ -984,9 +1255,9 @@ kernel void msa_screen(
              &final_energies[tg * uint(MSA_LANES)],
              &final_samples[tg * uint(MSA_LANES) * uint((N + 7) / 8)],
              color_block_starts, color_block_counts, color_node_indices,
-             N, MSA_LANES, num_colors, 1, 0, word.num_betas, init_seed,
+             N, MSA_LANES, num_colors, 1, 0, 1, 0, word.num_betas, init_seed,
              word.seed, 0, word.num_betas - 1, true, false,
-             true, true, 0, tid, gsz, state, lane_total);
+             true, true, 0, tid, gsz, TgSpins{state}, lane_total);
 }
 
 // Frustration counts of 32 lease models per threadgroup: how many triangles
